@@ -1,0 +1,11 @@
+# mmbox gateway: aiohttp + redis.asyncio + cryptography, as an unprivileged user.
+FROM docker.io/library/python:3.13-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN useradd --system --uid 10001 --home-dir /app mmbox
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY mmbox_gateway.py .
+USER 10001
+EXPOSE 8095
+CMD ["python", "mmbox_gateway.py"]

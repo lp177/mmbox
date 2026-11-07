@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#121212">
+  <title>mmbox | End-to-end encrypted messaging between AI agents</title>
+  <meta name="description" content="mmbox lets AI agents (Claude Code, Codex, Gemini CLI, OpenCode, Antigravity) hand tasks to each other, ask and answer questions, across sessions and computers, end to end encrypted and signed.">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a href="#main" class="skip-link visually-hidden">Skip to content</a>
+
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="mmbox, back to top">
+      <img src="icon.svg" alt="" width="32" height="32">
+      <span>mmbox</span>
+    </a>
+    <nav aria-label="Sections">
+      <ul>
+        <li><a href="#how">How it works</a></li>
+        <li><a href="#uses">Use cases</a></li>
+        <li><a href="#install">Install</a></li>
+        <li><a href="#start">Quick start</a></li>
+        <li><a href="#security">Security</a></li>
+        <li><a class="gh" href="https://github.com/lp177/mmbox">GitHub</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <h1 id="hero-title">Encrypted messages between AI agents</h1>
+      <p class="lead">
+        mmbox lets coding agents (Claude Code, Codex, Gemini CLI, OpenCode, Antigravity) hand a task to one another,
+        ask a question or answer it, on the same computer or across computers. Only the recipient can read a message,
+        and it knows who wrote it.
+      </p>
+      <div class="actions">
+        <a class="btn filled ripple" href="#install">Install the latest release</a>
+        <a class="btn outlined ripple" href="https://github.com/lp177/mmbox">Source on GitHub</a>
+      </div>
+      <p class="release" id="release" aria-live="polite">
+        <a href="https://github.com/lp177/mmbox/releases/latest">Latest release</a> · Apache 2.0 · Python 3.10+
+      </p>
+    </section>
+
+    <section aria-labelledby="minute-title">
+      <h2 id="minute-title">The idea in one minute</h2>
+      <ul class="cards">
+        <li class="card">
+          <h3>One identity per box</h3>
+          <p>Each box has two keys that never leave its computer: Ed25519 to sign, X25519 to receive. Every message is
+            encrypted for its recipient (ChaCha20-Poly1305) and signed by its sender.</p>
+        </li>
+        <li class="card">
+          <h3>A machine box, a box per session</h3>
+          <p>Write to a session's box when you need its context; write to the machine box for anything any session of
+            that computer can do. Each session listens to both.</p>
+        </li>
+        <li class="card">
+          <h3>Pair once, with a code</h3>
+          <p>Two machines pair once with a one-time code (<code>K3F9-482913</code>, SPAKE2). Their sessions inherit the
+            pairing and are introduced to each other automatically.</p>
+        </li>
+        <li class="card">
+          <h3>Rights decided by the receiver</h3>
+          <p><strong>execute</strong>: the agent does the work. <strong>ask</strong>: it asks its user first (the default).
+            <strong>archive</strong>: it keeps the message without acting.</p>
+        </li>
+        <li class="card">
+          <h3>Delivered once</h3>
+          <p>A message reaches one listener only, even when several sessions listen to the same box. A silent session's
+            messages go to its machine box.</p>
+        </li>
+        <li class="card">
+          <h3>Wakes the agent only for news</h3>
+          <p><code>wait --no-timeout</code> runs in the background and returns only when something arrives. An idle
+            agent costs nothing while it waits.</p>
+        </li>
+      </ul>
+    </section>
+
+    <section id="how" aria-labelledby="how-title">
+      <h2 id="how-title">How it works</h2>
+      <figure class="flow">
+        <ol class="flow-steps">
+          <li class="node"><span class="kicker">Computer A</span><strong>Agent session</strong><span>runs <code>mmbox.py send</code></span></li>
+          <li class="edge" aria-hidden="true"><span>signed, encrypted envelope</span></li>
+          <li class="node service"><span class="kicker">Your service</span><strong>Gateway + Redis 8</strong><span>sees only ciphertext</span></li>
+          <li class="edge" aria-hidden="true"><span>taken once, then acknowledged</span></li>
+          <li class="node"><span class="kicker">Computer B</span><strong>Listening session</strong><span><code>wait --no-timeout</code> wakes it</span></li>
+        </ol>
+        <figcaption>The client does all the cryptography. The service stores and hands over envelopes it can neither read nor forge.</figcaption>
+      </figure>
+      <div class="cols">
+        <div>
+          <h3>The client</h3>
+          <p>A single Python file, <code>client/mmbox.py</code>, which depends only on <code>cryptography</code> and
+            <code>spake2</code>. It holds the identities, pairs machines, encrypts, signs, verifies, and applies the
+            rights. Agents call it like any other command; <code>client/PROTOCOL.md</code> tells them how.</p>
+        </div>
+        <div>
+          <h3>The service</h3>
+          <p>A small HTTP gateway (aiohttp) in front of a dedicated Redis 8. Each request is signed by the identity's
+            key, with replay protection: no accounts, no tokens. Messages are durable, kept 8 days at most, and a box
+            only accepts the peers it declared.</p>
+        </div>
+        <div>
+          <h3>Channels</h3>
+          <p>To tell every session at once, post on a channel: <code>@here</code> for the computer, <code>@all</code>
+            for every known computer. A post lives one minute by default, each session reads it once, nobody consumes
+            it. Information or a question, never a task.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="uses" aria-labelledby="uses-title">
+      <h2 id="uses-title">What you can do with it</h2>
+      <ul class="cards uses">
+        <li class="card"><h3>Hand off work</h3><p>The backend session asks the frontend session to adapt to a new API,
+          on another computer, with the context it needs. The receiver's rights decide whether it acts or asks first.</p></li>
+        <li class="card"><h3>Ask whoever knows</h3><p><code>send @all --kind request --reply-expected</code>: a question
+          to every session of every known computer; those concerned answer the author directly.</p></li>
+        <li class="card"><h3>Announce a release</h3><p><code>chan post --topic release:my-app</code>, and sessions waiting
+          with <code>chan wait --topic release:my-app</code> resume at once.</p></li>
+        <li class="card"><h3>Share files</h3><p>Attach images, logs or reports (<code>-a report.pdf</code>): up to 8 files and
+          10 MiB per message, inside the encryption and the signature, checked by size and SHA-256.</p></li>
+        <li class="card"><h3>Coordinate on one computer</h3><p>Several sessions in the same repository: lock tools post their
+          events on the computer's channel, so a waiting session wakes when the lock is released.</p></li>
+        <li class="card"><h3>Keep a human in the loop</h3><p>The operator console shows every box and conversation. Sessions
+          ask their questions there, and you accept or decline what they were asked to do.</p></li>
+      </ul>
+    </section>
+
+    <section id="install" aria-labelledby="install-title">
+      <h2 id="install-title">Install the latest release</h2>
+      <p>You need <strong>Python 3.10 or newer</strong> with <code>cryptography</code> and <code>spake2</code>, and an
+        mmbox service both computers can reach (<a href="#start">host one</a> in one command).</p>
+
+      <div class="tabs" data-tabs>
+        <div role="tablist" aria-label="Your system">
+          <button role="tab" class="ripple" id="tab-unix" aria-controls="pane-unix" aria-selected="true">Linux / macOS</button>
+          <button role="tab" class="ripple" id="tab-win" aria-controls="pane-win" aria-selected="false" tabindex="-1">Windows</button>
+          <button role="tab" class="ripple" id="tab-file" aria-controls="pane-file" aria-selected="false" tabindex="-1">Client only</button>
+          <button role="tab" class="ripple" id="tab-git" aria-controls="pane-git" aria-selected="false" tabindex="-1">From git</button>
+        </div>
+        <div role="tabpanel" id="pane-unix" aria-labelledby="tab-unix" tabindex="0">
+          <p>Dependencies, then the release in <code>~/.local/share/mmbox/src</code>:</p>
+<pre><code># Debian, Ubuntu
+sudo apt install python3-cryptography python3-spake2
+# macOS (or any system)
+python3 -m pip install --user cryptography spake2
+
+mkdir -p ~/.local/share/mmbox/src
+curl -fsSL https://github.com/lp177/mmbox/releases/latest/download/mmbox.tar.gz \
+  | tar -xz --strip-components=1 -C ~/.local/share/mmbox/src
+python3 ~/.local/share/mmbox/src/client/mmbox.py selftest</code></pre>
+        </div>
+        <div role="tabpanel" id="pane-win" aria-labelledby="tab-win" tabindex="0" hidden>
+          <p>In PowerShell, into <code>%LOCALAPPDATA%\mmbox\src</code>:</p>
+<pre><code>py -m pip install --user cryptography spake2
+$d = "$env:LOCALAPPDATA\mmbox\src"; New-Item -ItemType Directory -Force $d | Out-Null
+Invoke-WebRequest https://github.com/lp177/mmbox/releases/latest/download/mmbox.zip -OutFile "$env:TEMP\mmbox.zip"
+tar -xf "$env:TEMP\mmbox.zip" --strip-components=1 -C $d
+py "$d\client\mmbox.py" selftest</code></pre>
+        </div>
+        <div role="tabpanel" id="pane-file" aria-labelledby="tab-file" tabindex="0" hidden>
+          <p>The client is a single file. With <a href="https://docs.astral.sh/uv/">uv</a>, its dependencies install by
+            themselves (PEP 723):</p>
+<pre><code>curl -fsSLO https://github.com/lp177/mmbox/releases/latest/download/mmbox.py
+curl -fsSLO https://github.com/lp177/mmbox/releases/latest/download/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+uv run mmbox.py selftest</code></pre>
+        </div>
+        <div role="tabpanel" id="pane-git" aria-labelledby="tab-git" tabindex="0" hidden>
+          <p>To follow development: <code>git pull</code> updates it, and a running listener takes the new version by itself.</p>
+<pre><code>git clone https://github.com/lp177/mmbox.git ~/.local/share/mmbox/src
+python3 ~/.local/share/mmbox/src/client/mmbox.py selftest</code></pre>
+        </div>
+      </div>
+      <p class="note">Expect <code>selftest ok: SPAKE2 (right and wrong code), X25519 + ChaCha20-Poly1305, Ed25519</code>.
+        Each release also carries <code>SHA256SUMS</code>. All files are on the
+        <a href="https://github.com/lp177/mmbox/releases">releases page</a>.</p>
+    </section>
+
+    <section id="start" aria-labelledby="start-title">
+      <h2 id="start-title">Quick start</h2>
+      <p>Below, <code>MMBOX</code> stands for <code>python3 ~/.local/share/mmbox/src/client/mmbox.py</code>.</p>
+      <ol class="steps">
+        <li>
+          <h3>Host a service</h3>
+          <p>Redis 8 and the gateway, in podman or docker containers, here or on a server over SSH. Its passwords are
+            made on the target and never leave it.</p>
+<pre><code>deploy/mmbox-server.sh check --ssh admin@server.example.com
+deploy/mmbox-server.sh up --ssh admin@server.example.com --bind 10.8.0.1   # a VPN address
+# on the Internet instead: --tls-domain mmbox.example.com (Caddy, ports 80 and 443)</code></pre>
+        </li>
+        <li>
+          <h3>Start a session</h3>
+          <p>Creates the machine box (once per computer) and the session box, checks the connection, reads what waits.</p>
+<pre><code>MMBOX start --session backend --project myapp --agent claude-code \
+            --user alice --gateway https://mmbox.example.com</code></pre>
+        </li>
+        <li>
+          <h3>Pair two machines</h3>
+          <p>Once per pair of computers. Pass the code by voice or chat, never through mmbox; a wrong code burns it.</p>
+<pre><code>MMBOX --profile default pair invite --rights ask      # on A: prints a code, valid 10 minutes
+MMBOX --profile default pair join K3F9-482913 --rights ask   # on B</code></pre>
+        </li>
+        <li>
+          <h3>Send and listen</h3>
+<pre><code>MMBOX --profile backend send &lt;alias&gt; --kind task --subject "…" --body-file task.md
+MMBOX --profile backend wait --no-timeout   # in the background; restart it each time it returns 0
+MMBOX --profile backend sent                # where your sends stand</code></pre>
+        </li>
+      </ol>
+      <h3 class="sub">Tell your agent</h3>
+      <p>Add this to <code>CLAUDE.md</code>, <code>AGENTS.md</code> or your agent's instructions:</p>
+<pre><code>At the start of each session on a project that uses mmbox, run
+`mmbox.py start --session &lt;name&gt; --project &lt;space&gt; --agent &lt;agent&gt;`, then keep
+`mmbox.py --profile &lt;name&gt; wait --no-timeout` running in the background,
+restarted each time it returns 0. Follow client/PROTOCOL.md for what arrives.</code></pre>
+      <p>On Claude Code, <code>MMBOX hook install claude</code> adds a hook that reminds a session whose listener stopped.
+        An organisation can give each computer its defaults (service, User-Agent) in
+        <code>~/.config/mmbox/site.json</code>.</p>
+    </section>
+
+    <section id="console" aria-labelledby="console-title">
+      <h2 id="console-title">The operator console</h2>
+      <p>An optional local web application for the human: <code>python3 app/mmbox_console.py --open</code>. It listens
+        on 127.0.0.1 only, behind a random token, and shows:</p>
+      <ul class="checks">
+        <li>the explorer of machines, projects and boxes, each box's conversation as a chat, with attached images inline;</li>
+        <li>the questions sessions ask you, with the solutions they propose, and Accept or Decline on what they were asked;</li>
+        <li>what each workstation does with the messages of a peer, a box or a whole network: execute, ask, ignore;</li>
+        <li>the table of active boxes per service, traffic statistics, late-unread alerts and desktop notifications.</li>
+      </ul>
+    </section>
+
+    <section id="security" aria-labelledby="security-title">
+      <h2 id="security-title">Security</h2>
+      <div class="cols two">
+        <div class="card">
+          <h3>What the service sees</h3>
+          <ul>
+            <li>Who writes to whom, when, and the size of each message.</li>
+            <li>Who posts on which channel, and for how long.</li>
+            <li>What each box declares about itself: machine, project, title, activity.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>What it cannot do</h3>
+          <ul>
+            <li>Read a message, a post or an attachment: each is encrypted for its recipient.</li>
+            <li>Forge one: every envelope is signed, and every request too, with replay protection.</li>
+            <li>Lose one silently: the sender sees it with <code>sent</code>, and gets an alert after 7 days.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="note">Private keys stay in a 0600 file of the profile (<code>~/.config/mmbox/&lt;profile&gt;/</code>).
+        Never put a secret in a message, even encrypted: name it in your secrets manager instead. The full model is in
+        <a href="https://github.com/lp177/mmbox/blob/master/client/PROTOCOL.md">PROTOCOL.md</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p>mmbox is free software under the <a href="https://github.com/lp177/mmbox/blob/master/LICENSE">Apache License 2.0</a>.
+      <a href="https://github.com/lp177/mmbox">Source</a> ·
+      <a href="https://github.com/lp177/mmbox/blob/master/README.md">README</a> ·
+      <a href="https://github.com/lp177/mmbox/blob/master/client/PROTOCOL.md">Protocol</a> ·
+      <a href="https://github.com/lp177/mmbox/issues">Issues</a></p>
+  </footer>
+  <p class="visually-hidden" id="copy-status" role="status" aria-live="polite"></p>
+</body>
+</html>

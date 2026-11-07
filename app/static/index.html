@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>mmbox console</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="console.css">
+  <script src="console.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="appbar">
+    <h1 class="brand"><img class="logo" src="/icon.svg" alt="" width="28" height="28">mmbox <span class="dim">console</span></h1>
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button class="tab ripple" role="tab" id="tab-messages" aria-controls="view-messages" aria-selected="true">Messages</button>
+      <button class="tab ripple" role="tab" id="tab-boxes" aria-controls="view-boxes" aria-selected="false" tabindex="-1">Boxes</button>
+      <button class="tab ripple" role="tab" id="tab-servers" aria-controls="view-servers" aria-selected="false" tabindex="-1">Servers</button>
+      <button class="tab ripple" role="tab" id="tab-activity" aria-controls="view-activity" aria-selected="false" tabindex="-1">Activity</button>
+      <button class="tab ripple" role="tab" id="tab-settings" aria-controls="view-settings" aria-selected="false" tabindex="-1">Settings</button>
+    </nav>
+    <div class="appbar-end">
+      <button id="questions-btn" class="btn small question-btn ripple" type="button" hidden aria-haspopup="dialog"></button>
+      <button id="late" class="btn small late-btn ripple" type="button" hidden title="Messages unread for longer than the threshold (Settings)"></button>
+      <span id="sync" class="sync" role="status" aria-live="polite">connecting…</span>
+      <button id="refresh" class="btn icon ripple" type="button" aria-label="Refresh now" title="Refresh now">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.74 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35Z"/></svg>
+      </button>
+      <button id="compose-open" class="btn filled ripple" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25ZM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83Z"/></svg>
+        Write
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- Messages: the tree, the list, the message -->
+    <section id="view-messages" class="view view-messages" role="tabpanel" aria-labelledby="tab-messages">
+      <aside class="pane tree-pane" aria-label="Machines, projects and boxes">
+        <div class="pane-head">
+          <h2>Explorer</h2>
+          <label class="switch-row"><input type="checkbox" role="switch" id="tree-active-only" class="switch"> <span>active only</span></label>
+        </div>
+        <div class="field small">
+          <input id="tree-filter" type="search" placeholder=" " autocomplete="off">
+          <label for="tree-filter">Filter the tree</label>
+        </div>
+        <ul id="tree" class="tree" role="tree" aria-label="Machines, projects, boxes"></ul>
+      </aside>
+
+      <section class="pane list-pane" aria-label="Message list">
+        <div class="toolbar" role="group" aria-label="Filters">
+          <div class="field grow">
+            <input id="f-search" type="search" placeholder=" " autocomplete="off">
+            <label for="f-search">Search (subject, body, box, id)</label>
+          </div>
+          <div class="field select">
+            <select id="f-view">
+              <option value="all">All</option>
+              <option value="unread">Unread</option>
+              <option value="late">Unread for too long</option>
+              <option value="read">Read</option>
+              <option value="pending">Queued / sent</option>
+              <option value="broadcast">Broadcasts</option>
+              <option value="direct">Direct messages</option>
+            </select>
+            <label for="f-view">Show</label>
+          </div>
+          <div class="field select">
+            <select id="f-dir">
+              <option value="both">Received and sent</option>
+              <option value="in">Received</option>
+              <option value="out">Sent</option>
+            </select>
+            <label for="f-dir">Direction</label>
+          </div>
+          <div class="field select">
+            <select id="f-tier">
+              <option value="1">1 · Essential</option>
+              <option value="2">2 · Normal</option>
+              <option value="3">3 · Debugging</option>
+            </select>
+            <label for="f-tier">Verbosity</label>
+          </div>
+          <div class="field select">
+            <select id="f-period">
+              <option value="3600">1 hour</option>
+              <option value="86400">24 hours</option>
+              <option value="604800">7 days</option>
+              <option value="0">All</option>
+            </select>
+            <label for="f-period">Period</label>
+          </div>
+          <div class="field select">
+            <select id="f-sort">
+              <option value="desc">Newest first</option>
+              <option value="asc">Oldest first</option>
+            </select>
+            <label for="f-sort">Order of arrival</label>
+          </div>
+          <div class="field select">
+            <select id="f-group">
+              <option value="none">None</option>
+              <option value="machine">Machine</option>
+              <option value="project">Project</option>
+              <option value="box">Box</option>
+              <option value="model">Model</option>
+              <option value="server">Server</option>
+              <option value="day">Day</option>
+              <option value="thread">Thread</option>
+            </select>
+            <label for="f-group">Group by</label>
+          </div>
+          <div class="field select">
+            <select id="f-source">
+              <option value="all">All</option>
+              <option value="local">This computer</option>
+              <option value="collector">Collectors</option>
+            </select>
+            <label for="f-source">Source</label>
+          </div>
+        </div>
+        <div class="list-head">
+          <p id="list-count" class="dim" role="status" aria-live="polite"></p>
+          <p id="scope" class="scope"></p>
+        </div>
+        <div id="list" class="list" role="listbox" aria-label="Messages" tabindex="0"></div>
+        <section id="chat" class="chat" hidden aria-labelledby="chat-title">
+          <header class="chat-head">
+            <div class="chat-who">
+              <h2 id="chat-title"></h2>
+              <p id="chat-sub" class="dim"></p>
+            </div>
+            <div class="chat-keep" role="group" aria-labelledby="chat-keep-label">
+              <span id="chat-keep-label" class="chat-keep-label">Message expiry</span>
+              <div class="field small"><input id="chat-ttl" type="number" min="0.04" max="3650" step="any" placeholder=" " aria-describedby="chat-keep-help"><label for="chat-ttl">days</label></div>
+              <button id="chat-ttl-save" class="btn small ripple" type="button">Save</button>
+              <button id="chat-ttl-reset" class="btn small text ripple" type="button">Default</button>
+              <button id="chat-pin" class="btn small ripple" type="button" aria-pressed="false"></button>
+            </div>
+            <p id="chat-keep-help" class="help"></p>
+          </header>
+          <div id="chat-log" class="chat-log" role="log" aria-label="Conversation" tabindex="0"></div>
+          <form id="chat-form" class="chat-compose">
+            <div class="row">
+              <div class="field select"><select id="chat-from" aria-describedby="chat-error"></select><label for="chat-from">From the box</label></div>
+              <div class="field select"><select id="chat-kind">
+                <option value="info">info</option><option value="request">request (question)</option><option value="task">task (work)</option><option value="reply">reply (answer)</option>
+              </select><label for="chat-kind">Kind</label></div>
+            </div>
+            <div class="chat-input">
+              <div class="field grow"><textarea id="chat-text" rows="2" placeholder=" " maxlength="400000"></textarea><label for="chat-text">Write to this box… (Ctrl+Enter sends)</label></div>
+              <button class="btn filled ripple" id="chat-send" type="submit" disabled>Send</button>
+            </div>
+            <p id="chat-error" class="error" role="alert"></p>
+          </form>
+        </section>
+      </section>
+
+      <!-- The open message: takes the place of the list (or of the conversation); the back button returns to it where it was -->
+      <section id="reader" class="pane reader-pane" aria-label="Message" hidden>
+        <div class="reader-bar" role="toolbar" aria-label="Message">
+          <button id="reader-back" class="btn icon ripple" type="button" aria-label="Back to the list" title="Back to the list (Esc)"></button>
+          <span id="reader-pos" class="dim reader-pos"></span>
+          <span class="spacer"></span>
+          <button id="reader-prev" class="btn icon ripple" type="button" aria-label="Previous message" title="Previous message (k)"></button>
+          <button id="reader-next" class="btn icon ripple" type="button" aria-label="Next message" title="Next message (j)"></button>
+        </div>
+        <div id="reader-scroll" class="reader-scroll" tabindex="-1">
+          <article id="detail" class="reader-body" aria-live="polite"></article>
+          <div id="reply-zone" class="reply-zone">
+            <form id="reply-form" class="reply" hidden aria-labelledby="reply-head">
+              <h3 id="reply-head" class="reply-head"></h3>
+              <div class="row">
+                <div class="field select"><select id="reply-from" aria-describedby="reply-error"></select><label for="reply-from">From the box</label></div>
+                <div class="field select"><select id="reply-kind">
+                  <option value="reply">reply (answer)</option><option value="info">info</option><option value="request">request (question)</option><option value="task">task (work)</option>
+                </select><label for="reply-kind">Kind</label></div>
+                <div class="field grow"><input id="reply-subject" placeholder=" " autocomplete="off" maxlength="300" required><label for="reply-subject">Subject</label></div>
+              </div>
+              <div class="field"><textarea id="reply-text" rows="7" placeholder=" " maxlength="400000" required></textarea><label for="reply-text">Your reply… (Ctrl+Enter sends)</label></div>
+              <div class="reply-foot">
+                <label class="switch-row"><input type="checkbox" role="switch" id="reply-expected" class="switch"> <span>Reply expected</span></label>
+                <span class="spacer"></span>
+                <button id="reply-discard" class="btn text ripple" type="button">Discard</button>
+                <button id="reply-send" class="btn filled ripple" type="submit" disabled>Send</button>
+              </div>
+              <p id="reply-error" class="error" role="alert"></p>
+            </form>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- Boxes: the table of active boxes, merged -->
+    <section id="view-boxes" class="view" role="tabpanel" aria-labelledby="tab-boxes" hidden>
+      <div class="toolbar">
+        <div class="field grow">
+          <input id="b-search" type="search" placeholder=" " autocomplete="off">
+          <label for="b-search">Search for a box</label>
+        </div>
+        <label class="switch-row"><input type="checkbox" role="switch" id="b-active" class="switch" checked> <span>active only</span></label>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <caption class="dim" id="boxes-caption"></caption>
+          <thead><tr>
+            <th scope="col">State</th><th scope="col">Box</th><th scope="col">Machine</th><th scope="col">Project</th>
+            <th scope="col">Servers</th><th scope="col">Waiting</th><th scope="col">Last activity</th><th scope="col"><span class="sr">Actions</span></th>
+          </tr></thead>
+          <tbody id="boxes-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Servers -->
+    <section id="view-servers" class="view" role="tabpanel" aria-labelledby="tab-servers" hidden>
+      <div class="toolbar">
+        <div class="operator" id="operator"></div>
+        <span class="grow"></span>
+        <button id="server-check" class="btn ripple" type="button">Check all</button>
+        <button id="server-add" class="btn filled ripple" type="button">Add a service</button>
+      </div>
+      <div id="servers" class="cards"></div>
+    </section>
+
+    <!-- Activity -->
+    <section id="view-activity" class="view" role="tabpanel" aria-labelledby="tab-activity" hidden>
+      <p class="dim pad">Box openings, closings and expiries, as seen by the collectors this console is the operator of.</p>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th scope="col">When</th><th scope="col">Event</th><th scope="col">Box</th><th scope="col">Machine</th><th scope="col">Server</th></tr></thead>
+          <tbody id="activity-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="view-settings" class="view" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <div class="cards">
+        <section class="card" aria-labelledby="set-notif">
+          <h3 id="set-notif">Alerts of this console</h3>
+          <label class="switch-row"><input type="checkbox" role="switch" id="n-desktop" class="switch"> <span>Desktop notifications</span></label>
+          <label class="switch-row"><input type="checkbox" role="switch" id="n-forward" class="switch" checked> <span>Alert when a message is forwarded to a machine box</span></label>
+          <div class="row">
+            <div class="field"><input id="n-late" type="number" min="1" max="1440" placeholder=" "><label for="n-late">Unread for more than (min)</label></div>
+          </div>
+          <p class="help">A message unread for longer than this threshold is highlighted in the list and reported once.</p>
+        </section>
+        <section class="card" aria-labelledby="set-tune">
+          <h3 id="set-tune">Delays of this computer</h3>
+          <p class="help">Read by every session of this computer (the machine box's configuration, <code>mmbox.py tune</code>).</p>
+          <div class="field"><input id="t-relay" type="number" min="30" step="1" placeholder=" " aria-describedby="t-relay-help"><label for="t-relay">Forward to the machine box after (s)</label></div>
+          <p class="help" id="t-relay-help"></p>
+          <div class="field"><input id="t-busy" type="number" min="60" step="1" placeholder=" " aria-describedby="t-busy-help"><label for="t-busy">Busy session: keeps its messages (s)</label></div>
+          <p class="help" id="t-busy-help"></p>
+          <div class="field"><input id="t-expire" type="number" min="1" max="168" step="0.5" placeholder=" " aria-describedby="t-expire-help"><label for="t-expire">Message stale (backlog) after (h)</label></div>
+          <p class="help" id="t-expire-help"></p>
+          <p id="t-env" class="error"></p>
+          <div class="actions">
+            <button id="t-reset" class="btn ripple" type="button">Default values</button>
+            <button id="t-apply" class="btn filled ripple" type="button">Apply</button>
+          </div>
+        </section>
+        <section class="card" aria-labelledby="set-questions">
+          <h3 id="set-questions">Questions from sessions</h3>
+          <p class="help">A session whose messages are in "Ask" mode puts its question here, with the solutions it proposes; your answer goes back to its box.</p>
+          <label class="switch-row"><input type="checkbox" role="switch" id="q-popup" class="switch"> <span>Persistent notification while a question waits</span></label>
+          <fieldset class="choices" aria-describedby="q-signal-help">
+            <legend>Signal when a question arrives</legend>
+            <label class="choice ripple"><input type="checkbox" id="q-none"> <span>None</span></label>
+            <label class="choice ripple"><input type="checkbox" id="q-badge"> <span>Red dot</span></label>
+            <label class="choice ripple"><input type="checkbox" id="q-audio"> <span>Sound</span></label>
+          </fieldset>
+          <p class="help" id="q-signal-help">Red dot: on the console's icon in the notification area (and on the tab). "None" turns off the dot and the sound.</p>
+          <div id="q-sound" hidden>
+            <fieldset class="sounds" id="q-sounds" aria-describedby="q-sound-help">
+              <legend>Sound played</legend>
+              <div id="q-sound-list" class="sound-list"></div>
+            </fieldset>
+            <p class="help" id="q-sound-help">Played by the console's open tab, otherwise by this computer. The ten sounds offered are royalty-free (generated for the console).</p>
+            <div class="actions">
+              <input type="file" id="q-file" accept=".mp3,audio/mpeg" class="sr" tabindex="-1" aria-hidden="true">
+              <button id="q-import" class="btn ripple" type="button">Import an MP3…</button>
+              <button id="q-test" class="btn ripple" type="button">Test on this computer</button>
+            </div>
+          </div>
+        </section>
+        <div id="col-settings" class="contents"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Compose -->
+  <dialog id="compose" aria-labelledby="compose-title" closedby="closerequest">
+    <form id="compose-form" method="dialog" class="dialog-body">
+      <h2 id="compose-title">Write</h2>
+      <fieldset class="segmented">
+        <legend class="sr">Kind of send</legend>
+        <label><input type="radio" name="mode" value="message" checked> <span>Message to a box</span></label>
+        <label><input type="radio" name="mode" value="broadcast"> <span>Broadcast</span></label>
+      </fieldset>
+      <div class="mode-message">
+        <div class="field select">
+          <select id="c-to" required></select>
+          <label for="c-to">Recipient</label>
+        </div>
+        <div class="field select">
+          <select id="c-from" required aria-describedby="c-from-help"></select>
+          <label for="c-from">From the box</label>
+        </div>
+        <p id="c-from-help" class="help">Only the boxes of this computer paired with the recipient can write to it.</p>
+        <div class="row">
+          <div class="field select">
+            <select id="c-kind">
+              <option value="info">info</option>
+              <option value="request">request (question)</option>
+              <option value="task">task (work)</option>
+              <option value="reply">reply (answer)</option>
+            </select>
+            <label for="c-kind">Kind</label>
+          </div>
+          <div class="field grow">
+            <input id="c-re" placeholder=" " autocomplete="off" pattern="[\w-]{6,80}">
+            <label for="c-re">In reply to (id)</label>
+          </div>
+        </div>
+        <label class="switch-row"><input type="checkbox" role="switch" id="c-reply" class="switch"> <span>Reply expected</span></label>
+      </div>
+      <div class="mode-broadcast" hidden>
+        <div class="row">
+          <div class="field select grow">
+            <select id="c-poster"></select>
+            <label for="c-poster">From the session</label>
+          </div>
+          <div class="field select">
+            <select id="c-scope">
+              <option value="machine">This computer (@here)</option>
+              <option value="network">The whole network (@all)</option>
+            </select>
+            <label for="c-scope">Scope</label>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field select">
+            <select id="c-bkind"><option value="info">info</option><option value="request">request</option></select>
+            <label for="c-bkind">Kind</label>
+          </div>
+          <div class="field grow">
+            <input id="c-topic" placeholder=" " autocomplete="off">
+            <label for="c-topic">Wait topic (topic, optional)</label>
+          </div>
+          <div class="field">
+            <input id="c-ttl" type="number" min="5" max="600" value="60" placeholder=" ">
+            <label for="c-ttl">Lifetime (s)</label>
+          </div>
+        </div>
+        <p class="help">A broadcast is information or a question, never a task: every listening session reads it and may analyse it. Keep it for what really concerns everyone.</p>
+      </div>
+      <div class="field">
+        <input id="c-subject" required placeholder=" " autocomplete="off" maxlength="300">
+        <label for="c-subject">Subject</label>
+      </div>
+      <div class="field">
+        <textarea id="c-body" required placeholder=" " rows="8"></textarea>
+        <label for="c-body">Message</label>
+      </div>
+      <p id="c-error" class="error" role="alert"></p>
+      <div class="actions">
+        <button class="btn ripple" value="cancel" formnovalidate type="submit">Cancel</button>
+        <button class="btn filled ripple" id="c-send" value="send" type="submit">Send</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Add / edit a service -->
+  <dialog id="server-dialog" aria-labelledby="server-title">
+    <form id="server-form" method="dialog" class="dialog-body">
+      <h2 id="server-title">Service</h2>
+      <input type="hidden" id="s-mode">
+      <input type="hidden" id="s-orig">
+      <div class="field"><input id="s-name" required placeholder=" " pattern="[A-Za-z0-9._\-]{1,60}" autocomplete="off"><label for="s-name">Name</label></div>
+      <div class="field"><input id="s-url" type="url" placeholder=" " autocomplete="off"><label for="s-url">URL (https://… or http://host:port)</label></div>
+      <div class="field"><input id="s-address" placeholder=" " autocomplete="off"><label for="s-address">Forced address (optional, e.g. 192.0.2.1)</label></div>
+      <div class="field"><input id="s-note" placeholder=" " autocomplete="off"><label for="s-note">Note</label></div>
+      <p id="s-error" class="error" role="alert"></p>
+      <div class="actions">
+        <button class="btn ripple" value="cancel" formnovalidate type="submit">Cancel</button>
+        <button class="btn filled ripple" value="save" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Confirmation -->
+  <dialog id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+    <form method="dialog" class="dialog-body">
+      <h2 id="confirm-title">Confirm</h2>
+      <p id="confirm-text"></p>
+      <div class="actions">
+        <button class="btn ripple" value="cancel" autofocus type="submit">Cancel</button>
+        <button class="btn filled danger ripple" value="ok" type="submit" id="confirm-ok">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Output of a command -->
+  <dialog id="output" aria-labelledby="output-title">
+    <form method="dialog" class="dialog-body wide">
+      <h2 id="output-title">Result</h2>
+      <pre id="output-text" class="output"></pre>
+      <div class="actions"><button class="btn filled ripple" value="ok" autofocus type="submit">Close</button></div>
+    </form>
+  </dialog>
+
+  <!-- An attached image, full size -->
+  <dialog id="att-viewer" class="att-viewer" aria-labelledby="att-viewer-title" aria-describedby="att-viewer-meta" closedby="any">
+    <form method="dialog" class="dialog-body wide">
+      <h2 id="att-viewer-title">Image</h2>
+      <p id="att-viewer-meta" class="dim"></p>
+      <div class="att-viewer-frame"><img id="att-viewer-img" alt=""></div>
+      <div class="actions">
+        <button class="btn ripple" type="button" id="att-viewer-dl"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 9h-4V3H9v6H5l7 7 7-7ZM5 18v2h14v-2H5Z"/></svg>Download</button>
+        <button class="btn filled ripple" value="close" type="submit" autofocus>Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- A box: who it is, what it does -->
+  <dialog id="box-dialog" aria-labelledby="box-title" closedby="any">
+    <form method="dialog" class="dialog-body">
+      <h2 id="box-title">Box</h2>
+      <div id="box-content"></div>
+      <div class="actions">
+        <button class="btn ripple" value="close" type="submit">Close</button>
+        <button class="btn ripple" value="write" type="submit" id="box-write">Write</button>
+        <button class="btn filled ripple" value="inbox" type="submit" id="box-inbox" autofocus>See its box</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- At the opening, after a long absence: the collectors' messages about to expire -->
+  <dialog id="startup" aria-labelledby="startup-title" aria-describedby="startup-text" closedby="none">
+    <form method="dialog" class="dialog-body">
+      <h2 id="startup-title">Collector messages about to expire</h2>
+      <div id="startup-text"></div>
+      <div class="actions">
+        <button class="btn ripple" value="keep" type="submit" autofocus>Leave as it is</button>
+        <button class="btn ripple" value="hold" type="submit">Reset the TTLs to 48 h</button>
+        <button class="btn filled danger ripple" value="purge" type="submit">Purge everything</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- A question a session puts to the user -->
+  <dialog id="question" aria-labelledby="q-title" aria-describedby="q-desc" closedby="closerequest">
+    <form id="question-form" method="dialog" class="dialog-body">
+      <div class="q-head">
+        <h2 id="q-title">Question</h2>
+        <span id="q-count" class="chip request"></span>
+      </div>
+      <p id="q-from" class="q-from"></p>
+      <div id="q-desc" class="q-desc"></div>
+      <div id="q-about"></div>
+      <fieldset id="q-options" class="q-options">
+        <legend id="q-legend">Proposed solutions</legend>
+        <div id="q-option-list" class="q-option-list"></div>
+      </fieldset>
+      <div class="field">
+        <textarea id="q-text" placeholder=" " rows="3" maxlength="8000"></textarea>
+        <label for="q-text">Add to it, or answer something else</label>
+      </div>
+      <p id="q-hint" class="help">Choose at least one solution, or write an answer.</p>
+      <p id="q-error" class="error" role="alert"></p>
+      <div class="actions">
+        <button class="btn ripple" value="skip" type="submit" id="q-skip" formnovalidate>Skip</button>
+        <button class="btn filled ripple" value="send" type="submit" id="q-send" disabled>Send the answer</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- How this computer handles what a machine or a box sends: one menu, opened from each node of the tree -->
+  <div id="rights-menu" class="menu" popover="auto">
+    <div role="menu" aria-labelledby="rights-menu-title" id="rights-menu-items">
+      <p id="rights-menu-title" class="menu-title"></p>
+      <button type="button" role="menuitem" id="rights-pause" class="pause-item" hidden></button>
+      <button type="button" role="menuitem" id="rights-range" class="pause-item" hidden>Statistics period…</button>
+      <hr id="rights-pause-sep" hidden>
+      <div role="group" aria-label="Handling">
+        <button type="button" role="menuitemradio" aria-checked="false" data-rights="execute">Execute<span class="hint">acts without asking</span></button>
+        <button type="button" role="menuitemradio" aria-checked="false" data-rights="ask">Ask<span class="hint">asks you the question</span></button>
+        <button type="button" role="menuitemradio" aria-checked="false" data-rights="archive">Ignore<span class="hint">archived without showing</span></button>
+      </div>
+      <hr>
+      <button type="button" role="menuitemradio" aria-checked="false" data-rights="follow" id="rights-follow">Follow the workstation</button>
+    </div>
+  </div>
+
+  <!-- The period of a network's traffic counter -->
+  <div id="range-menu" class="menu" popover="auto">
+    <div role="menu" aria-labelledby="range-menu-title">
+      <p id="range-menu-title" class="menu-title">Messages through it over</p>
+      <div role="group" aria-label="Period">
+        <button type="button" role="menuitemradio" aria-checked="false" data-range="300">5 minutes</button>
+        <button type="button" role="menuitemradio" aria-checked="false" data-range="3600">1 hour</button>
+        <button type="button" role="menuitemradio" aria-checked="false" data-range="86400">1 day</button>
+        <button type="button" role="menuitemradio" aria-checked="false" data-range="604800">7 days</button>
+      </div>
+      <hr>
+      <button type="button" role="menuitem" class="pause-item" data-range="clear">Clear<span class="hint">resets the counter to zero</span></button>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>
