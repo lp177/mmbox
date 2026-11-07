@@ -198,7 +198,7 @@ done
 hash_of() { tr -d '\n' < "$1" | $SHA | awk '{print $1}'; }
 CMDS="-@all +ping +hello +auth +client|setname +client|id +select +xadd +xread +xrange +xrevrange +xdel +xtrim +xlen"
 CMDS+=" +get +set +del +unlink +exists +expire +pexpire +ttl +pttl +hset +hsetnx +hget +hmget +hgetall +hdel +hexists"
-CMDS+=" +scan +multi +exec +discard"
+CMDS+=" +scan +multi +exec +discard +info +memory|usage +dbsize"
 printf 'user default off\nuser mmbox-admin on #%s ~* &* +@all\nuser mmbox-gateway on #%s ~mmbox:* &mmbox:* %s\n' \
     "$(hash_of "$DATA/secrets/admin.pw")" "$(hash_of "$DATA/secrets/gateway.pw")" "$CMDS" > "$DATA/users.acl.new"
 chmod 644 "$DATA/users.acl.new"   # hashes only: Redis (another uid in its container) must read it

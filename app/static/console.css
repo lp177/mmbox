@@ -162,7 +162,8 @@ main { min-height: 0; }
 }
 .pane { min-height: 0; overflow: auto; border-right: 1px solid var(--line); }
 .pane-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 12px 4px; flex-wrap: wrap; }
-.tree-pane { background: var(--s1); padding-bottom: 24px; }
+.tree-pane { background: var(--s1); display: flex; flex-direction: column; }
+.tree-pane .tree { flex: 1 0 auto; padding-bottom: 16px; }
 .tree-pane .field { margin: 6px 12px; }
 .list-pane { display: flex; flex-direction: column; overflow: hidden; }
 /* the list and the open message share one cell: the list stays laid out under the message, so it keeps its scroll position */
@@ -229,7 +230,8 @@ main { min-height: 0; }
 .chip.broadcast { background: rgb(197 138 249 / .18); color: var(--violet); }
 .chip.unread { background: var(--primary); color: var(--primary-ink); }
 .chip.taken { background: rgb(253 214 99 / .16); color: var(--warn); }
-.chip.queued { background: rgb(242 139 130 / .18); color: var(--err); }
+.chip.queued, .chip.dropped { background: rgb(242 139 130 / .18); color: var(--err); }
+.chip.stranded { background: rgb(253 214 99 / .16); color: var(--warn); }
 .chip.ok { background: rgb(129 201 149 / .16); color: var(--ok); }
 
 /* ---------- the message */
@@ -268,6 +270,12 @@ details.raw pre { font: 12px/1.5 var(--mono); background: var(--s1); padding: 12
 .reply-head { font-size: 14px; font-weight: 500; color: var(--text-2); margin: 0 0 4px; }
 #reply-form .row .field { flex: 0 1 220px; }
 #reply-form .row .field.grow { flex: 1 1 260px; }
+.reply-route { font-size: 12.5px; color: var(--text-2); margin: 6px 0 0; }
+.reply-route.warn { color: var(--warn); }
+.reply-sent:empty { display: none; }
+.reply-sent { display: grid; gap: 6px; margin: 0 0 12px; }
+.sent-note { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; background: var(--s2); border-left: 3px solid var(--ok, #4caf50); padding: 8px 12px; border-radius: 6px; font-size: 13px; color: var(--text-2); }
+.sent-note strong { color: var(--text); font-weight: 500; }
 .reply-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
 
 /* ---------- tables, cards */
@@ -566,3 +574,40 @@ dialog.att-viewer { width: min(1100px, calc(100vw - 32px)); }
 .decide details > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 4px; }
 .btn.danger:not(.filled) { color: var(--err); }
 .btn.danger:not(.filled):hover { background: rgb(242 139 130 / 0.12); }
+
+/* ---------------------------------------------------------------- memory: the explorer's frame and its view */
+.mem-frame {
+  position: sticky; bottom: 0; margin: 8px 10px 10px; flex: none; display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; text-align: left; font: inherit; color: var(--text); cursor: pointer; overflow: hidden;
+  background: var(--s2); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: 0 -8px 16px var(--s1); transition: background .15s var(--ease), border-color .15s var(--ease);
+}
+.mem-frame:hover { background: var(--s3); border-color: var(--line-strong); }
+.mem-frame:active { background: var(--s4); }
+.mem-frame:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.mem-frame-title { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-2); }
+.mem-line { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+.mem-line > :first-child { color: var(--text-2); }
+.mem-line > :last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mem-bar { display: block; height: 4px; border-radius: 2px; background: var(--s4); overflow: hidden; }
+.mem-bar > span { display: block; height: 100%; width: 0; background: var(--teal); border-radius: inherit; transition: width .3s var(--ease); }
+.mem-bar.warn > span { background: var(--warn); }
+.mem-bar.err > span { background: var(--err); }
+.mem-body { min-width: min(720px, 92vw); max-width: 920px; gap: 8px; }
+.mem-head { display: flex; align-items: center; gap: 12px; }
+.mem-head h2 { margin: 0; flex: 1; }
+.mem-at { font-size: 12px; color: var(--text-3); }
+.mem-h { font-size: 13px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text-2); margin: 14px 0 2px; }
+.mem-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.mem-card { background: var(--s2); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.mem-card h4 { margin: 0; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
+.mem-card h4 span { color: var(--text-2); font-weight: 400; font-variant-numeric: tabular-nums; }
+.mem-card .why { color: var(--warn); font-size: 13px; margin: 0; }
+.mem-card .path { color: var(--text-3); font-size: 12px; font-family: var(--mono); overflow-wrap: anywhere; }
+.mem-action { display: flex; align-items: center; gap: 16px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--s2); }
+.mem-action > div { flex: 1; min-width: 0; }
+.mem-action p { margin: 4px 0 0; font-size: 13px; color: var(--text-2); }
+.mem-action .btn { flex: none; }
+@media (prefers-reduced-motion: reduce) {
+  .mem-frame, .mem-bar > span { transition: none; }
+}

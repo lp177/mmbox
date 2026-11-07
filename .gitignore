@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 users.acl
 infisical-client-*
+
+# a deployment's own values (site.example/README.md): never in this repository
+/site

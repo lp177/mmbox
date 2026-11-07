@@ -21,7 +21,7 @@ jobs:
           python -m py_compile app/mmbox_console.py gateway/mmbox_gateway.py
       - name: Build
         run: |
-          paths="client app gateway deploy README.md LICENSE"
+          paths="client app gateway deploy site.example README.md LICENSE"
           git archive --format=tar.gz --prefix=mmbox/ -o mmbox.tar.gz HEAD $paths
           git archive --format=zip --prefix=mmbox/ -o mmbox.zip HEAD $paths
           cp client/mmbox.py client/PROTOCOL.md .

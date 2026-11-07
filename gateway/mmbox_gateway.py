@@ -71,6 +71,7 @@ import base64, hashlib, json, os, re, time
 
 from aiohttp import web
 import redis.asyncio as aioredis
+from redis.exceptions import ResponseError as RedisError
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -118,6 +119,8 @@ OPERATORS = [o for o in re.split(r"[,\s]+", os.environ.get("MMBOX_OPERATORS", ""
 if OPERATORS:  # a box may ask the first operator's console a question, and the console answers it (no pairing)
     FEATURES.append("questions")
 FEATURES.append("stats")
+FEATURES.append("usage")
+_USAGE: dict = {"at": 0.0, "data": None}
 STATS_KEEP_MS = 7 * 86_400_000  # the traffic counted per minute, for 7 days whatever the collector keeps
 _STATS: dict = {"at": 0.0, "data": None}
 
@@ -284,6 +287,90 @@ async def stats(request: web.Request) -> web.Response:
             start = "(" + rows[-1][0]
         _STATS.update(at=now, data={"buckets": sorted(buckets.values()), "keep_s": STATS_KEEP_MS // 1000, "now_ms": now_ms})
     return ok(_STATS["data"])
+
+
+async def _scan(r: aioredis.Redis, pattern: str) -> list[str]:
+    return [k async for k in r.scan_iter(match=pattern, count=1000)]
+
+
+async def _sizes(r: aioredis.Redis, keys: list[str]) -> int | None:
+    """What these keys take in Redis's memory (MEMORY USAGE), in bytes; None when the gateway's Redis user may not
+    ask (an ACL older than the `usage` feature: +info +memory|usage +dbsize)."""
+    total = 0
+    try:
+        for i in range(0, len(keys), 500):
+            async with r.pipeline(transaction=False) as p:
+                for k in keys[i:i + 500]:
+                    p.memory_usage(k)
+                total += sum(int(x or 0) for x in await p.execute())
+    except RedisError:
+        return None
+    return total
+
+
+BOX_KEYS = ("card", "links", "in", "alerts", "chan", "watch", "machine", "hinted", "box")  # what a box is, here
+
+
+async def usage(request: web.Request) -> web.Response:
+    """The service's memory, for an operator: Redis's own figures (used, peak, limit, eviction policy) and what the
+    boxes, the channels, the collector and the traffic counts take. Recomputed at most every 30 s, unless `fresh`.
+    `empty`: every box removed, the operators' own excepted (their questions stay): its card, links, declaration,
+    channel, alerts and what waits in it, taken or not, for good. A box still in use registers again by itself at its
+    next call (its client answers "unknown identity" with its card and links); a message written to it meanwhile waits
+    in its sender's queue. The collector notes who did it, how many boxes and entries went."""
+    me, data = await signed_json(request)
+    if me not in OPERATORS:
+        raise _http(403, "the service's memory is for its operators only (MMBOX_OPERATORS)")
+    r = request.app["redis"]
+    emptied = None
+    if data.get("empty"):
+        ids = set(await r.hgetall("mmbox:seen"))
+        for kind in ("card", "in", "box", "links"):
+            ids |= {k.split(":", 2)[2] for k in await _scan(r, f"mmbox:{kind}:*")}
+        ids = sorted(i for i in ids if ID_RE.fullmatch(i) and i not in OPERATORS)
+        entries = 0
+        for i in range(0, len(ids), 200):
+            async with r.pipeline(transaction=False) as p:
+                for b in ids[i:i + 200]:
+                    p.xlen(f"mmbox:in:{b}")
+                entries += sum(int(x or 0) for x in await p.execute())
+            async with r.pipeline(transaction=False) as p:
+                for b in ids[i:i + 200]:
+                    p.delete(*(f"mmbox:{k}:{b}" for k in BOX_KEYS), f"mmbox:chanrate:{b}")
+                    p.hdel("mmbox:seen", b)
+                await p.execute()
+        receipts = [k for k in await _scan(r, "mmbox:take:*") + await _scan(r, "mmbox:recover:*")
+                    if k.split(":")[2] not in OPERATORS]
+        for i in range(0, len(receipts), 500):
+            await r.delete(*receipts[i:i + 500])
+        emptied = {"boxes": len(ids), "entries": entries}
+        await col(r, {"ev": "empty", "by": me, "boxes": str(len(ids)), "entries": str(entries)})
+        _USAGE["at"] = 0.0
+    now = time.time()
+    if _USAGE["data"] is None or now - _USAGE["at"] > 30 or data.get("fresh"):
+        try:
+            mem, nkeys, acl = await r.info("memory"), await r.dbsize(), None
+        except RedisError as e:  # NOPERM: the boxes' counts still come, Redis's own figures do not
+            mem, nkeys, acl = {}, None, f"the gateway's Redis user may not read the memory figures ({e}): " \
+                                        "deploy Redis again with the current ACL (+info +memory|usage +dbsize)"
+        boxes = [k for k in await _scan(r, "mmbox:in:*") if k.split(":", 2)[2] not in OPERATORS]  # what `empty` takes
+        chans = await _scan(r, "mmbox:chan:*")
+        known = sum(1 for k in await _scan(r, "mmbox:card:*") if k.split(":", 2)[2] not in OPERATORS)
+        waiting = 0
+        for i in range(0, len(boxes), 500):
+            async with r.pipeline(transaction=False) as p:
+                for k in boxes[i:i + 500]:
+                    p.xlen(k)
+                waiting += sum(int(x or 0) for x in await p.execute())
+        _USAGE.update(at=now, data={
+            "used": int(mem.get("used_memory") or 0), "peak": int(mem.get("used_memory_peak") or 0),
+            "max": int(mem.get("maxmemory") or 0), "policy": mem.get("maxmemory_policy"),
+            "dataset": int(mem.get("used_memory_dataset") or 0), "keys": nkeys, "acl": acl,
+            "boxes": {"count": known, "entries": waiting, "bytes": await _sizes(r, boxes)},  # bytes: what waits
+            "channels": {"count": len(chans), "bytes": await _sizes(r, chans)},
+            "collector": {"entries": await r.xlen("mmbox:col"), "bytes": await _sizes(r, ["mmbox:col"])},
+            "stats": {"bytes": await _sizes(r, ["mmbox:stats"])}})
+    return ok({**_USAGE["data"], "emptied": emptied, "at_ms": int(_USAGE["at"] * 1000)})
 
 
 def note_of(data: dict, me: str) -> str | None:
@@ -783,8 +870,7 @@ async def close(request: web.Request) -> web.Response:
     me, data = await signed_json(request)
     own_box(me, data)
     r = request.app["redis"]
-    n = await r.delete(*(f"mmbox:{k}:{me}" for k in ("card", "links", "in", "alerts", "chan", "watch", "machine", "hinted",
-                                                     "box")))
+    n = await r.delete(*(f"mmbox:{k}:{me}" for k in BOX_KEYS))
     await r.hdel("mmbox:seen", me)
     await col(r, {"ev": "removed", "box": me})
     return ok({"removed": n})
@@ -1074,7 +1160,8 @@ def make_app() -> web.Application:
                      ("/v1/close", close), ("/v1/lock", lock), ("/v1/alerts", alerts), ("/v1/watch", watch),
                      ("/v1/chan/post", chan_post), ("/v1/chan/read", chan_read), ("/v1/box/open", box_open),
                      ("/v1/box/close", box_close), ("/v1/boxes", boxes), ("/v1/col/read", col_read),
-                     ("/v1/box/activity", box_activity), ("/v1/col/config", col_config), ("/v1/stats", stats)):
+                     ("/v1/box/activity", box_activity), ("/v1/col/config", col_config), ("/v1/stats", stats),
+                     ("/v1/usage", usage)):
         app.router.add_post(path, fn)
     return app
 

@@ -2,7 +2,9 @@
 """mmbox console: the operator's graphical view of the mmbox services, boxes and messages (optional).
 
 A local web application (standard library only, besides the client's own `cryptography`): run it, open the URL it
-prints. It listens on 127.0.0.1 only and every API call carries the random token of that URL.
+prints. It listens on 127.0.0.1 only and every API call carries the random token of that URL. With pywebview (Debian:
+python3-webview) the same page opens in a window of its own, from the icon in the notification area (--browser: no
+window, the browser as before).
 
 What it shows, merged in one tree machine > project > box (like a file manager):
   - the boxes of this computer and their messages: the local logs (decrypted, as each box handled them) and what
@@ -18,7 +20,7 @@ through `mmbox.py` itself, so the rules of the client apply.
 The operator identity is this console's own key pair, in ~/.config/mmbox-console/ (MMBOX_CONSOLE_HOME): never an
 mmbox box, never paired. Its id goes to MMBOX_OPERATORS on the gateways it may read.
 
-  python3 app/mmbox_console.py [--port 8765] [--open] [--client PATH] [--days 7] [--refresh 8]
+  python3 app/mmbox_console.py [--port 8765] [--open] [--browser] [--no-tray] [--client PATH] [--days 7] [--refresh 8]
 """
 from __future__ import annotations
 
@@ -35,6 +37,50 @@ VERBOSE = bool(os.environ.get("MMBOX_CONSOLE_DEBUG"))
 
 def log(*a):
     print("console:", *a, file=sys.stderr, flush=True)
+
+
+WAITING = ("queued", "sent", "unread", "taken")  # a message's states while it is still in a box (or on its way)
+# final states besides read: "delivered" (its service says it was consumed: what the logs of this computer and the
+# collectors could not tell, as for a message sent before a collector ran), "stranded" (it waits in a box that closed:
+# the relay forwards real messages, not the tool's own), "dropped" (its sender gave up: no service ever accepted it)
+DELIVERY_RECHECK_S = 120  # a sent message the service still holds is asked about again after this long
+DELIVERY_GROUPS = 24  # (service, sender, recipient) asked per refresh at most: the first refreshes catch up in turn
+
+
+def fmt_bytes(n: float) -> str:
+    for unit in ("B", "kB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} GB"
+
+
+def dir_size(p: Path) -> int:
+    """The bytes of a file, or of everything under a folder (links not followed)."""
+    try:
+        if p.is_symlink():
+            return 0
+        if p.is_file():
+            return p.stat().st_size
+        total = 0
+        for root, _, files in os.walk(p):
+            for f in files:
+                try:
+                    total += os.lstat(os.path.join(root, f)).st_size
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def webkit_dirs() -> list[Path]:
+    """Where WebKitGTK keeps the window's page data (local storage, cache), named after the program (mmbox-console)."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return []
+    data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return [data / "mmbox-console", cache / "mmbox-console"]
 
 
 # ---------------------------------------------------------------- the client, imported as a module
@@ -293,80 +339,358 @@ class Questions:
             self.save()
 
 
-class Desktop:
-    """This computer's desktop, when it has one (Linux: a session bus, PyGObject, AyatanaAppIndicator3, libnotify): an
-    icon in the notification area, with a red dot while questions wait (the badge setting); one persistent
-    notification while questions wait and no browser tab shows its own (never one per question); the sound, played
-    here when no tab can play it."""
+def desktop_session() -> bool:
+    """A Linux graphical session with a session bus: where the notification area and the notifications are."""
+    return os.name != "nt" and sys.platform != "darwin" and bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS")) \
+        and bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
-    def __init__(self, home: Path, url_of, on_quit):
-        self.ok, self.url_of, self.on_quit = False, url_of, on_quit
-        self.note, self.dismissed, self.shown = None, set(), None
-        if os.name == "nt" or sys.platform == "darwin" or not os.environ.get("DBUS_SESSION_BUS_ADDRESS") \
-                or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+
+class AppWindow:
+    """The console in a window of its own (pywebview: WebKitGTK on Linux, WebView2 on Windows, WebKit on macOS): the
+    same page as in the browser, with the same token. Its close button hides it in the notification area while the
+    icon is there (`can_hide`, set by Desktop), otherwise it quits the console. Every call may come from any thread:
+    pywebview's own calls wait for the window, so they run in a short thread of their own."""
+
+    # the questions: at once when the page has them, else at its next poll (what #question=next does at the opening)
+    JS_QUESTION = "pendingQ().length ? openQuestions() : (S.wantQuestion = true, poll(true))"
+
+    def __init__(self, webview, url: str, shown: bool, home: Path):
+        self.wv, self.home = webview, home
+        self.can_hide, self.quitting, self.visible = False, False, shown
+        self.on_change = lambda: None  # the icon's menu follows the window
+        webview.settings["ALLOW_DOWNLOADS"] = True  # the attached files: a save dialog
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+        width, height = 1280, 860
+        if desktop_session():
+            try:
+                from gi.repository import Gdk, GdkPixbuf, Gtk
+                Gtk.init([])
+                # its icon in the task bar: set before the window exists, which the default icon applies to only
+                icon = str(STATIC / "icon.svg")
+                Gtk.Window.set_default_icon_list([GdkPixbuf.Pixbuf.new_from_file_at_size(icon, n, n)
+                                                  for n in (16, 24, 32, 48, 64, 128, 256)])
+                # most of the screen pywebview centres it on (its first), a 4K one included
+                geo = Gdk.Display.get_default().get_monitor(0).get_geometry()
+                width, height = max(1100, int(geo.width * 0.7)), max(760, int(geo.height * 0.8))
+            except Exception as e:
+                log(f"window: {type(e).__name__}: {e}")
+        self.win = webview.create_window("mmbox console", url, width=width, height=height, min_size=(760, 520),
+                                         hidden=not shown, background_color="#121212", text_select=True)
+        self.win.events.closing += self._closing
+
+    @staticmethod
+    def _bg(fn, *a) -> None:
+        threading.Thread(target=fn, args=a, daemon=True, name="window").start()
+
+    def _closing(self) -> bool:
+        """The close button: hidden in the notification area (False cancels the close), or the console stops."""
+        if self.quitting or not self.can_hide:
+            self.quitting = True
+            return True
+        self.hide()
+        return False
+
+    def show(self, question: bool = False) -> None:
+        def run():
+            self.win.show()
+            self.win.restore()  # out of the task bar, in front
+            if question:
+                self.win.evaluate_js(self.JS_QUESTION)
+        self.visible = True
+        self._bg(run)
+        self.on_change()
+
+    def on_screen(self) -> bool:
+        """Shown and not minimized. Called in the GTK loop on Linux, where the window itself says it."""
+        try:
+            from webview.platforms.gtk import BrowserView
+            from gi.repository import Gdk
+            w = BrowserView.instances[self.win.uid].window
+            gw = w.get_window()
+            return w.get_visible() and not (gw and gw.get_state() & Gdk.WindowState.ICONIFIED)
+        except Exception:
+            return self.visible
+
+    def hide(self) -> None:
+        self.visible = False
+        self._bg(self.win.hide)
+        self.on_change()
+
+    def quit(self) -> None:
+        self.quitting = True
+        self._bg(self.win.destroy)
+
+    def run(self) -> None:
+        """The window's loop, on the main thread, until the console quits. On Linux it is also the icon's GTK loop."""
+        opts = {"private_mode": False, "storage_path": str(self.home / "webview")}  # the page's settings are kept
+        if desktop_session():
+            opts["gui"] = "gtk"
+        self.wv.start(**opts)
+
+
+SNI_XML = """<node><interface name="org.kde.StatusNotifierItem">
+ <property name="Category" type="s" access="read"/><property name="Id" type="s" access="read"/>
+ <property name="Title" type="s" access="read"/><property name="Status" type="s" access="read"/>
+ <property name="WindowId" type="i" access="read"/><property name="IconThemePath" type="s" access="read"/>
+ <property name="IconName" type="s" access="read"/><property name="AttentionIconName" type="s" access="read"/>
+ <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+ <property name="ItemIsMenu" type="b" access="read"/><property name="Menu" type="o" access="read"/>
+ <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+ <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+ <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+ <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+ <signal name="NewTitle"/><signal name="NewIcon"/><signal name="NewAttentionIcon"/><signal name="NewToolTip"/>
+ <signal name="NewStatus"><arg name="status" type="s"/></signal>
+</interface></node>"""
+
+
+class SniTray:
+    """The icon as a StatusNotifierItem of its own (KDE Plasma, GNOME's AppIndicator extension, most panels): a
+    click opens the console (Activate), the right button shows the menu (exported with Dbusmenu)."""
+
+    PATH, IFACE = "/StatusNotifierItem", "org.kde.StatusNotifierItem"
+
+    def __init__(self, d: "Desktop"):
+        import gi
+        gi.require_version("Dbusmenu", "0.4")
+        from gi.repository import Dbusmenu
+        Gio, GLib = d.Gio, d.GLib
+        self.d, self.D, self.GLib, self.Gio = d, Dbusmenu, GLib, Gio
+        self.icon, self.tip = "mmbox-console", "mmbox console"
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self.server = Dbusmenu.Server.new("/MenuBar")
+        root = Dbusmenu.Menuitem.new()
+        self.items = {}
+        for key, label, act in d.menu():
+            it = Dbusmenu.Menuitem.new()
+            if key == "sep":
+                it.property_set(Dbusmenu.MENUITEM_PROP_TYPE, Dbusmenu.CLIENT_TYPES_SEPARATOR)
+            else:
+                it.property_set(Dbusmenu.MENUITEM_PROP_LABEL, label)
+                it.connect("item-activated", lambda *_, act=act: act())
+            root.child_append(it)
+            self.items[key] = it
+        self.server.set_root(root)
+        iface = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        self.reg = self.bus.register_object(self.PATH, iface, self._call, self._get, None)
+        self.own = Gio.bus_own_name_on_connection(self.bus, self.name, Gio.BusNameOwnerFlags.NONE, self._owned, None)
+        self.refresh()
+
+    def _owned(self, *_):
+        """Registered with the panel's watcher, and again each time it starts (a restarted plasmashell)."""
+        self.watch = self.Gio.bus_watch_name_on_connection(
+            self.bus, "org.kde.StatusNotifierWatcher", self.Gio.BusNameWatcherFlags.NONE, self._register, None)
+
+    def _register(self, *_):
+        def done(bus, res):
+            try:
+                bus.call_finish(res)
+            except Exception as e:
+                log(f"notification area: {e}")
+        self.bus.call("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher",
+                      "RegisterStatusNotifierItem", self.GLib.Variant("(s)", (self.name,)), None,
+                      self.Gio.DBusCallFlags.NONE, -1, None, done)
+
+    def _call(self, bus, sender, path, iface, method, params, inv):
+        if method == "Activate":  # a click: the window opens, or folds back into the notification area
+            self.d.toggle()
+        elif method == "SecondaryActivate":  # the middle button: the questions when some wait
+            self.d.open(question=bool(self.d.pending_n))
+        inv.return_value(None)
+
+    def _get(self, bus, sender, path, iface, prop):
+        V = self.GLib.Variant
+        return {"Category": V("s", "Communications"), "Id": V("s", "mmbox-console"), "Title": V("s", "mmbox console"),
+                "Status": V("s", "Active"), "WindowId": V("i", 0), "IconThemePath": V("s", str(self.d.icons)),
+                "IconName": V("s", self.icon), "AttentionIconName": V("s", "mmbox-console-alert"),
+                "ToolTip": V("(sa(iiay)ss)", (self.icon, [], "mmbox console", self.tip)),
+                "ItemIsMenu": V("b", False), "Menu": V("o", "/MenuBar")}.get(prop)
+
+    def _signal(self, name: str) -> None:
+        self.bus.emit_signal(None, self.PATH, self.IFACE, name, None)
+
+    def set_icon(self, icon: str, tip: str) -> None:
+        if (icon, tip) != (self.icon, self.tip):
+            self.icon, self.tip = icon, tip
+            self._signal("NewIcon")
+            self._signal("NewToolTip")
+
+    def refresh(self) -> None:
+        D = self.D
+        for key, (label, enabled, visible) in self.d.menu_state().items():
+            it = self.items[key]
+            if label:
+                it.property_set(D.MENUITEM_PROP_LABEL, label)
+            it.property_set_bool(D.MENUITEM_PROP_ENABLED, enabled)
+            it.property_set_bool(D.MENUITEM_PROP_VISIBLE, visible)
+
+
+class AyatanaTray:
+    """The icon through AyatanaAppIndicator3, where Dbusmenu is missing or no StatusNotifierWatcher runs (it falls
+    back to the old system tray itself): a click shows the menu, the middle button opens the console."""
+
+    def __init__(self, d: "Desktop"):
+        import gi
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3 as AI
+        Gtk, GLib = d.Gtk, d.GLib
+        GLib.log_set_handler("libayatana-appindicator", GLib.LogLevelFlags.LEVEL_WARNING, lambda *a: None)  # "deprecated"
+        self.d = d
+        ind = AI.Indicator.new_with_path("mmbox-console", "mmbox-console", AI.IndicatorCategory.COMMUNICATIONS, str(d.icons))
+        ind.set_status(AI.IndicatorStatus.ACTIVE)
+        ind.set_title("mmbox console")
+        menu, self.items = Gtk.Menu(), {}
+        for key, label, act in d.menu():
+            it = Gtk.SeparatorMenuItem() if key == "sep" else Gtk.MenuItem(label=label)
+            if act:
+                it.connect("activate", lambda *_, act=act: act())
+            menu.append(it)
+            self.items[key] = it
+        menu.show_all()
+        ind.set_menu(menu)
+        ind.set_secondary_activate_target(self.items["open"])
+        self.ind = ind
+        self.refresh()
+
+    def set_icon(self, icon: str, tip: str) -> None:
+        self.ind.set_icon_full(icon, tip)
+
+    def refresh(self) -> None:
+        for key, (label, enabled, visible) in self.d.menu_state().items():
+            it = self.items[key]
+            if label:
+                it.set_label(label)
+            it.set_sensitive(enabled)
+            it.set_visible(visible)
+
+
+class Desktop:
+    """This computer's desktop, when it has one (Linux: a session bus, PyGObject, libnotify, Dbusmenu or
+    AyatanaAppIndicator3): an icon in the notification area, with a red dot while questions wait (the badge setting),
+    whose click opens the console (its window, or the browser with --browser) and whose menu opens it, opens the
+    local site in the browser, hides the window in the notification area or quits; one persistent notification while
+    questions wait and no browser tab shows its own (never one per question); the sound, played here when no tab can
+    play it. With the window, the GTK loop is the window's, on the main thread; without it, its own, in a thread."""
+
+    def __init__(self, home: Path, url_of, on_quit, app: AppWindow | None = None):
+        self.ok, self.url_of, self.on_quit, self.app = False, url_of, on_quit, app
+        self.note, self.dismissed, self.shown, self.tray, self.pending_n = None, set(), None, None, 0
+        if not desktop_session():
             return
         try:
             import gi
             gi.require_version("Gtk", "3.0")
-            gi.require_version("AyatanaAppIndicator3", "0.1")
             gi.require_version("Notify", "0.7")
-            from gi.repository import GLib, Gtk, Notify
-            from gi.repository import AyatanaAppIndicator3 as AI
+            from gi.repository import Gio, GLib, Gtk, Notify
         except (ImportError, ValueError) as e:
-            log(f"no icon in the notification area ({e}): install python3-gi, gir1.2-ayatanaappindicator3-0.1, gir1.2-notify-0.7")
+            log(f"no icon in the notification area ({e}): install python3-gi, gir1.2-dbusmenu-glib-0.4, gir1.2-notify-0.7")
             return
-        self.GLib, self.Gtk, self.Notify, self.AI = GLib, Gtk, Notify, AI
-        GLib.log_set_handler("libayatana-appindicator", GLib.LogLevelFlags.LEVEL_WARNING, lambda *a: None)  # "deprecated"
+        self.Gio, self.GLib, self.Gtk, self.Notify = Gio, GLib, Gtk, Notify
         self.icons = home / "icons"
         self.icons.mkdir(parents=True, exist_ok=True)
         for name, dot in (("mmbox-console", False), ("mmbox-console-alert", True)):
             (self.icons / f"{name}.svg").write_text(tray_svg(dot), encoding="utf-8")
+        if app:
+            app.on_change = lambda: GLib.idle_add(self._refresh)
+            self.ok = True  # built as soon as the window's loop runs
+            GLib.idle_add(self._build)
+            return
         ready = threading.Event()
 
         def run():
             try:
                 Gtk.init([])
-                Notify.init("mmbox console")
-                ind = AI.Indicator.new_with_path("mmbox-console", "mmbox-console", AI.IndicatorCategory.COMMUNICATIONS, str(self.icons))
-                ind.set_status(AI.IndicatorStatus.ACTIVE)
-                ind.set_title("mmbox console")
-                menu = Gtk.Menu()
-                it_open = Gtk.MenuItem(label="Open the console")
-                it_open.connect("activate", lambda *_: self.open())
-                self.it_q = Gtk.MenuItem(label="No question waiting")
-                self.it_q.set_sensitive(False)
-                self.it_q.connect("activate", lambda *_: self.open(question=True))
-                it_quit = Gtk.MenuItem(label="Quit the console")
-                it_quit.connect("activate", lambda *_: self.on_quit())
-                for it in (it_open, self.it_q, Gtk.SeparatorMenuItem(), it_quit):
-                    menu.append(it)
-                menu.show_all()
-                ind.set_menu(menu)
-                ind.set_secondary_activate_target(it_open)
-                self.ind = ind
+                self._build()
+            finally:
                 ready.set()
+            if self.tray:
                 Gtk.main()
-            except Exception as e:
-                log(f"notification area unavailable: {type(e).__name__}: {e}")
-                ready.set()
         threading.Thread(target=run, daemon=True, name="desktop").start()
         ready.wait(10)
-        self.ok = hasattr(self, "ind")
+        self.ok = self.tray is not None
+
+    def _build(self) -> bool:
+        try:
+            self.Notify.init("mmbox console")
+        except Exception as e:
+            log(f"notifications unavailable: {e}")
+        watcher = self.Gio.bus_get_sync(self.Gio.BusType.SESSION, None).call_sync(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner",
+            self.GLib.Variant("(s)", ("org.kde.StatusNotifierWatcher",)), None, self.Gio.DBusCallFlags.NONE, 2000, None)[0]
+        errors = []
+        for kind in ((SniTray, AyatanaTray) if watcher else (AyatanaTray, SniTray)):
+            try:
+                self.tray = kind(self)
+                break
+            except Exception as e:
+                errors.append(f"{kind.__name__}: {type(e).__name__}: {e}")
+        if self.tray is None:
+            log("no icon in the notification area (" + "; ".join(errors) + "): install gir1.2-dbusmenu-glib-0.4 "
+                "(or gir1.2-ayatanaappindicator3-0.1)")
+            self.ok = False
+        if self.app:
+            self.app.can_hide = self.tray is not None
+            if self.tray is None and not self.app.visible:
+                self.app.show()  # without an icon, nothing else could open it
+        return False
+
+    # ---- the menu: (key, label, action); its state follows the window and the questions
+    def menu(self) -> list[tuple]:
+        return [("open", "Open the console", self.open),
+                ("browser", "Open the local site in the browser", self.open_browser),
+                ("questions", "No question waiting", lambda: self.open(question=True)),
+                ("hide", "Hide in the notification area", self.hide),
+                ("sep", None, None),
+                ("quit", "Quit the console", self.on_quit)]
+
+    def menu_state(self) -> dict:
+        n, app = self.pending_n, self.app
+        return {"open": ("Open the console" if app else "Open the console in the browser", True, True),
+                "browser": (None, True, bool(app)),
+                "questions": (f"Answer the questions ({n})" if n else "No question waiting", bool(n), True),
+                "hide": (None, bool(app and app.visible), bool(app and app.can_hide))}
+
+    def _refresh(self) -> bool:
+        if self.tray:
+            self.tray.refresh()
+        return False
+
+    def toggle(self) -> None:
+        """The icon's click: the window folds back when it is on screen, else it opens."""
+        if self.app and self.app.can_hide and self.app.on_screen():
+            self.app.hide()
+        else:
+            self.open()
 
     def open(self, question: bool = False) -> None:
+        if self.app:
+            self.app.show(question=question)
+        else:
+            self._browser(self.url_of(question))
+
+    def open_browser(self) -> None:
+        self._browser(self.url_of(False))
+
+    def hide(self) -> None:
+        if self.app and self.app.can_hide:
+            self.app.hide()
+
+    @staticmethod
+    def _browser(url: str) -> None:
         import webbrowser
-        webbrowser.open(self.url_of(question))
+        threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
 
     def update(self, pending: list[dict], badge: bool, popup: bool) -> None:
         if self.ok:
             self.GLib.idle_add(self._update, [dict(q) for q in pending], badge, popup)
 
     def _update(self, pending, badge, popup):
-        n = len(pending)
-        self.ind.set_icon_full("mmbox-console-alert" if badge and n else "mmbox-console",
+        n = self.pending_n = len(pending)
+        if self.tray:
+            self.tray.set_icon("mmbox-console-alert" if badge and n else "mmbox-console",
                                f"{n} question(s) waiting" if n else "mmbox console")
-        self.it_q.set_label(f"Answer the questions ({n})" if n else "No question waiting")
-        self.it_q.set_sensitive(bool(n))
+            self.tray.refresh()
         ids = {q["id"] for q in pending}
         if not (popup and n) or ids <= self.dismissed:  # nothing waits, a tab shows its own, or the user closed it
             if self.note is not None and not (popup and n):
@@ -580,6 +904,19 @@ class Archive:
             self.db.execute("DELETE FROM msgs WHERE id NOT IN (SELECT id FROM conv WHERE expired=0)")
             self.db.execute("COMMIT")
 
+    def purge(self, keep: set) -> int:
+        """Every kept message but those of `keep` gone, pinned conversations included; a marker stays for each, so
+        that the boxes' logs do not bring them back. The file is compacted after."""
+        with self.lock:
+            gone = [(r[0],) for r in self.db.execute("SELECT id FROM msgs") if r[0] not in keep]
+            self.db.execute("BEGIN")
+            self.db.executemany("UPDATE conv SET expired=1 WHERE id=?", gone)
+            self.db.executemany("DELETE FROM msgs WHERE id=?", gone)
+            self.db.execute("COMMIT")
+            self.db.execute("VACUUM")
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return len(gone)
+
     def get(self, mid: str) -> dict | None:
         with self.lock:
             r = self.db.execute("SELECT data FROM msgs WHERE id=?", (mid,)).fetchone()
@@ -628,6 +965,7 @@ class State:
         self.cards: dict[str, dict] = self._load_cards()
         self.snapshot: dict = {"version": 0}
         self.messages: dict[str, dict] = {}
+        self._usage: tuple[float, dict] = (0.0, {})
         self.digest = ""
         self.errors: list[str] = []
         self.startup: dict | None = None  # what the operator is asked once, at the opening (collector retention)
@@ -644,6 +982,7 @@ class State:
         self.desktop: Desktop | None = None
         self.known_q: set | None = None  # the questions seen at the last tick (None: not yet: no sound at the opening)
         self.rights: dict[str, dict] = {}
+        self.delivery: dict[str, dict] = {}  # message id -> {"st": consumed|taken|waiting|unknown, "at": when asked}
 
     def save_console_state(self) -> None:
         tmp = self.seen_path.with_suffix(".tmp")
@@ -684,6 +1023,101 @@ class State:
             self.desktop.update(pend, badge=st["badge"], popup=st["popup"] and not tab_notify)
         if new and st["audio"] and not tab_audio and (p := self.sound_path()):
             Desktop.play(p)
+
+    def waiting_ids(self) -> set:
+        """The messages still in a box: sent and not consumed yet, unread, taken, or queued by their sender."""
+        with self.lock:
+            return {mid for mid, m in self.messages.items() if m.get("state") in WAITING}
+
+    def usage(self, fresh: bool = False) -> dict:
+        """What the services' Redis (where this console is an operator) and this computer hold, for the explorer's
+        frame and the memory view. Cached a minute, unless `fresh`."""
+        at, cached = self._usage
+        if cached and not fresh and time.time() - at < 60:
+            return cached
+
+        def one(srv):
+            row = {"name": srv["name"], "url": srv["url"]}
+            if not srv.get("operator"):
+                row["why"] = "this console is no operator of it"
+            elif not srv.get("ok"):
+                row["why"] = "unreachable"
+            elif "usage" not in (srv.get("features") or []):
+                row["why"] = "its gateway predates the memory figures: update it"
+            else:
+                r = call(srv["url"], self.op, "/usage", {"fresh": fresh})
+                if r.get("_error") is not None:
+                    row["why"] = f"{r['_error']} {r.get('error', '')}".strip()
+                else:
+                    row["redis"] = {k: r.get(k) for k in ("used", "peak", "max", "policy", "dataset", "keys", "boxes",
+                                                           "channels", "collector", "stats", "at_ms", "acl")}
+            return row
+        import concurrent.futures as cf
+        servers = list(self.snapshot.get("servers") or [])
+        with cf.ThreadPoolExecutor(max(1, min(8, len(servers)))) as ex:
+            rows = list(ex.map(one, servers))
+        out = {"servers": rows, "local": self.local_usage(), "at": time.time()}
+        self._usage = (time.time(), out)
+        return out
+
+    def local_usage(self) -> dict:
+        """This computer: the console's folder (its copy of the messages, their attached files, the window's data)
+        and the boxes' folder (their keys, logs and attached files)."""
+        home, boxes_dir = self.op.home, Path(M.base_dir())
+        archive = sum(dir_size(home / f"archive.sqlite{x}") for x in ("", "-wal", "-shm"))
+        atts, wv_home = dir_size(home / "attachments"), dir_size(home / "webview")
+        webkit, total_home = sum(dir_size(d) for d in webkit_dirs()), dir_size(home)
+        waiting = self.waiting_ids()
+        with self.archive.lock:
+            ids = [r[0] for r in self.archive.db.execute("SELECT id FROM msgs")]
+        console = {"archive": archive, "attachments": atts, "window": wv_home + webkit,
+                   "other": max(0, total_home - archive - atts - wv_home), "total": total_home + webkit, "path": str(home)}
+        boxes = {"total": dir_size(boxes_dir), "path": str(boxes_dir),
+                 "profiles": sum(1 for d in boxes_dir.iterdir() if d.is_dir()) if boxes_dir.is_dir() else 0}
+        return {"console": console, "boxes": boxes, "total": console["total"] + boxes["total"],
+                "messages": len(ids), "purgeable": sum(1 for i in ids if i not in waiting)}
+
+    def purge_archive(self) -> dict:
+        """The memory view's first button: every message the console keeps that no longer waits in a box, and the
+        attached files it keeps for them. The boxes' own logs on this computer are not touched."""
+        keep = self.waiting_ids()
+        before = self.local_usage()["console"]["total"]
+        n = self.archive.purge(keep)
+        with self.lock:
+            shas = {str(a.get("sha256") or "") for mid in keep for a in (self.messages.get(mid) or {}).get("attachments") or []}
+        files = 0
+        folder = self.op.home / "attachments"
+        if folder.is_dir():
+            for f in folder.iterdir():
+                if f.is_file() and f.name not in shas:
+                    f.unlink(missing_ok=True)
+                    files += 1
+        after = self.local_usage()["console"]["total"]
+        self._usage = (0.0, {})
+        return {"ok": True, "out": f"{n} message(s) purged from the console, {files} attached file(s); "
+                                   f"{len(keep)} still waiting kept; {fmt_bytes(max(0, before - after))} freed."}
+
+    def empty_boxes(self) -> dict:
+        """The memory view's second button: every box of every service where this console is an operator deleted
+        with what waits in it, for every computer (the operators' own box excepted); live sessions register again."""
+        lines, ok = [], True
+        for srv in self.snapshot.get("servers") or []:
+            if not (srv.get("operator") and srv.get("ok") and "usage" in (srv.get("features") or [])):
+                continue
+            r = call(srv["url"], self.op, "/usage", {"empty": True}, timeout=120)
+            if r.get("_error") is not None:
+                ok = False
+                lines.append(f"{srv['name']}: failed ({r['_error']} {r.get('error', '')})")
+            else:
+                e = r.get("emptied") or {}
+                lines.append(f"{srv['name']}: {e.get('boxes', 0)} box(es) deleted with {e.get('entries', 0)} waiting message(s); "
+                             f"Redis now {fmt_bytes(r.get('used') or 0)}")
+        if not lines:
+            return {"ok": False, "err": "no service where this console is an operator has the memory figures"}
+        log("boxes emptied: " + "; ".join(lines))
+        threading.Thread(target=self.refresh, daemon=True).start()
+        self._usage = (0.0, {})
+        return {"ok": ok, "out": "\n".join(lines)}
 
     def fetch_questions(self, servers: list[dict], peers: dict) -> list[str]:
         """What boxes wrote to this console on each service where it is the operator: questions (and their
@@ -1051,6 +1485,7 @@ class State:
                     jobs[(n, u)] = (lambda b=b, u=u: unread_of(b, u))
         for k, v in parallel(jobs).items():
             waiting[k] = v or []
+        self.check_delivery(profiles, servers)
 
         for srv in servers:  # each collector's retention, for the settings
             if srv["operator"] and srv["ok"] and "collector" in srv["features"]:
@@ -1064,6 +1499,39 @@ class State:
                 errors.append(f"startup check: {e}")
         with self.lock:
             self._build(servers, tables, profiles, peers, waiting, errors)
+
+    def check_delivery(self, profiles: dict, servers: list[dict]) -> None:
+        """The messages the last model left "sent" (no collector saw them, their recipient is not on this computer):
+        their sender's service says whether it still holds them (/v1/status), once consumed for good."""
+        ok_urls = {s["url"] for s in servers if s["ok"]}
+        now = time.time()
+        groups: dict[tuple, list] = {}
+        with self.lock:
+            prev = list(self.messages.values())
+        for m in prev:
+            if m.get("state") != "sent" or not m.get("entry") or not m.get("to") or m.get("broadcast"):
+                continue
+            d = self.delivery.get(m["id"])
+            if d and (d["st"] == "consumed" or now - d["at"] < DELIVERY_RECHECK_S * (30 if d["st"] == "unknown" else 1)):
+                continue
+            prof = next((x.split(":", 1)[1] for x in m.get("sources") or [] if x.startswith("local:")), None)
+            url = next((u for u in m.get("servers") or [] if u in ok_urls), None)
+            if prof in profiles and url:
+                groups.setdefault((url, prof, m["to"]), []).append(m)
+        if not groups:
+            return
+        picked = sorted(groups.items(), key=lambda kv: min((self.delivery.get(m["id"]) or {}).get("at", 0) for m in kv[1]))
+        picked = dict(picked[:DELIVERY_GROUPS])
+
+        def ask(url, prof, to, ms):
+            ms = ms[-1000:]
+            r = call(url, profiles[prof], "/status", {"to": to, "entries": [m["entry"] for m in ms]})
+            st = r.get("status") if isinstance(r.get("status"), dict) else None
+            return {m["id"]: (st or {}).get(m["entry"], "unknown") for m in ms} if st is not None else \
+                {m["id"]: "unknown" for m in ms}
+        for res in parallel({k: (lambda k=k, v=v: ask(*k, v)) for k, v in picked.items()}).values():
+            for mid, st in (res or {}).items():
+                self.delivery[mid] = {"st": st, "at": now}
 
     # -- the merged model
     def _build(self, servers, tables, profiles, peers, waiting, errors):
@@ -1230,8 +1698,12 @@ class State:
                     st = e.get("status")
                     if st == "queued" and m.get("state") not in ("read", "taken", "unread", "sent"):
                         m["state"] = "queued"
-                    elif st == "sent" and m.get("state") in (None, "queued"):
+                        m["queued_by"] = n
+                    elif st == "sent" and m.get("state") in (None, "queued", "dropped"):
                         m["state"] = "sent"
+                    elif st == "dropped" and m.get("state") in (None, "queued"):
+                        m["state"] = "dropped"
+                        m["reason"] = e.get("reason")
                     if e.get("entry"):
                         m["entry"] = e["entry"]
                 else:
@@ -1242,8 +1714,30 @@ class State:
                     m["read_at"] = e.get("at")
                     if e.get("box") == "machine":
                         m["via_machine"] = True
+                    tb = e.get("taken_by") if isinstance(e.get("taken_by"), dict) else None
+                    if tb and (tb.get("id") or tb.get("label")):  # the session whose listener took a machine-box message
+                        m["taken_by"] = {k: tb.get(k) for k in ("id", "label", "profile")}
+                        if tb.get("id"):
+                            box(tb["id"], label=tb.get("label"), profile=tb.get("profile"))
                     if e.get("reason"):
                         m["reason"] = e["reason"]
+
+        outboxes: dict[str, set] = {}  # queued, but no longer in its sender's outbox: dropped before the log said it
+        for m in msgs.values():
+            n = m.pop("queued_by", None)
+            if m.get("state") == "queued" and n in profiles:
+                if n not in outboxes:
+                    st = profiles[n].local.load("state.json", {}) or {}
+                    outboxes[n] = {i.get("msg_id") for i in st.get("outbox") or []}
+                if m["id"] not in outboxes[n]:
+                    m["state"] = "dropped"
+                    m["reason"] = m.get("reason") or "no longer in its sender's outbox: dropped by its client"
+
+        # what the services said of the messages still "sent" (check_delivery)
+        for m in msgs.values():
+            d = self.delivery.get(m["id"])
+            if d and m.get("state") == "sent":
+                m["state"] = {"consumed": "delivered", "taken": "taken", "waiting": "unread"}.get(d["st"], "sent")
 
         # 2. what waits unread in the boxes of this computer
         for (n, u), rows in waiting.items():
@@ -1264,6 +1758,7 @@ class State:
 
         # 3. the collectors: what each service saw, and the annotations sealed for this console
         activity = []
+        box_open: dict[str, tuple] = {}  # each box's last word in the collectors: (time, open or not)
         for u, st in self.col.items():
             by_entry = {}
             for ev in st["events"]:
@@ -1318,7 +1813,16 @@ class State:
                         elif m.get("state") == "unread":
                             m["state"] = "taken"
                         m["events"].append({"ev": kind, "t": t, "server": u})
+                elif kind == "empty":  # an operator deleted every box of this service: what waited there is gone
+                    for mid in by_entry.values():
+                        if msgs[mid].get("state") in ("unread", "taken"):
+                            msgs[mid]["state"] = "emptied"
+                            msgs[mid]["events"].append({"ev": kind, "t": t, "server": u})
+                    activity.append({"id": f"{u}#{ev['entry']}", "ev": kind, "box": ev.get("by"), "t": t, "server": u,
+                                     "reason": f"{ev.get('boxes', '?')} box(es) deleted with {ev.get('entries', '?')} waiting message(s)"})
                 else:  # the boxes' lifecycle on this service
+                    if kind in ("open", "active", "close") and ev.get("box") and t >= box_open.get(ev["box"], (0,))[0]:
+                        box_open[ev["box"]] = (t, kind != "close")
                     info = ev.get("info") if isinstance(ev.get("info"), dict) else {}
                     if info:
                         box(ev.get("box"), label=info.get("label"), role=info.get("role"), machine=info.get("machine"),
@@ -1326,6 +1830,15 @@ class State:
                             title=info.get("title"), activity=info.get("activity"), at_ms=t)
                     activity.append({"id": f"{u}#{ev['entry']}", "ev": kind, "box": ev.get("box"), "t": t, "server": u,
                                      "reason": ev.get("reason")})
+
+        # stranded: still in a box that closed (on this computer, or by what a collector saw last) and is not active now
+        active_now = {b["id"] for b in boxes.values() if b.get("active") and "table" in b.get("sources", [])}
+        closed_here = {y.id for y in profiles.values() if y.closed_at}
+        for m in msgs.values():
+            to = m.get("to")
+            if m.get("state") in ("unread", "taken") and not m.get("broadcast") and to and to not in active_now \
+                    and (to in closed_here or box_open.get(to, (0, True))[1] is False):
+                m["state"] = "stranded"
 
         # labels and the relations of each message to the boxes
         for m in msgs.values():
@@ -1338,6 +1851,11 @@ class State:
             m.setdefault("state", "sent")
             k = m.get("kind")
             m["tier"] = tier_of(m)
+        for m in msgs.values():  # answered: a later message of the thread, from another box than the asker
+            o = msgs.get(m.get("re") or "")
+            if o and not o.get("broadcast") and m.get("from") and m["from"] != o.get("from") \
+                    and m.get("kind") not in ("ack", "pong", "notice") and not m.get("broadcast"):
+                o.setdefault("answers", []).append(m["id"])
         for a in activity:
             box(a["box"])
         # machines: a session's machine box; a box with none is its own machine group by host name
@@ -1543,6 +2061,10 @@ def act(state: State, body: dict) -> dict:
         r = run_client(args)
         threading.Thread(target=state.refresh, daemon=True).start()
         return r
+    if a == "purge_archive":  # the memory view: what the console keeps of the messages no longer waiting in a box
+        return state.purge_archive()
+    if a == "empty_boxes":  # the memory view: every box of every service where this console is an operator
+        return state.empty_boxes()
     if a == "col_config":  # an operator's collector: retention, hold every entry 48 h more, purge
         url = s("url")
         srv = next((x for x in state.snapshot.get("servers", []) if x["url"] == url), None)
@@ -1742,6 +2264,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"count": len(pend), "ids": [x["id"] for x in pend], "version": st.snapshot.get("version", 0),
                                    "latest": ({k: pend[-1].get(k) for k in ("id", "from", "label", "title", "subject")} if pend else None),
                                    "desktop": bool(st.desktop and st.desktop.ok)})
+            if u.path == "/api/usage":  # the explorer's memory frame and the memory view
+                return self._json(st.usage(fresh=(q.get("fresh") or ["0"])[0] == "1"))
             if u.path == "/api/sound":  # the operator's own sound (the presets are static files)
                 f = st.op.home / "sounds" / "custom.mp3"
                 if not f.is_file():
@@ -1837,7 +2361,9 @@ def main():
     ap.add_argument("--client", help="path of mmbox.py (default: ../client/mmbox.py, then the one mmbox-install put here)")
     ap.add_argument("--days", type=float, default=7, help="how far back to show messages (0: everything kept)")
     ap.add_argument("--refresh", type=float, default=8, help="seconds between two refreshes")
-    ap.add_argument("--open", action="store_true", help="open the console in the default browser")
+    ap.add_argument("--open", action="store_true", help="open the console at once (its window, or the browser with --browser)")
+    ap.add_argument("--browser", action="store_true",
+                    help="no window of its own: the icon and --open open the console in the default browser")
     ap.add_argument("--whoami", action="store_true", help="print the operator id and fingerprint, then exit")
     ap.add_argument("--no-tray", action="store_true", help="no icon in the notification area, no system notification")
     a = ap.parse_args()
@@ -1866,20 +2392,57 @@ def main():
     Handler.state, Handler.token, Handler.port = state, secrets.token_urlsafe(24), a.port
     httpd = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     url = f"http://127.0.0.1:{a.port}/#token={Handler.token}"
+    url_of = lambda question=False: url + ("&question=next" if question else "")  # noqa: E731
+    app = None if a.browser else app_window(url, a.open or a.no_tray, op.home)
     if not a.no_tray:
         def quit_console():
             log("stopped from the notification area")
+            if app:
+                app.quit()
             threading.Thread(target=httpd.shutdown, daemon=True).start()
-        state.desktop = Desktop(op.home, lambda question=False: url + ("&question=next" if question else ""), quit_console)
+        state.desktop = Desktop(op.home, url_of, quit_console, app)
         state.tick()
     print(f"mmbox console: {url}\n  operator id {op.id} · fingerprint {op.fingerprint}\n  Ctrl+C to stop", flush=True)
-    if a.open:
+    if a.open and not app:
         import webbrowser
         webbrowser.open(url)
+    if app is None:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        return
+    threading.Thread(target=httpd.serve_forever, daemon=True, name="http").start()
+    if desktop_session():  # Ctrl+C and SIGTERM, which the GTK loop would otherwise never let Python see
+        import signal
+        from gi.repository import GLib
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: (app.quit(), False)[1])
     try:
-        httpd.serve_forever()
+        app.run()
     except KeyboardInterrupt:
         pass
+    httpd.shutdown()
+
+
+def app_window(url: str, shown: bool, home: Path) -> AppWindow | None:
+    """The console's own window (pywebview), or None: the browser then, as before."""
+    if os.name != "nt" and sys.platform != "darwin" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return None  # no graphical session: a server, an SSH session
+    try:
+        if desktop_session():
+            import gi
+            gi.require_version("Gtk", "3.0")
+            gi.require_version("Gdk", "3.0")
+            gi.require_version("GdkPixbuf", "2.0")
+            from gi.repository import GLib
+            GLib.set_prgname("mmbox-console")  # the window's class, and where WebKit keeps the page's storage
+            GLib.set_application_name("mmbox console")
+        import webview
+    except (ImportError, ValueError) as e:
+        log(f"no window of its own ({e}): install pywebview (Debian: python3-webview); the browser opens the console")
+        return None
+    return AppWindow(webview, url, shown, home)
 
 
 if __name__ == "__main__":

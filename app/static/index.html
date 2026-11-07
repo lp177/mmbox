@@ -47,6 +47,14 @@
           <label for="tree-filter">Filter the tree</label>
         </div>
         <ul id="tree" class="tree" role="tree" aria-label="Machines, projects, boxes"></ul>
+        <button id="mem-frame" class="mem-frame ripple" type="button" aria-haspopup="dialog" aria-controls="mem-dialog"
+                aria-describedby="mem-frame-sum">
+          <span class="mem-frame-title">Memory</span>
+          <span class="mem-line"><span>Redis</span><span id="mem-redis">…</span></span>
+          <span class="mem-bar" aria-hidden="true"><span id="mem-redis-bar"></span></span>
+          <span class="mem-line"><span>This computer</span><span id="mem-local">…</span></span>
+          <span id="mem-frame-sum" class="sr"></span>
+        </button>
       </aside>
 
       <section class="pane list-pane" aria-label="Message list">
@@ -60,8 +68,9 @@
               <option value="all">All</option>
               <option value="unread">Unread</option>
               <option value="late">Unread for too long</option>
-              <option value="read">Read</option>
+              <option value="read">Taken</option>
               <option value="pending">Queued / sent</option>
+              <option value="undelivered">Never read (closed box, dropped)</option>
               <option value="broadcast">Broadcasts</option>
               <option value="direct">Direct messages</option>
             </select>
@@ -170,6 +179,7 @@
         <div id="reader-scroll" class="reader-scroll" tabindex="-1">
           <article id="detail" class="reader-body" aria-live="polite"></article>
           <div id="reply-zone" class="reply-zone">
+            <div id="reply-sent" class="reply-sent" aria-live="polite"></div>
             <form id="reply-form" class="reply" hidden aria-labelledby="reply-head">
               <h3 id="reply-head" class="reply-head"></h3>
               <div class="row">
@@ -186,6 +196,7 @@
                 <button id="reply-discard" class="btn text ripple" type="button">Discard</button>
                 <button id="reply-send" class="btn filled ripple" type="submit" disabled>Send</button>
               </div>
+              <p id="reply-route" class="reply-route"></p>
               <p id="reply-error" class="error" role="alert"></p>
             </form>
           </div>
@@ -401,6 +412,39 @@
         <button class="btn ripple" value="cancel" autofocus type="submit">Cancel</button>
         <button class="btn filled danger ripple" value="ok" type="submit" id="confirm-ok">Confirm</button>
       </div>
+    </form>
+  </dialog>
+
+  <!-- Memory: what Redis and this computer hold, and the two purges -->
+  <dialog id="mem-dialog" aria-labelledby="mem-title" closedby="any">
+    <form method="dialog" class="dialog-body wide mem-body">
+      <div class="mem-head">
+        <h2 id="mem-title">Memory</h2>
+        <span id="mem-at" class="mem-at"></span>
+        <button id="mem-refresh" class="btn icon ripple" type="button" aria-label="Measure again" title="Measure again">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.74 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35Z"/></svg>
+        </button>
+      </div>
+      <h3 class="mem-h">Redis, per service</h3>
+      <div id="mem-servers" class="mem-cards"></div>
+      <h3 class="mem-h">This computer</h3>
+      <div id="mem-localbox" class="mem-cards"></div>
+      <h3 class="mem-h">Free space</h3>
+      <div class="mem-action">
+        <div>
+          <strong>Purge the console's messages</strong>
+          <p id="mem-purge-text"></p>
+        </div>
+        <button id="mem-purge" class="btn danger ripple" type="button">Purge</button>
+      </div>
+      <div class="mem-action">
+        <div>
+          <strong>Delete every mmbox box</strong>
+          <p id="mem-empty-text"></p>
+        </div>
+        <button id="mem-empty" class="btn danger filled ripple" type="button">Delete the boxes</button>
+      </div>
+      <div class="actions"><button class="btn ripple" value="close" type="submit" autofocus>Close</button></div>
     </form>
   </dialog>
 

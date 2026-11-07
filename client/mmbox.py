@@ -112,8 +112,11 @@ SILENT = ("pinged", "pong", "link", "transport", "retired", "introduced")  # boo
 # wakes the agent (an introduced session is trusted by the tool on its own: the agent would only read "nothing to do")
 TOOL_KINDS = ("ping", "pong", "notice", "forward", "transport", "retire", "link")  # never relayed
 QUEUED: set = set()  # messages of this process the service did not accept yet (memories closed): retried later
+QUEUE_NOTES: list | None = None  # `start` collects the queued sends here and says them in one line
 ALERTED: list = []  # alert batches this process printed (a listener returns on them: the user must hear of them)
 QUIET_KINDS = ("ping", "pong", "notice", "transport", "retire", "link")  # nothing for the user to process
+EPHEMERAL_KINDS = ("ping", "pong", "notice")  # worth nothing once their session's box closed: the relay consumes them
+# there (logged in that box's own log); transport, retire and link stay, its session uses them if it comes back
 # Life of a session box: open while it is used (a live listener, or its agent process); closed after SESSION_IDLE_S
 # without either (what waits for it goes to the machine box, its remote peers are told); removed SESSION_KEEP_S after
 # closing (store, gateway, local keys). A session that comes back opens its box again (or gets a new one once removed).
@@ -865,17 +868,16 @@ class Gateway:
         for attempt in range(3):
             ts, nonce = str(int(time.time() + self.skew)), secrets.token_hex(16)
             msg = "\n".join(["mmbox/2", "POST", "/v1" + path, ts, nonce, hashlib.sha256(raw).hexdigest()]).encode()
-            req = urllib.request.Request(self.url + "/v1" + path, data=raw, method="POST", headers={
-                "Content-Type": "application/json", "User-Agent": UA, "X-Mmbox-Id": me.id, "X-Mmbox-Ts": ts,
-                "X-Mmbox-Nonce": nonce, "X-Mmbox-Sig": b64e(me.sign.sign(msg))})
+            headers = {"Content-Type": "application/json", "User-Agent": UA, "X-Mmbox-Id": me.id, "X-Mmbox-Ts": ts,
+                       "X-Mmbox-Nonce": nonce, "X-Mmbox-Sig": b64e(me.sign.sign(msg))}
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    self._clock(r.headers.get("Date"))
-                    return json.loads(r.read() or b"{}")
-            except urllib.error.HTTPError as e:
-                self._clock(e.headers.get("Date") if e.headers else None)
+                code, rh, data = http_request(self.url + "/v1" + path, "POST", raw, headers, timeout)
+                self._clock(rh.get("Date"))
+                if code < 400:
+                    return json.loads(data or b"{}")
+                e = urllib.error.HTTPError(self.url + "/v1" + path, code, "", rh, None)
                 try:
-                    why = json.loads(e.read() or b"{}").get("error", "")
+                    why = json.loads(data or b"{}").get("error", "")
                 except ValueError:
                     why = ""
                 if e.code in (502, 503, 504) and attempt < 2:
@@ -889,7 +891,7 @@ class Gateway:
                 if soft:
                     return {"_error": e.code, "error": why}
                 die(f"gateway {path}: HTTP {e.code} {why}")
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
                 if attempt < 2:
                     time.sleep(1 + attempt * 2)
                     continue
@@ -907,9 +909,11 @@ class Gateway:
 
     def health(self) -> dict:
         try:
-            with urllib.request.urlopen(urllib.request.Request(self.url + "/v1/health", headers={"User-Agent": UA}), timeout=10) as r:
-                self._clock(r.headers.get("Date"))
-                return json.loads(r.read() or b"{}")
+            code, rh, data = http_request(self.url + "/v1/health", "GET", None, {"User-Agent": UA}, 10)
+            self._clock(rh.get("Date"))
+            if code >= 400:
+                return {"_error": code, "error": f"HTTP {code}"}
+            return json.loads(data or b"{}")
         except (urllib.error.URLError, OSError, ValueError) as e:
             return {"_error": 0, "error": str(getattr(e, "reason", e))}
 
@@ -996,6 +1000,66 @@ class Gateway:
 
 
 _GATEWAYS: dict[str, Gateway] = {}
+_POOL = threading.local()  # kept-alive connections, one set per thread: over a slow link a new TLS connection costs
+# several round trips per request, a kept one a single round trip
+_PROXIED = any(os.environ.get(k) for k in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"))
+
+
+def http_request(url: str, method: str, body: bytes | None, headers: dict, timeout: float) -> tuple[int, dict, bytes]:
+    """One HTTP request on a kept-alive connection of this thread (a new one when it was closed meanwhile):
+    (status, headers, body). Behind a proxy (its environment variables), urllib as before. OSError on a network
+    failure, as urllib raises."""
+    import http.client
+    if _PROXIED or os.environ.get("MMBOX_NO_KEEPALIVE"):
+        req = urllib.request.Request(url, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, dict(r.headers), r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers or {}), e.read() or b""
+    u = urllib.parse.urlsplit(url)
+    key = (u.scheme, u.hostname, u.port)
+    pool = getattr(_POOL, "conns", None)
+    if pool is None:
+        pool = _POOL.conns = {}
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    for attempt in range(2):
+        conn, fresh = pool.get(key), key not in pool
+        if conn is None:
+            if u.scheme == "https":
+                import ssl
+                conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=ssl.create_default_context())
+            else:
+                conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
+            pool[key] = conn
+        try:
+            conn.timeout = timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            conn.request(method, path, body=body, headers={**headers, "Connection": "keep-alive"})
+            r = conn.getresponse()
+            data = r.read()
+            hdrs = {k: v for k, v in r.getheaders()}
+            if (r.getheader("Connection") or "").lower() == "close":
+                conn.close()
+                pool.pop(key, None)
+            return r.status, hdrs, data
+        except (http.client.RemoteDisconnected, http.client.CannotSendRequest, http.client.BadStatusLine,
+                BrokenPipeError, ConnectionResetError) as exc:
+            conn.close()
+            pool.pop(key, None)
+            if fresh or attempt:
+                raise OSError(f"{type(exc).__name__}: {exc}") from None
+            continue  # a kept connection the server had closed while idle: once more, on a new one
+        except http.client.HTTPException as exc:
+            conn.close()
+            pool.pop(key, None)
+            raise OSError(f"{type(exc).__name__}: {exc}") from None
+        except OSError:
+            conn.close()
+            pool.pop(key, None)
+            raise
+    raise OSError("no answer")
 
 
 def gateway(url: str) -> Gateway:
@@ -1430,6 +1494,12 @@ def flush_outbox(me: "Me") -> int:
             alerts.append(("unsent", peer or {"alias": item["peer_id"], "user": "?", "label": "?"}, item["msg_id"],
                            time.time() - item["at"], "the service never accepted it (the peer is not on it, or never "
                            "listed this box); dropped"))
+            p = item.get("payload") or {}  # the log says it too, or the message stays "queued" there for ever
+            me.local.append_log({"dir": "out", "id": item["msg_id"], "peer": item["peer_id"], "status": "dropped", "at": iso(),
+                                 "payload": {k: p[k] for k in ("v", "id", "ts", "from", "to", "kind", "subject", "project", "re")
+                                             if k in p},
+                                 "reason": "the peer is no longer known" if not peer else
+                                           f"not accepted by any shared service for {RECEIPT_TTL_S / 86400:g} days"})
         else:
             keep.append(item)
     warned = {k["msg_id"] for k in keep if k.get("warned")}
@@ -2064,8 +2134,14 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
             return None
         # local log first: if we die after this line, the take left behind makes the next pass report it
         seen[msg_id] = item["status"]
+        taker = {"taken_by": {"profile": announce.profile, "id": (announce.load("identity.json", {}) or {}).get("id"),
+                              "label": (announce.load("config.json", {}) or {}).get("label"),
+                              "session_id": (announce.load("config.json", {}) or {}).get("session_id")}} \
+            if me.role == "machine" and announce is not None and announce.profile != me.local.profile else {}
+        if taker:
+            item["taken_by"] = taker["taken_by"]
         me.local.append_log({"dir": "in", "id": msg_id, "peer": mid, "status": item["status"], "at": iso(),
-                             "payload": p, "reason": item.get("reason"), **({"env": env} if p is None else {})})
+                             "payload": p, "reason": item.get("reason"), **taker, **({"env": env} if p is None else {})})
         me.local.update("state.json", lambda st, i=msg_id, v=item["status"]: st.setdefault("seen", {}).__setitem__(i, v))
         if p is not None:
             peer["last_in"] = {"id": msg_id, "ts": p["ts"], "subject": p.get("subject", ""), "kind": p.get("kind")}
@@ -2934,6 +3010,26 @@ def unhandled_handover(local: Local) -> str | None:
             f"({', '.join(ids[-10:])})")
 
 
+def missing_skill_links() -> str | None:
+    """`start` run through a project's links to the mailbox skills (e.g. <project>/.agents/skills/<skill>, links into
+    the ai/skills clone): the skills of the same group the project has no link to yet (a link set made before they
+    existed). None when started otherwise, or when nothing is missing."""
+    try:
+        script = Path(sys.argv[0]).absolute()
+        skill = script.parent.parent  # <skills folder>/<skill>/scripts/mmbox.py
+        here, real = skill.parent, Path(os.path.realpath(skill)).parent
+        if not (skill / "SKILL.md").exists() or real == here or not real.is_dir():
+            return None
+        expected = {d.name for d in real.iterdir() if (d / "SKILL.md").is_file()}
+        missing = sorted(expected - {d.name for d in here.iterdir()})
+    except OSError:
+        return None
+    if not missing:
+        return None
+    return (f"NOTE: {here} has no link to {', '.join(missing)} (skills of the same group in {real}): link them as the "
+            f"others are (`ln -s {real}/<skill> {here}/`), or run the ai/skills installer again. Tell the user once")
+
+
 def tmp_warning() -> str | None:
     """The temp folder where an agent harness writes command outputs (a listener's included) is nearly full."""
     import shutil
@@ -2953,6 +3049,15 @@ def rtt_of(healths: dict, url: str) -> float:
     return float((healths.get(url) or (None, None))[1] or 0)
 
 
+def budgeted(fns: list, limit_s: float) -> None:
+    """Run the calls one after the other in this thread (its kept-alive connections), until `limit_s` is spent."""
+    end = time.monotonic() + limit_s
+    for f in fns:
+        if time.monotonic() >= end:
+            return
+        f()
+
+
 def parallel(fns: list, limit_s: float) -> None:
     """Run the calls side by side, waiting `limit_s` at most for them all; the late ones go on in the background."""
     ts = [threading.Thread(target=f, daemon=True) for f in fns]
@@ -2968,9 +3073,11 @@ def describe_session(o: Me) -> str:
             f"{o.agent} session {o.session_id or 'unknown'})")
 
 
-def untaken(y: Me, store: Store, project: str, min_age: float) -> tuple[dict, list[dict]]:
+def untaken(y: Me, store: Store, project: str, min_age: float,
+            ephemeral: list | None = None) -> tuple[dict, list[dict]]:
     """What waits for session `y` that nobody took, older than `min_age`, on memories and on its gateway; the tool's own
-    messages between sessions (ping, pong, notice, forward) left out."""
+    messages between sessions (ping, pong, notice, forward) left out. With `ephemeral` (a list), the untaken gateway
+    entries of an EPHEMERAL_KINDS are added to it (with their payload) instead of being only skipped."""
     ypeers = peers_load(y.local)
     out = []
     for pid, peer in ypeers.items():
@@ -2994,10 +3101,26 @@ def untaken(y: Me, store: Store, project: str, min_age: float) -> tuple[dict, li
         for e in r.get("entries", []):
             peer = ypeers.get(e.get("from"))
             age = ((r.get("now_ms") or 0) - e["stored_ms"]) / 1000
+            if not peer and ephemeral is not None and not e.get("taken") and (sb := local_box(e.get("from"))):
+                peer = own_peer(sb)  # a session of this computer closed since: its own key verifies what it sent
+                try:
+                    p = open_envelope(y, peer, e.get("env") or {})
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if p.get("kind") in EPHEMERAL_KINDS:
+                    ephemeral.append({"src": "gateway", "gw": gw.url, "pid": e["from"], "peer": peer, "age": age,
+                                      "entry": e["entry"], "payload": p,
+                                      "msg_id": str((e.get("env") or {}).get("id") or e["entry"])})
+                continue
             if e.get("taken") or not peer or age < min_age or age > RECEIPT_TTL_S:
                 continue
             try:  # the tool's own messages (ping, notice, transport, link…) are never relayed, whoever sent them
-                if open_envelope(y, peer, e.get("env") or {}).get("kind") in TOOL_KINDS:
+                p = open_envelope(y, peer, e.get("env") or {})
+                if p.get("kind") in TOOL_KINDS:
+                    if ephemeral is not None and p.get("kind") in EPHEMERAL_KINDS:
+                        ephemeral.append({"src": "gateway", "gw": gw.url, "pid": e["from"], "peer": peer, "age": age,
+                                          "entry": e["entry"], "payload": p,
+                                          "msg_id": str((e.get("env") or {}).get("id") or e["entry"])})
                     continue
             except (ValueError, KeyError, TypeError):
                 pass
@@ -3107,9 +3230,11 @@ def relay(me: Me, project: str, ack_wait: float = ACK_WAIT_S, min_age: float | N
         if not y or y.user != me.user or y.conf.get("project") != project:
             continue
         if y.closed_at:  # a closed box: what still reaches it goes to the machine box at once, without a ping
-            ypeers, waiting = untaken(y, store, project, 0)
+            stale: list = []
+            ypeers, waiting = untaken(y, store, project, 0, ephemeral=None if dry_run else stale)
             if waiting:
                 closed.append((y, ypeers, waiting))
+            drop_ephemeral(y, store, project, stale)
             continue
         if y.id not in mpeers:
             continue
@@ -3175,6 +3300,43 @@ def relay(me: Me, project: str, ack_wait: float = ACK_WAIT_S, min_age: float | N
                          + "\n".join(f"- {i} from {a}: {sub} (now {f})" for i, a, sub, f in done), "notice", None, False)
             say(f"RELAY: {len(done)} message(s) of {describe_session(y)} forwarded to the machine box ({why})")
     return moved
+
+
+_LOCAL_IDS: dict = {"at": 0.0, "ids": {}}
+
+
+def local_box(bid: str | None) -> "Me | None":
+    """The profile of this computer whose identity is `bid` (closed ones too), or None; the index of identities is
+    read again at most once a minute, on a miss."""
+    if not bid:
+        return None
+    if bid not in _LOCAL_IDS["ids"] and time.time() - _LOCAL_IDS["at"] > 60:
+        ids = {}
+        for name in local_profiles():
+            i = (Local(name).load("identity.json") or {}).get("id")
+            if i:
+                ids[i] = name
+        _LOCAL_IDS.update(at=time.time(), ids=ids)
+    name = _LOCAL_IDS["ids"].get(bid)
+    return load_me(name) if name else None
+
+
+def drop_ephemeral(y: Me, store: Store, project: str, stale: list[dict]) -> int:
+    """The wake-up pings, pongs and notices left in closed box `y`: consumed in its name, each kept in its own log
+    (status `dropped`), the service's collector told `dropped`. Silent: nothing in them is for an agent or the user."""
+    n = 0
+    for w in stale:
+        env, handle = take_for(y, store, project, w, "relay")
+        if env is None:
+            continue
+        p = w["payload"]
+        y.local.append_log({"dir": "in", "id": w["msg_id"], "peer": w["pid"], "status": "dropped", "at": iso(), "payload": p,
+                            "box": "session", "reason": f"a {p.get('kind')} left in this box after it closed on {y.closed_at}: "
+                                                         "worth nothing once its session is gone"})
+        y.local.update("state.json", lambda st, i=w["msg_id"]: st.setdefault("seen", {}).__setitem__(i, "dropped"))
+        gateway(w["gw"]).done(y, [w["entry"]], {w["entry"]: "dropped"})
+        n += 1
+    return n
 
 
 def forward_to_machine(me: Me, machine: Me, machine_peer: dict | None, y: Me, ypeers: dict, waiting: list[dict],
@@ -3678,6 +3840,8 @@ def cmd_start(a, local: Local):
     if local.profile == MACHINE_PROFILE:
         die(f"name this session: `mmbox.py start --session <name>` (profile {MACHINE_PROFILE} is the machine box)")
     sys.stdout.reconfigure(line_buffering=True)  # each step shows as it ends, in a file or a pipe too
+    global QUEUE_NOTES
+    QUEUE_NOTES = []
     CALL_TIMEOUT[0] = min(CALL_TIMEOUT[0], float(os.environ.get("MMBOX_START_CALL_TIMEOUT_S", "12")))
     mlocal = Local(MACHINE_PROFILE)
     project = a.project or (local.load("config.json", {}) or {}).get("project") or \
@@ -3756,26 +3920,37 @@ def cmd_start(a, local: Local):
           f"fingerprint {fingerprint(me.sign_pub, me.box_pub)})" + (f", child of {me.conf['parent']}" if me.conf.get("parent") else ""))
     if note := harness_title(local, me.conf.get("title")):
         print(note)
+    print(f"NEXT (already possible): the box exists; if this command was moved to the background, start listening now "
+          f"with `{listen_command(local.profile)}` as its own background command, without waiting for its end")
     url = a.gateway or os.environ.get("MMBOX_GATEWAY") or m.conf.get("gateway")  # a new session follows its machine box
+    deferred = []
     if url:
         for b in (m, me):
             if b.conf.get("gateway") != url.rstrip("/"):
-                enable_gateway(b, url, project)
+                enable_gateway(b, url, project, announce=b.id == m.id)  # the session's peers are told by its listener
+                if b.id != m.id:
+                    deferred.append(url)
             else:
                 gw_sync(b)
         m, me = load_me(MACHINE_PROFILE), load_me(local.profile)
     for u in gw_urls(m)[1:]:  # and every other service the machine box joined (server join), new session or not
         if u not in gw_urls(me):
-            join_gateway(me, u, project, announce=True)
+            join_gateway(me, u, project, announce=False)
+            deferred.append(u)
             print(f"GATEWAY: {me.label} joins {u}, as its machine box did")
+    if deferred:  # each announcement is a send to a remote peer: the listener's first pass makes them
+        local.update("state.json", lambda st: st.__setitem__("announce_pending", {
+            "why": f"{me.label} is on {', '.join(gw_urls(me))}", "at": time.time()}))
     me = load_me(local.profile)
     # the other OPEN sessions on a gateway now list this one among those who may write to them (a closed box syncs
     # when it opens again): in parallel, START_SYNC_S at most, the rest left to their own listeners' next pass
     others = [b for n in local_profiles() if n not in (local.profile, MACHINE_PROFILE) and (b := load_me(n))
               and not b.closed_at and gw_of(b) and b.user == me.user and b.conf.get("project") == project]
-    parallel([lambda b=b: gw_sync(b) for b in others], START_SYNC_S)
+    # in this thread, on its kept-alive connections (a new thread would open new ones), the most recently used first,
+    # START_SYNC_S at most: the others sync at their own listener's next pass
+    budgeted([lambda b=b: gw_sync(b) for b in sorted(others, key=last_active, reverse=True)], START_SYNC_S / 2)
     healths = {}
-    parallel([lambda g=g: healths.__setitem__(g.url, (g.health(), probe(g.url)))
+    budgeted([lambda g=g: healths.__setitem__(g.url, (g.health(), probe(g.url)))
               for g in {g.url: g for b in (m, me) for g in gateways_of(b)}.values()], START_SYNC_S)
     for b in (m, me):
         for g in gateways_of(b):
@@ -3788,13 +3963,14 @@ def cmd_start(a, local: Local):
         fast = [v for v, (h2, r2) in healths.items() if v != u and h2.get("ok") and r2 is not None and r2 < rtt_of(healths, u) / 4]
         print(f"WARNING: {u} answers in {rtt_of(healths, u):.0f} ms (VPN or network degraded?): every call there is slow"
               + (f"; sends to the peers also on {', '.join(fast)} go there instead" if fast else "") + ". Tell the user once")
-    parallel([lambda g=g: g.watch(me, "$", "$", 0, machine=m.id)  # where each service hints at the arrivals for this box
+    budgeted([lambda g=g: g.watch(me, "$", "$", 0, machine=m.id)  # where each service hints at the arrivals for this box
               for g in (gateways_of(me) if me.id != m.id else []) if "watch" in g.features()], START_SYNC_S)
-    if len(gw_urls(me)) > 1:  # several services: the link with each remote peer negotiated when none is recent
-        links = links_load(me)
-        for pid, q in remote_targets(me).items():
-            if time.time() - float((links.get(pid) or {}).get("at") or 0) > 86400 and len(shared_urls(me, q)) > 1:
-                link_propose(me, pid, q, project, "a session started")
+    if len(gw_urls(me)) > 1 and not deferred:  # several services: the link with each remote peer negotiated when
+        links = links_load(me)  # none is recent (side by side; a new box's listener does it with its announcements)
+        parallel([lambda pid=pid, q=q: link_propose(me, pid, q, project, "a session started")
+                  for pid, q in remote_targets(me).items()
+                  if time.time() - float((links.get(pid) or {}).get("at") or 0) > 86400 and len(shared_urls(me, q)) > 1],
+                 START_SYNC_S)
     if a.read:  # first this session's own box, then the machine box; the old messages come last (BACKLOG). By default
         # the listener's first pass reads them (and announces the backlog): it returns at once if anything waits
         for b, title in ((me, "SESSION BOX"), (m, "MACHINE BOX")):
@@ -3824,10 +4000,17 @@ def cmd_start(a, local: Local):
             print(f"BACKLOG: no message older than {EXPIRE_S / 3600:g} h")
     else:
         print("MESSAGES: read by the listener's first pass (it returns at once with what waits, the backlog announced)")
+    if QUEUE_NOTES:
+        names = sorted(set(QUEUE_NOTES))
+        print(f"QUEUED: {len(QUEUE_NOTES)} message(s) of the tool (introductions, services) wait until {', '.join(names)} "
+              f"list this box on the service (at their next pass); sent again by this box's passes: nothing to do")
+    QUEUE_NOTES = None
     if left := unhandled_handover(local):
         print(left)
     if warn := tmp_warning():
         print(warn)
+    if note := missing_skill_links():
+        print(note)
     print(f"NEXT: listen now with `{listen_command(local.profile)}`, as its own background command (Claude Code: "
           f"run_in_background): it returns only when something arrives for this session (a message of the session box "
           f"or the machine box, a channel post), stops by itself when this agent session ends, and runs the relay round "
@@ -3946,6 +4129,27 @@ def server_users() -> dict:
     return out
 
 
+def announce_services(b: Me, project: str, why: str) -> None:
+    """Tell box `b`'s remote peers every service it is on now, and ask them to negotiate the link again."""
+    for pid, q in remote_targets(b).items():
+        if q.get("caps") is None or "transport" in q["caps"]:
+            tell_gateway(b, pid, q, project, gw_urls(b)[0])
+        link_propose(b, pid, q, project, why)
+
+
+def announce_pending(b: Me, project: str) -> None:
+    """What `start` left to the listener: the announcements of the session box's services (each one a send to a
+    remote peer, slow over a degraded VPN)."""
+    why = ((b.local.load("state.json", {}) or {}).get("announce_pending") or {}).get("why")
+    if not why:
+        return
+    b.local.update("state.json", lambda st: st.pop("announce_pending", None))
+    try:
+        announce_services(load_me(b.local.profile) or b, project, why)
+    except SystemExit:
+        pass
+
+
 def join_gateway(b: Me, url: str, project: str, announce: bool = True) -> bool:
     """Box `b` also on service `url` (its main one unchanged): card and links there, listened to there; its remote
     peers told of every service it is on now, and asked to negotiate the link again."""
@@ -3959,10 +4163,7 @@ def join_gateway(b: Me, url: str, project: str, announce: bool = True) -> bool:
         b.conf["gateway"] = url
     gw_sync(b, force=True)
     if announce:
-        for pid, q in remote_targets(b).items():
-            if q.get("caps") is None or "transport" in q["caps"]:
-                tell_gateway(b, pid, q, project, gw_urls(b)[0])
-            link_propose(b, pid, q, project, f"{b.label} joined {url}")
+        announce_services(b, project, f"{b.label} joined {url}")
     return True
 
 
@@ -5239,9 +5440,12 @@ def send_payload(me: Me, peer_id: str, peer: dict, project: str, subject: str, b
         item = {"peer_id": peer_id, "msg_id": msg_id, "env": env, "payload": payload, "at": time.time()}
         me.local.update("state.json", lambda st: st.setdefault("outbox", []).append(item))
         me.local.append_log({"dir": "out", "id": msg_id, "peer": peer_id, "status": "queued", "at": iso(), "payload": payload})
-        print(f"mmbox: the service did not accept {msg_id} for {peer['alias']} yet "
-              f"({'it does not list this box yet, or is unreachable' if shared_urls(me, peer) else 'it is not on a service of ours'}): "
-              f"queued, sent again at the next passes of this box", file=sys.stderr)
+        if QUEUE_NOTES is not None:
+            QUEUE_NOTES.append(peer["alias"])
+        else:
+            print(f"mmbox: the service did not accept {msg_id} for {peer['alias']} yet "
+                  f"({'it does not list this box yet, or is unreachable' if shared_urls(me, peer) else 'it is not on a service of ours'}): "
+                  f"queued, sent again at the next passes of this box", file=sys.stderr)
         QUEUED.add(msg_id)
         return msg_id
     if not via:
@@ -5612,6 +5816,21 @@ def chan_post_cmd(me: Me, project: str, a, scope: str) -> int:
     return print_posted(r, getattr(a, "json", False))
 
 
+def borrowed_box(me: Me) -> str | None:
+    """This agent session writes with the box of ANOTHER agent session that is still alive: the answers will reach
+    that session (its listener), not this one."""
+    cur = session_facts()["session_id"]
+    if me.role == "machine" or not cur or not me.session_id or cur == me.session_id or me.closed_at:
+        return None
+    live = session_state(me.local)
+    if not live["listening"] and not live["session_alive"]:
+        return None
+    return (f"WARNING: box `{me.local.profile}` belongs to another live agent session ({me.agent} session {me.session_id}"
+            + (f", listener pid {', '.join(map(str, live['listening']))}" if live["listening"] else "") + "): what "
+            f"answers this message reaches that session, not yours. Sent anyway; next time write with this session's "
+            f"own box (`start --session <name>`), and say in the body whom it continues.")
+
+
 def cmd_send(a, local: Local):
     me = Me(local)
     if a.peer in ("@here", "@all"):  # a broadcast: the ephemeral channels, not a box
@@ -5626,6 +5845,8 @@ def cmd_send(a, local: Local):
             f"computer we know); `machine`, without @, is this computer's machine box (one session takes the message)")
     if getattr(a, "activity", None) and me.role != "machine":
         set_activity(me, a.activity)
+    if warn := borrowed_box(me):
+        print(warn, file=sys.stderr)
     extra = None
     via = a.via
     if not via and a.re and me.role != "machine":  # an answer to a machine-box message goes out from the machine box
@@ -5717,7 +5938,10 @@ def cmd_sent(a, local: Local):
     last = {}
     for e in entries:  # a queued message sent again later: its last entry tells where it is
         last[e["id"]] = e
-    entries = [e for e in entries if last[e["id"]] is e][-a.n:]
+    entries = [e for e in entries if last[e["id"]] is e][-a.n:] if not getattr(a, "id", None) else \
+        [e for e in entries if last[e["id"]] is e and e["id"] == a.id]
+    if getattr(a, "id", None) and not entries:
+        die(f"{a.id}: not in this box's log of sent messages (`sent` lists them; another session's: --profile)")
     present: dict[str, set] = {}
     proven: dict[str, set] = {}
     by_gw: dict[tuple, dict] = {}
@@ -5740,9 +5964,11 @@ def cmd_sent(a, local: Local):
             print(f"{p['ts']} -> {peers.get(e['peer'], {}).get('alias', e['peer'])} [{ {'consumed': 'consumed', 'taken': 'being read', 'waiting': 'waiting'}.get(st, st) } · gateway] "
                   f"{p.get('kind')}: {p.get('subject', '')} ({e['id']})")
             continue
-        if e.get("status") in ("queued", "not sent"):
+        if e.get("status") in ("queued", "not sent", "dropped"):
             p = e["payload"]
-            print(f"{p['ts']} -> {peers.get(e['peer'], {}).get('alias', e['peer'])} [{'queued: not accepted by the service yet' if e['status'] == 'queued' else 'not sent'}] "
+            what = {"queued": "queued: not accepted by the service yet", "not sent": "not sent",
+                    "dropped": f"dropped, never accepted: {e.get('reason') or 'see the alert'}"}[e["status"]]
+            print(f"{p.get('ts', e.get('at'))} -> {peers.get(e['peer'], {}).get('alias', e['peer'])} [{what}] "
                   f"{p.get('kind')}: {p.get('subject', '')} ({e['id']})")
             continue
         project = (e.get("payload") or {}).get("project") or me.project(None)
@@ -5759,6 +5985,28 @@ def cmd_sent(a, local: Local):
         p = e["payload"]
         print(f"{p['ts']} -> {peers.get(e['peer'], {}).get('alias', e['peer'])} [{state}] {p.get('kind')}: "
               f"{p.get('subject', '')} ({e['id']})")
+    if getattr(a, "id", None):
+        sent_detail(entries[-1], peers)
+
+
+def sent_detail(e: dict, peers: dict) -> None:
+    """`sent --id`: where a message went, and who took it when the recipient is a box of this computer."""
+    p, q = e.get("payload") or {}, peers.get(e.get("peer") or "") or {}
+    print(f"  to: {q.get('alias', e.get('peer'))} ({q.get('user', '?')}, {q.get('label', '?')})"
+          + (f" · reply expected" if p.get("reply_expected") else " · no reply expected") + (f" · re {p['re']}" if p.get("re") else ""))
+    if e.get("via") == "gateway":
+        print(f"  through: {e.get('gateway')} (entry {e.get('entry')})")
+    if q.get("local_profile"):  # a box of this computer: its own log says who took it
+        rec = next((x for x in reversed(Local(q["local_profile"]).log()) if x.get("dir") == "in" and x.get("id") == e["id"]), None)
+        if rec:
+            tb = rec.get("taken_by") or {}
+            print(f"  taken: {rec.get('at')} as {rec.get('status')}"
+                  + (f" by session {tb.get('label') or tb.get('profile')} (profile {tb.get('profile')}, agent session "
+                     f"{tb.get('session_id') or '?'})" if tb else f" by {q['local_profile']}"))
+        else:
+            print("  taken: not yet by that box (or before its log)")
+    else:
+        print("  taken: the service keeps no taker; an answer names the session that handled it (via_session)")
 
 
 def cmd_show(a, local: Local):
@@ -6143,6 +6391,8 @@ def wait_loop(me: Me, project: str, timeout: float, on_items, forever: bool = Fa
 
     def passes() -> bool:
         seen_alerts, shown = len(ALERTED), False
+        if me.role != "machine":
+            announce_pending(me, project)
         for b in boxes:
             for inv in list(((b.local.load("state.json", {}) or {}).get("pairs") or {}).keys()):
                 with b.local.locked():  # pairings in progress complete in the background, one process at a time
@@ -7054,6 +7304,8 @@ def main():
     x = sub("sent", cmd_sent, "messages sent: queued, waiting, being read or consumed by the peer")
     x.add_argument("peer", nargs="?")
     x.add_argument("-n", type=int, default=20)
+    x.add_argument("--id", help="one message: its state, the service it went through, and (for a box of this "
+                                "computer) the session that took it")
     x = sub("archive", cmd_archive, "mark messages archived (or done)")
     x.add_argument("ids", nargs="+")
     x.add_argument("--done", action="store_true")

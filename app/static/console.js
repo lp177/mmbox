@@ -48,6 +48,7 @@ const ICON = {
   up: "M7.41 15.41 12 10.83l4.59 4.58L18 14l-6-6-6 6z",
   down: "M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6z",
   lock: "M18 8h-1V6A5 5 0 0 0 7 6v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2ZM9 6a3 3 0 0 1 6 0v2H9V6Zm3 11a2 2 0 1 1 0-4 2 2 0 0 1 0 4Z",
+  check: "M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z",
 };
 
 // ---------------------------------------------------------------- the token and the API
@@ -98,9 +99,18 @@ function ago(sec) {
   if (sec < 86400) return `${Math.round(sec / 3600)} h ago`;
   return `${Math.round(sec / 86400)} d ago`;
 }
-const STATE_TXT = { unread: "unread", taken: "being read", read: "read", queued: "queued", sent: "sent", posted: "posted" };
+// "taken" is what the service knows: a box took the message, not that an agent read or handled it
+const STATE_TXT = { unread: "unread", taken: "being taken", read: "taken", queued: "queued", sent: "sent", posted: "posted", emptied: "emptied",
+  delivered: "consumed", stranded: "left in a closed box", dropped: "dropped" };
+const STATE_TITLE = {
+  read: "a box took it from the service; it says nothing of what its agent did with it",
+  delivered: "its service says it no longer holds it (taken by its box, or deleted with it): learnt afterwards, no log nor collector of this computer saw it taken",
+  stranded: "it waits in a box that closed before reading it: the relay forwards real messages to the machine box, the tool's own (ping, notice, link…) stay until the box is removed",
+  dropped: "its sender gave up: no service ever accepted it (the recipient was no longer known, or never listed the sender)",
+  sent: "sent; nothing says yet whether its box took it",
+};
 const HANDLED_TXT = { execute: "executed", ask: "asked the user", archived: "archived", rejected: "rejected", expired: "expired", interrupted: "interrupted",
-  forwarded: "forwarded", relayed: "relayed", purged: "purged", notice: "notice", introduced: "introduction", pinged: "wake-up", pong: "pong",
+  forwarded: "forwarded", relayed: "relayed", purged: "purged", dropped: "dropped (closed box)", notice: "notice", introduced: "introduction", pinged: "wake-up", pong: "pong",
   broadcast: "broadcast read", lockevent: "lock event", transport: "service announced", retired: "closing", link: "link" };
 const LEVEL_TXT = { full: "full content", subject: "subject only", meta: "metadata", none: "not annotated" };
 
@@ -108,6 +118,15 @@ const LEVEL_TXT = { full: "full content", subject: "subject only", meta: "metada
 const boxOf = (id) => S.boxes.get(id) || { id, label: null, servers: [] };
 const boxName = (id) => { if (!id) return "?"; const b = boxOf(id); return b.title || b.label || b.alias || id; };
 const boxLabel = (id) => { const b = boxOf(id); return b.label || b.alias || id; };
+// the state of a direct message in words: who took it (the session behind a machine box when known), answered
+function stateText(m) {
+  if (m.broadcast) return STATE_TXT[m.state] || m.state || "";
+  if ((m.answers || []).length) return "answered";
+  if (m.state !== "read") return STATE_TXT[m.state] || m.state || "";
+  if (m.taken_by) return "taken by " + (m.taken_by.id ? boxName(m.taken_by.id) : m.taken_by.label);
+  const r = m.read_by || m.to;
+  return boxOf(r).role === "machine" || m.via_machine ? "taken by the machine box" : "taken by its box";
+}
 function machineKey(b) {
   if (b.role === "machine") return b.id;
   if (b.machine) return b.machine;
@@ -169,6 +188,7 @@ function filtered() {
       case "late": if (!isLate(m) || m.tier > LATE_TIER) return false; break;
       case "read": if (m.state !== "read" && !(m.broadcast && (m.seen_by || []).length)) return false; break;
       case "pending": if (!["queued", "sent"].includes(m.state)) return false; break;
+      case "undelivered": if (!["stranded", "dropped"].includes(m.state)) return false; break;
       case "broadcast": if (!m.broadcast) return false; break;
       case "direct": if (m.broadcast) return false; break;
     }
@@ -401,7 +421,7 @@ async function setReception(url, act) {
 // ---------------------------------------------------------------- the traffic of each network
 const RANGE_TXT = { 300: "5 min", 3600: "1 h", 86400: "1 d", 604800: "7 d" };
 const rangeOf = (url) => +(F.statsRange?.[url] || 3600);
-const fmtBytes = (n) => n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${Math.round(n / 1e3)} kB` : `${n} B`;
+const fmtBytes = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${Math.round(n / 1e3)} kB` : `${n} B`;
 function statsLine(s) {
   if (!s.stats) return h("div", { class: "stats-line dim" }, s.ok && !(s.features || []).includes("stats") ? "statistics: older gateway" : "");
   const w = rangeOf(s.url), c = s.stats.windows[String(w)] || { messages: 0, posts: 0, bytes: 0 };
@@ -717,7 +737,7 @@ function drawChatLog() {
       subj ? h("p", { class: "bubble-subject" }, subj) : null,
       body ? h("p", { class: "bubble-body" }, body) : h("p", { class: "bubble-body dim" }, "(content not transmitted)"),
       attachmentsBlock(m, "chat"),
-      h("footer", {}, STATE_TXT[m.state] || m.state || "", m.handled ? ` · ${HANDLED_TXT[m.handled] || m.handled}` : "",
+      h("footer", {}, stateText(m), m.handled ? ` · ${HANDLED_TXT[m.handled] || m.handled}` : "",
         m.kept_until ? h("span", { class: "dim", title: "this copy expires on " + fmtFull.format(new Date(m.kept_until * 1000)) }, ` · expires ${when(m.kept_until * 1000)}`) : h("span", { class: "dim" }, " · ", svg(ICON.pin, "ico tiny"), " kept"))));
   }
   if (!msgs.length) frag.append(h("p", { class: "empty" }, "No message kept for this box."));
@@ -786,7 +806,8 @@ $("#chat-ttl-reset").addEventListener("click", async () => {
 // ---------------------------------------------------------------- rendering: the list
 function stateChip(m) {
   if (m.broadcast) return h("span", { class: "chip broadcast" }, m.scope === "network" ? "network" : m.scope === "machine" ? "@here" : "broadcast");
-  return h("span", { class: "chip " + (m.state === "read" ? "ok" : m.state) }, STATE_TXT[m.state] || m.state);
+  const ok = (m.answers || []).length || m.state === "read" || m.state === "delivered";
+  return h("span", { class: "chip " + (ok ? "ok" : m.state), title: (m.answers || []).length ? null : STATE_TITLE[m.state] || null }, stateText(m));
 }
 function route(m) {
   const to = m.broadcast ? (m.scope === "network" ? "the whole network" : (m.to_boxes || []).length > 1 ? `${m.to_boxes.length} channels` : "this computer") : boxName(m.to);
@@ -802,7 +823,7 @@ function msgRow(m) {
   return h("div", { class: "msg ripple" + (unread ? " unread" : "") + (late ? " late" + (S.freshLate.has(m.id) ? " fresh-late" : "") : "") + (isForward(m) ? " forward" : ""),
     title: late ? `unread for ${ago((Date.now() - tsOf(m)) / 1000).replace(" ago", "")}` : null, role: "option", id: "m-" + m.id, tabindex: "-1",
     "aria-selected": String(S.selected === m.id), dataset: { id: m.id } },
-    h("span", { class: "state" }, h("span", { class: "dot " + (unread ? "listening" : m.state === "queued" ? "closed" : "") })),
+    h("span", { class: "state" }, h("span", { class: "dot " + (unread ? "listening" : ["queued", "dropped", "stranded"].includes(m.state) ? "closed" : "") })),
     h("span", { class: "line1" }, m.kind ? h("span", { class: "chip " + m.kind }, m.kind) : h("span", { class: "chip" }, "?"),
       stateChip(m), h("span", { class: "route" }, route(m)),
       m.attachments?.length ? h("span", { class: "att-count", title: `${m.attachments.length} attachment(s)` }, svg(ICON.clip, "ico tiny"), h("span", { class: "sr" }, "attachments: "), String(m.attachments.length)) : null),
@@ -986,7 +1007,19 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ---------------------------------------------------------------- the reply, under the open message
-const RP = { id: null, msg: null, drafts: new Map() };
+const RP = { id: null, msg: null, drafts: new Map(), senders: null, sent: new Map() };
+// what this console sent from the open message: id, then its state as the next snapshots see it
+function renderSent() {
+  const el = $("#reply-sent"), list = RP.sent.get(RP.id) || [];
+  el.replaceChildren(...list.map((x) => {
+    const sm = x.id && S.byId.get(x.id);
+    const st = !x.id ? "sent (no id in the client's answer)" : sm ? stateText(sm) : "sent, waiting for the next refresh";
+    return h("div", { class: "sent-note" }, svg(ICON.check, "ico tiny"),
+      h("span", {}, `Sent ${fmtTime.format(new Date(x.at))} to ${boxName(x.to)}: `, h("strong", {}, st)),
+      x.id ? h("span", { class: "mono dim" }, " " + x.id) : null,
+      sm ? h("button", { class: "btn text ripple", type: "button", onclick: () => openMessage(x.id) }, "Open") : null);
+  }));
+}
 function replyTarget(m) {
   if (!m?.from) return null;
   // a message one of this computer's boxes sent to a box elsewhere: write again to that box; otherwise answer the author
@@ -1000,7 +1033,7 @@ function saveDraft() {
   RP.drafts.set(RP.id, { text, subject: $("#reply-subject").value, kind: $("#reply-kind").value, expected: $("#reply-expected").checked, from: $("#reply-from").value });
 }
 function resetReply(m) {
-  RP.id = m?.id ?? RD.open; RP.msg = m || null;
+  RP.id = m?.id ?? RD.open; RP.msg = m || null; renderSent();
   $("#reply-form").hidden = true; $("#reply-error").textContent = "";
   const d = RP.drafts.get(RP.id);
   if (d && m) openReply(m, d, false);
@@ -1014,7 +1047,8 @@ async function openReply(m = RP.msg, draft = null, focus = true) {
   $("#reply-head").textContent = `${t.to === m.from ? "Reply to" : "Write again to"} ${boxName(t.to)}`;
   $("#reply-subject").value = draft?.subject ?? (/^re:/i.test(subj) ? subj : "Re: " + subj);
   $("#reply-kind").value = draft?.kind ?? (t.to === m.from ? "reply" : m.kind || "info");
-  $("#reply-expected").checked = draft?.expected ?? false;
+  // writing again to a box that was asked something: the operator wants to hear back
+  $("#reply-expected").checked = draft?.expected ?? (t.to !== m.from && (!!m.reply_expected || ["task", "request"].includes(m.kind)));
   $("#reply-text").value = draft?.text ?? "";
   $("#reply-error").textContent = "";
   f.hidden = false;
@@ -1026,12 +1060,25 @@ async function openReply(m = RP.msg, draft = null, focus = true) {
     const r = await api("/api/senders?to=" + encodeURIComponent(t.to));
     if (RP.id !== m.id) return;
     const want = draft?.from || (t.as && boxOf(t.as).profile);
+    RP.senders = new Map(r.senders.map((s) => [s.profile, s]));
     sel.replaceChildren(...(r.senders.length ? r.senders.map((s) => h("option", { value: s.profile, selected: s.profile === want }, `${s.role === "machine" ? "machine box" : s.profile} — ${s.label}`))
       : [h("option", { value: "" }, "no box here is paired with it")]));
   } catch (e) { $("#reply-error").textContent = e.message; }
   replyValid();
 }
+// where the answer will land: the box the message is sent from, and whether anybody listens there now
+function replyRoute() {
+  const el = $("#reply-route"), s = RP.senders?.get($("#reply-from").value);
+  if (!s) { el.replaceChildren(); return; }
+  const b = boxOf(s.id), name = s.role === "machine" ? `the machine box ${b.label || s.label}` : `the session box ${boxName(s.id)}`;
+  const gone = b.closed_at || b.retired_at, live = b.listening || b.listening_here;
+  el.className = "reply-route" + (gone ? " warn" : "");
+  el.replaceChildren(`Sent as ${name}: its answer comes back to that box`,
+    s.role === "machine" ? ", where any session of this computer may take it." : gone ? ", which is closed: nobody will take the answer there; this console still shows it."
+      : live ? ", which listens now. This console shows it in the thread." : ", which does not listen now: the answer waits there; this console shows it in the thread.");
+}
 function replyValid() {
+  replyRoute();
   const ok = !!$("#reply-from").value && !!$("#reply-subject").value.trim() && !!$("#reply-text").value.trim();
   $("#reply-send").disabled = !ok; return ok;
 }
@@ -1053,7 +1100,11 @@ $("#reply-form").addEventListener("submit", async (e) => {
   busy(btn, false);
   if (!r.ok) { $("#reply-error").textContent = ((r.err || "") + "\n" + (r.out || "")).trim().split("\n").filter(Boolean).at(-1) || "failed"; replyValid(); return; }
   RP.drafts.delete(m.id); $("#reply-text").value = ""; $("#reply-form").hidden = true;
-  toast((r.out || "sent").trim().split("\n").at(-1));
+  const line = (r.out || "sent").trim().split("\n").filter(Boolean).at(-1) || "sent";
+  const sid = (/^sent (\S+)/m.exec(r.out || "") || [])[1] || null;
+  RP.sent.set(m.id, [...(RP.sent.get(m.id) || []), { id: sid, at: Date.now(), to: t.to, subject: $("#reply-subject").value.trim(), line }]);
+  renderSent();
+  toast(line);
   ($("#detail .reply-btn") || $("#reader-back")).focus();
   setTimeout(() => poll(true), 800);
 });
@@ -1078,7 +1129,17 @@ function renderDetail(m, partial) {
     h("dt", {}, "Sent"), h("dd", {}, m.ts ? fmtFull.format(new Date(tsOf(m))) : "?", " by ",
       h("button", { class: "boxref", type: "button", onclick: () => openBoxCard(m.from) }, m.sender_title || boxName(m.from)),
       h("span", { class: "dim" }, ` (${boxLabel(m.from)})`)),
-    m.read_at ? [h("dt", {}, "Read"), h("dd", {}, fmtFull.format(new Date(Date.parse(m.read_at))), m.read_by ? h("span", { class: "dim" }, " by " + boxName(m.read_by)) : null)] : null,
+    m.read_at ? (() => {
+      const rb = m.read_by || m.to, mach = m.via_machine || boxOf(rb).role === "machine";
+      return [h("dt", {}, "Taken"), h("dd", {}, fmtFull.format(new Date(Date.parse(m.read_at))),
+        rb ? h("span", { class: "dim" }, " by " + boxName(rb) + (mach ? " (machine box)" : "")) : null,
+        m.taken_by ? [h("span", { class: "dim" }, ", for the session "), m.taken_by.id ? boxRef(m.taken_by.id) : h("span", {}, m.taken_by.label || "?")]
+          : mach ? h("span", { class: "dim" }, m.read_by ? ", for a session of this computer (taken before its client named it)" : ", for one of that computer's sessions (the service does not say which)") : null)];
+    })() : null,
+    (m.answers || []).length ? [h("dt", {}, "Answered"), h("dd", {}, m.answers.flatMap((id, i) => {
+      const a = S.byId.get(id);
+      return [i ? ", " : null, h("button", { class: "boxref", type: "button", onclick: () => openMessage(id) }, a ? `${when(tsOf(a))} by ${boxName(a.from)}` : id)];
+    }))] : null,
     m.work || m.project ? [h("dt", {}, "Project"), h("dd", {}, [m.work, m.project && `space ${m.project}`].filter(Boolean).join(" · "))] : null,
     m.topic ? [h("dt", {}, "Topic"), h("dd", {}, m.topic)] : null,
     m.re ? [h("dt", {}, "In reply to"), h("dd", {}, S.byId.get(m.re) ? h("button", { class: "boxref", type: "button", onclick: () => openMessage(m.re) }, S.byId.get(m.re).subject || m.re) : h("span", { class: "mono" }, m.re))] : null,
@@ -1239,9 +1300,9 @@ function renderServers() {
 }
 function renderActivity() {
   const rows = (S.snap?.activity || []).slice().sort((a, b) => b.t - a.t).slice(0, 1000);
-  const TXT = { open: "opened", close: "closed", expire: "expired", active: "active (back)", removed: "removed" };
+  const TXT = { open: "opened", close: "closed", expire: "expired", active: "active (back)", removed: "removed", empty: "boxes deleted" };
   $("#activity-body").replaceChildren(...(rows.length ? rows.map((a) => h("tr", {},
-    h("td", {}, fmtFull.format(new Date(a.t))), h("td", {}, h("span", { class: "chip " + ({ open: "ok", active: "ok", close: "request", expire: "queued", removed: "queued" }[a.ev] || "") }, TXT[a.ev] || a.ev), a.reason ? h("div", { class: "dim" }, a.reason) : null),
+    h("td", {}, fmtFull.format(new Date(a.t))), h("td", {}, h("span", { class: "chip " + ({ open: "ok", active: "ok", close: "request", expire: "queued", removed: "queued", empty: "request" }[a.ev] || "") }, TXT[a.ev] || a.ev), a.reason ? h("div", { class: "dim" }, a.reason) : null),
     h("td", {}, h("button", { class: "boxref", type: "button", onclick: () => gotoBox(a.box) }, boxName(a.box)), h("div", { class: "mono" }, a.box)),
     h("td", {}, machineName(machineKey(boxOf(a.box)))), h("td", {}, (S.servers.get(a.server) || {}).name || a.server)))
     : [h("tr", {}, h("td", { colspan: "5", class: "dim" }, "No event: this console is the operator of no collector."))]));
@@ -1261,9 +1322,10 @@ async function setLevel(btn, s, level) {
   if (!r.ok) showOutput("Collector", r); else toast(level === "off" ? "No more annotations for " + s.name : `Annotations "${level}" for ${s.name}`);
   poll(true);
 }
-function confirmRun(title, text, body) {
+function confirmRun(title, text, body, { okLabel = "Confirm", after } = {}) {
   const dlg = $("#confirm");
   $("#confirm-title").textContent = title; $("#confirm-text").textContent = text;
+  $("#confirm-ok").textContent = okLabel;
   dlg.returnValue = "";
   dlg.addEventListener("close", async () => {
     if (dlg.returnValue !== "ok") return;
@@ -1272,6 +1334,7 @@ function confirmRun(title, text, body) {
     const r = await action(body);
     showOutput(title, r);
     poll(true);
+    after?.(r);
   }, { once: true });
   dlg.showModal();
 }
@@ -1784,7 +1847,7 @@ async function poll(force = false, background = false) {
       S.servers = new Map(snap.servers.map((s) => [s.url, s]));
       S.msgs = snap.messages; S.byId = new Map(S.msgs.map((m) => [m.id, m]));
       watchAlerts(snap.version === S.firstVersion);
-      renderTree(); renderList(); renderBoxes(); renderServers(); renderActivity(); renderSettings(); renderQuestionSettings();
+      renderSent(); renderTree(); renderList(); renderBoxes(); renderServers(); renderActivity(); renderSettings(); renderQuestionSettings();
       const first = Q.known === null;
       const ids = pendingQ().map((q) => q.id);
       const fresh = first ? [] : ids.filter((i) => !Q.known.has(i));
@@ -1808,6 +1871,102 @@ async function poll(force = false, background = false) {
 }
 $("#refresh").addEventListener("click", async (e) => { const btn = e.currentTarget; busy(btn, true); await poll(true); busy(btn, false); });
 
+// ---------------------------------------------------------------- memory: the explorer's frame and its view
+// What the Redis of each service where this console is an operator holds, and this computer (the console's folder,
+// the boxes' folder); the view purges the console's copy of the messages that no longer wait in a box, or empties
+// every box of those services.
+const MEM = { data: null, loading: false };
+const pct = (a, b) => (b ? Math.min(100, (a / b) * 100) : 0);
+function memBar(p) {
+  const fill = h("span");
+  fill.style.width = `${p}%`;
+  return h("span", { class: `mem-bar${p >= 90 ? " err" : p >= 70 ? " warn" : ""}`, "aria-hidden": "true" }, fill);
+}
+const memDl = (rows) => h("dl", { class: "meta" }, rows.filter(Boolean).flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, String(v))]));
+function redisSum(d) {
+  const rows = (d?.servers || []).filter((s) => s.redis);
+  const fig = rows.filter((s) => !s.redis.acl);  // a Redis user without the memory commands: counts, no figures
+  const used = fig.reduce((t, s) => t + (s.redis.used || 0), 0);
+  const max = fig.length && fig.every((s) => s.redis.max) ? fig.reduce((t, s) => t + s.redis.max, 0) : 0;
+  return { rows, fig, used, max, waiting: rows.reduce((t, s) => t + (s.redis.boxes?.entries || 0), 0),
+    boxes: rows.reduce((t, s) => t + (s.redis.boxes?.count || 0), 0) };
+}
+async function loadUsage(fresh = false) {
+  if (!token || MEM.loading) return;
+  MEM.loading = true;
+  if (fresh) busy($("#mem-refresh"), true);
+  try {
+    MEM.data = await api(`/api/usage${fresh ? "?fresh=1" : ""}`);
+    renderMemFrame();
+    if ($("#mem-dialog").open) renderMemDialog();
+  } catch { $("#mem-redis").textContent = "—"; }
+  finally { MEM.loading = false; if (fresh) busy($("#mem-refresh"), false); }
+}
+function renderMemFrame() {
+  const d = MEM.data;
+  if (!d) return;
+  const r = redisSum(d), p = pct(r.used, r.max), bar = $("#mem-redis-bar");
+  const redis = r.fig.length ? (r.max ? `${fmtBytes(r.used)} / ${fmtBytes(r.max)}` : fmtBytes(r.used)) : "—";
+  $("#mem-redis").textContent = redis;
+  bar.style.width = `${p}%`;
+  bar.parentElement.classList.toggle("warn", p >= 70 && p < 90);
+  bar.parentElement.classList.toggle("err", p >= 90);
+  $("#mem-local").textContent = fmtBytes(d.local.total);
+  $("#mem-frame").title = r.fig.length ? "Memory: open the view" : (d.servers.find((s) => s.why || s.redis?.acl)?.why || r.rows[0]?.redis.acl || "no service");
+  $("#mem-frame-sum").textContent = `Redis ${redis}${r.max ? `, ${Math.round(p)} %` : ""}; this computer ${fmtBytes(d.local.total)}`;
+}
+function renderMemDialog() {
+  const d = MEM.data;
+  if (!d) return;
+  $("#mem-at").textContent = `measured at ${new Date(d.at * 1000).toLocaleTimeString()}`;
+  const cards = d.servers.map((s) => {
+    if (!s.redis) return h("div", { class: "mem-card" }, h("h4", {}, s.name), h("p", { class: "why" }, s.why || "no figures"));
+    const R = s.redis;
+    return h("div", { class: "mem-card" },
+      h("h4", {}, s.name, h("span", {}, R.acl ? "—" : R.max ? `${fmtBytes(R.used)} / ${fmtBytes(R.max)}` : fmtBytes(R.used))),
+      R.max && !R.acl ? memBar(pct(R.used, R.max)) : null,
+      R.acl ? h("p", { class: "why" }, R.acl) : null,
+      memDl([R.acl ? null : ["Peak", fmtBytes(R.peak || 0)], R.acl ? null : ["When full", R.policy || "—"], R.acl ? null : ["Keys", R.keys ?? "—"],
+        ["Boxes", `${R.boxes.count} · ${R.boxes.entries} message(s) waiting${R.boxes.bytes == null ? "" : " · " + fmtBytes(R.boxes.bytes)}`],
+        ["Channels", `${R.channels.count}${R.channels.bytes == null ? "" : " · " + fmtBytes(R.channels.bytes)}`],
+        ["Collector", `${R.collector.entries} event(s)${R.collector.bytes == null ? "" : " · " + fmtBytes(R.collector.bytes)}`],
+        R.stats.bytes == null ? null : ["Traffic counts", fmtBytes(R.stats.bytes)]]));
+  });
+  $("#mem-servers").replaceChildren(...(cards.length ? cards : [h("p", { class: "why" }, "No service configured.")]));
+  const L = d.local, C = L.console, B = L.boxes;
+  $("#mem-localbox").replaceChildren(
+    h("div", { class: "mem-card" }, h("h4", {}, "Console", h("span", {}, fmtBytes(C.total))),
+      memDl([["Messages kept", `${L.messages} · ${fmtBytes(C.archive)}`], ["Attached files", fmtBytes(C.attachments)],
+        ["Window data", fmtBytes(C.window)], ["Settings, keys", fmtBytes(C.other)]]),
+      h("span", { class: "path" }, C.path)),
+    h("div", { class: "mem-card" }, h("h4", {}, "mmbox boxes", h("span", {}, fmtBytes(B.total))),
+      memDl([["Boxes", `${B.profiles} (keys, logs, attached files)`]]),
+      h("span", { class: "path" }, B.path)));
+  $("#mem-purge-text").textContent = L.purgeable
+    ? `${L.purgeable} of the ${L.messages} messages the console keeps no longer wait in a box: they go for good, pinned conversations included, with the attached files it keeps for them. Those still waiting stay. The boxes' own logs on this computer are not touched, so the message list still shows what they hold.`
+    : `Every message the console keeps (${L.messages}) still waits in a box: nothing to purge.`;
+  $("#mem-purge").disabled = !L.purgeable;
+  const r = redisSum(d), names = r.rows.map((s) => s.name).join(", ");
+  $("#mem-empty-text").textContent = r.rows.length
+    ? `${r.boxes} box(es) on ${names}, ${r.waiting} message(s) waiting in them. Every box of every computer is deleted with what waits in it, taken or not, for good (this console's own box and its questions stay). A session still running registers its box again by itself at its next contact; what is sent to it meanwhile waits in its sender's queue.`
+    : "No service where this console is an operator gives its memory figures.";
+  $("#mem-empty").disabled = !r.rows.length || !r.boxes;
+}
+$("#mem-frame").addEventListener("click", () => { renderMemDialog(); $("#mem-dialog").showModal(); loadUsage(true); });
+$("#mem-refresh").addEventListener("click", () => loadUsage(true));
+$("#mem-purge").addEventListener("click", () => {
+  const L = MEM.data.local;
+  confirmRun("Purge the console's messages",
+    `${L.purgeable} message(s) no longer waiting in a box are deleted from the console's copy, pinned conversations included, and cannot come back. Those still waiting stay.`,
+    { action: "purge_archive" }, { okLabel: "Purge", after: () => loadUsage(true) });
+});
+$("#mem-empty").addEventListener("click", () => {
+  const r = redisSum(MEM.data);
+  confirmRun("Delete every mmbox box",
+    `${r.boxes} box(es) of ${r.rows.map((s) => s.name).join(", ")} are deleted, for every computer and every session, with the ${r.waiting} message(s) waiting in them: nobody will receive those. Sessions still running come back on their own.`,
+    { action: "empty_boxes" }, { okLabel: "Delete the boxes", after: () => loadUsage(true) });
+});
+
 showTab(DEEP.get("tab") || localStorage.getItem("mmbox-console-tab") || "messages");
 if (DEEP.get("msg")) { const id = DEEP.get("msg"); const t = setInterval(() => { if (S.byId.has(id)) { clearInterval(t); openMessage(id); } }, 300); }
 if (DEEP.get("box")) { const id = DEEP.get("box"); const t = setInterval(() => { if (S.boxes.has(id)) { clearInterval(t); openBoxCard(id); } }, 300); }
@@ -1816,4 +1975,5 @@ else {
   S.wantQuestion = DEEP.get("question") === "next";
   poll(); setInterval(() => document.visibilityState === "visible" && poll(), 5000);
   setInterval(pollPending, 4000);
+  loadUsage(); setInterval(() => document.visibilityState === "visible" && loadUsage(), 60000);
 }

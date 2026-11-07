@@ -222,12 +222,18 @@ MMBOX server use <name>                       # every box of this computer moves
 An optional application, for the human: [app/mmbox_console.py](app/mmbox_console.py). It runs on a workstation that already has a machine box and depends only on the standard library and `cryptography`:
 
 ```sh
-python3 app/mmbox_console.py --open      # http://127.0.0.1:8765/#token=… ; Ctrl+C to stop it
+python3 app/mmbox_console.py --open      # its window at once; http://127.0.0.1:8765/#token=… ; Ctrl+C to stop it
+python3 app/mmbox_console.py --browser   # no window of its own: the browser, as before
 python3 app/mmbox_console.py --whoami    # the id and fingerprint of its operator key
 ```
 
 It listens on 127.0.0.1 only, and each call carries the token of the printed URL.
 
+- **Desktop application**: with [pywebview](https://pywebview.flowrl.com/) (Debian: `python3-webview`; WebKitGTK on Linux, WebView2 on Windows), the console opens in a window of its own, the same page as in the browser. A click on its icon in the notification area opens it, or folds it back there when it is on screen; the right button offers to open it, to open the local site in the browser, to hide the window in the notification area, or to quit. The window's close button hides it there while the icon is shown, otherwise it quits the console. Without pywebview, or with `--browser`, the icon opens the browser.
+
+- **Memory**: a frame at the bottom of the explorer shows what the Redis of the services where the console is an operator holds (used / limit) and what this computer holds (the console's folder and the boxes' folder). A click opens the memory view: per service, Redis's figures (peak, policy when full, keys) and what the boxes, the channels, the collector and the traffic counts take; on this computer, the console's copy of the messages, their attached files, the window's data, and the boxes' folder. Two buttons free space, each after a confirmation:
+  - **Purge the console's messages**: every message the console keeps (`archive.sqlite` and its attached files) that no longer waits in a box (read, emptied, or gone), pinned conversations included; those still waiting stay. The boxes' own logs are not touched.
+  - **Delete every mmbox box**: on each service where the console is an operator, every box of every computer is deleted (card, peers, declaration, channel, alerts) with what waits in it, taken or not, for good (`/v1/usage` with `empty`); the operators' own box and its questions stay. A session still running registers its box again by itself at its next contact, and what is sent to it meanwhile waits in its sender's queue. The console marks the deleted messages `emptied`, and the collector notes it.
 - **Questions from sessions**: a session whose messages are in "Ask" mode asks its question in the console (`MMBOX question`), with the solutions it proposes. The console shows:
   - the description of the problem and the message concerned;
   - one card per solution, which you tick (one or more);
@@ -255,7 +261,7 @@ It listens on 127.0.0.1 only, and each call carries the token of the printed URL
     - The dot is put on the console's icon in the notification area and on the tab.
     - The sound is chosen among ten royalty-free sounds, or an imported MP3 (kept in the console's folder).
 
-  If no console tab is open, the icon, the notification and the sound go through the desktop (Linux: `python3-gi`, AyatanaAppIndicator3 and libnotify; `--no-tray` turns them off).
+  If no console tab is open, the icon, the notification and the sound go through the desktop (Linux: `python3-gi`, libnotify, and Dbusmenu, else AyatanaAppIndicator3; `--no-tray` turns them off).
 - **Messages**: an explorer machines › projects › boxes, and for each message who sent it (title, box, activity at the time of sending) and when, to whom, whether it is read. Filters: unread, read, queued, broadcasts, direct messages, received or sent, period, order of arrival, grouping by machine, project, box, server, day or thread, and three verbosity levels (essential; the tool's messages; debugging: wake-ups, links, locks, unannotated traffic).
   The list takes the whole width beside the explorer. Opening a message (click, or Enter on the keyboard; the arrows only move the selection) shows it in the place of the list, or of the box's conversation, with its reply form below it; the back button at the top left (Esc or `u`) returns to the list at the scroll position it had. `j` / `k`, or the arrows at the top right, go to the next or previous message of the list; `r` opens the reply. A reply not sent is kept as a draft while the console stays open.
 - **Alerts**: a message unread for more than 5 minutes (adjustable) is highlighted and reported once; a message forwarded to a machine box gives a notification, with its original sender as the title and the message as the content.
@@ -373,7 +379,8 @@ deploy/mmbox-server.sh up --ssh admin@server.example.com --bind 10.8.0.1 # a VPN
 - **Reachable from where it must be**: `--bind` defaults to `127.0.0.1`. On a VPN or a local network, `--bind <address>`; on the Internet, `--tls-domain <name>` (Caddy, ports 80 and 443).
 - **Durable**: messages survive a restart (AOF) and Redis never drops data: when full, it refuses to write (`--maxmemory`, 6gb by default).
 - The script prints the service URL (`MMBOX_SERVER_URL=…`), to give to `MMBOX server add`. `status`, `logs`, `down` and `uninstall` complete it; `--help` gives the options.
-- **A deployment of your own** (Quadlet units, Kubernetes, a secrets manager) runs the same two containers: [gateway/Containerfile](gateway/Containerfile); the gateway reads its Redis password from `/run/secrets/mmbox_redis_gateway`, else `MMBOX_REDIS_PASSWORD`.
+- **On a server of your own, behind nginx**: `deploy/site-deploy.sh redis|gateway` deploys the two containers as rootless Podman Quadlet units, with an nginx vhost limited to the addresses you allow. Everything that is yours (host, domain, VPN, operator, where your secrets are kept, your DNS) stays in a **site folder** outside the repository (`./site`, ignored by git, or `MMBOX_SITE_DIR`): a `site.env` and optional hooks (`site_init`, `secret_get` / `secret_set` for a secrets manager, `site_post_gateway`). Start from [site.example/](site.example/README.md); keep yours in your infrastructure's own repository and link it here.
+- **A deployment of your own** (Kubernetes, another orchestrator) runs the same two containers: [gateway/Containerfile](gateway/Containerfile); the gateway reads its Redis password from `/run/secrets/mmbox_redis_gateway`, else `MMBOX_REDIS_PASSWORD`.
 
 ## The repository
 
@@ -382,6 +389,8 @@ client/mmbox.py, client/PROTOCOL.md   the client (a single file) and its protoco
 app/                                  the operator console (optional): mmbox_console.py, static/
 gateway/                              the service: mmbox_gateway.py, Containerfile, requirements.txt
 deploy/mmbox-server.sh                host a service in containers, here or over SSH
+deploy/site-deploy.sh, deploy/host/   host it as Quadlet units behind nginx, with a site folder of your own
+site.example/                         the template of a site folder (./site is ignored by git)
 docs/                                 the website (GitHub Pages)
 ```
 

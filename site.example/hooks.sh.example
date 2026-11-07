@@ -1,0 +1,22 @@
+# mmbox site hooks: shell functions run ON THE HOST, before the script (deploy/site-deploy.sh puts them in front of it).
+# All optional. Rename to hooks.sh in your site folder. Never write a secret here: fetch it.
+# shellcheck shell=bash
+
+# Before anything: load what your host needs (your secrets manager's login, the variables of your DNS API…).
+#site_init() {
+#    source /root/scripts/secrets.sh </dev/null
+#}
+
+# Keep the Redis passwords in a secrets manager instead of the host's root-only file (/etc/mmbox/secrets.env).
+# secret_get prints the value (nothing when unknown), secret_set stores it; never put a value on a command line
+# (other users see it in ps): give it through a file or stdin. With Infisical, the CLI's `secrets-manager secrets`
+# commands take a value from a file as name=@path (https://infisical.com/docs/cli/reference/secrets-manager/secrets),
+# or reuse the helpers your servers already have:
+#secret_get() { my_vault_get "$1"; }
+#secret_set() { my_vault_set "$1" "$2"; }
+#secret_where() { echo "my vault, /mmbox"; }
+
+# After the gateway and its vhost: what your site does besides (a DNS record, a monitoring check…).
+#site_post_gateway() {
+#    mmbox_log "DNS: nothing to do here"
+#}
