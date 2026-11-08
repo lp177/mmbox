@@ -1786,7 +1786,8 @@ class State:
                     chain = remote
                     self.console_state.pop("joining", None)
                     self.save_console_state()
-                    log(f"account: this console is now a device of {st['account']}")
+                    run_client(["daemon", "operator", "--account", st["fingerprint"]], timeout=60)
+                    log(f"account: this console is now a device of {st['account']}; this computer's daemon obeys it")
                 continue
             try:
                 if remote and A.extends(chain, remote) and len(remote) > len(chain):
@@ -1832,6 +1833,7 @@ class State:
             return {"available": False}
         chain = account_chain()
         out = {"available": True, "this": self.op.id, "joining": self.console_state.get("joining"),
+               "default_recovery": str(default_recovery_path()),
                "joins": list(getattr(self, "account_joins", {}).values()), "errors": getattr(self, "_acct_errors", [])}
         if self.console_state.get("joining"):
             out["my_code"] = A.join_code(device_record(self.op))
@@ -1845,6 +1847,15 @@ class State:
     def account_action(self, a: str, body: dict) -> dict:
         A = account_lib()
         chain = account_chain()
+        if a == "account_create":  # the onboarding window: the passphrase came over this console's own loopback
+            path = Path(os.path.expanduser(str(body.get("recovery") or "").strip() or str(default_recovery_path())))
+            try:
+                res = account_create(self.op, str(body.get("passphrase") or ""), path)
+            except ValueError as e:
+                return {"ok": False, "err": str(e)}
+            log(f"account {res['account']} made (root {res['fingerprint']}); recovery export {res['recovery']}")
+            threading.Thread(target=self.account_sync, daemon=True).start()
+            return {"ok": True, **res}
         if a == "account_join":
             fp = str(body.get("account") or "").strip().upper()
             if chain:
@@ -3387,6 +3398,12 @@ def main():
 
 
 # ---------------------------------------------------------------- the account (client/ACCOUNTS.md): root key, device chain
+def default_recovery_path() -> Path:
+    """Where the onboarding offers to write the recovery export: the user's Documents (Windows) or home folder."""
+    docs = Path.home() / "Documents"
+    return (docs if os.name == "nt" and docs.is_dir() else Path.home()) / "mmbox-account-recovery.json"
+
+
 def account_chain() -> list | None:
     try:
         return json.loads((console_home() / "account.json").read_text(encoding="utf-8")).get("chain") or None
@@ -3438,6 +3455,34 @@ def account_head_due(op: "Operator", hours: float = 20) -> bool:
     return True
 
 
+def account_create(op: "Operator", passphrase: str, recovery: Path) -> dict:
+    """The account: its root key (kept here: keyring or DPAPI), sealed into `recovery` with `passphrase`, and this
+    console as its first device. Shared by --account-create and the onboarding window."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    if account_chain():
+        raise ValueError("this console is already a device of an account")
+    if len(passphrase) < 16:
+        raise ValueError("the passphrase is shorter than 16 characters")
+    A = account_lib()
+    root = Ed25519PrivateKey.generate()
+    rpub = root.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    raw = dict(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw,
+               encryption_algorithm=serialization.NoEncryption())
+    rec = {"id": A.account_id(rpub), "sign_key": M.b64e(root.private_bytes(**raw)), "box_key": M.b64e(os.urandom(32)),
+           "created": M.iso()}
+    recovery.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(recovery, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({**seal_identity(rec, passphrase), "kind": "mmbox account root"}, f)
+    where = KeyStore(console_home(), "root").save(rec)
+    account_save([A.make_link([], "add", device_record(op), "root", root, rpub)])
+    fp = A.root_fingerprint(rpub)
+    pin = run_client(["daemon", "operator", "--account", fp], timeout=60) if CLIENT else {"ok": False}
+    return {"account": rec["id"], "fingerprint": fp, "root_kept": where, "recovery": str(recovery),
+            "pinned_here": bool(pin.get("ok"))}
+
+
 def account_command(a) -> int:
     """--account-*: make the account (its root key and the first device: this console), a new device asking to join,
     approving it from a device of the account (its code checked), revoking one, the daily head, the chain for a daemon."""
@@ -3450,25 +3495,15 @@ def account_command(a) -> int:
     if a.account_create:
         if chain:
             raise SystemExit("this console is already a device of an account (--account-show)")
-        root = Ed25519PrivateKey.generate()
-        rpub = root.public_key().public_bytes(**raw_pub)
-        raw = dict(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw,
-                   encryption_algorithm=serialization.NoEncryption())
-        rec = {"id": A.account_id(rpub), "sign_key": M.b64e(root.private_bytes(**raw)), "box_key": M.b64e(os.urandom(32)),
-               "created": M.iso()}
-        out = Path(a.account_create)
         pw = ask_passphrase(a, "A passphrase for the recovery export of the root key (16 characters at least): ", True)
-        if len(pw) < 16:
-            raise SystemExit("not made: the passphrase is shorter than 16 characters")
-        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({**seal_identity(rec, pw), "kind": "mmbox account root"}, f)
-        where = KeyStore(console_home(), "root").save(rec)
-        chain = [A.make_link([], "add", device_record(op), "root", root, rpub)]
-        account_save(chain)
-        print(f"account {rec['id']} made; root fingerprint {A.root_fingerprint(rpub)} (pin it on each computer: "
-              f"`mmbox.py daemon operator --account {A.root_fingerprint(rpub)}`); root key kept in {where}; recovery "
-              f"export written to {out}: keep it offline, then delete it from this computer")
+        try:
+            res = account_create(op, pw, Path(a.account_create))
+        except ValueError as e:
+            raise SystemExit(f"not made: {e}")
+        print(f"account {res['account']} made; root fingerprint {res['fingerprint']} (pinned on this computer's daemon: "
+              f"{'yes' if res['pinned_here'] else 'no'}; on the others: `mmbox.py daemon operator --account "
+              f"{res['fingerprint']}`); root key kept in {res['root_kept']}; recovery export written to {res['recovery']}: "
+              f"keep it offline, then delete it from this computer")
         return 0
     if a.account_join:
         if chain:

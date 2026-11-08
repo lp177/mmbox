@@ -697,10 +697,20 @@ dialog.att-viewer { width: min(1100px, calc(100vw - 32px)); }
 .list-head { display: flex; align-items: center; gap: 8px; } .list-head #list-count { flex: 1; }
 #session-dialog .dialog-body, #butler-launch .dialog-body { display: flex; flex-direction: column; gap: 10px; min-width: min(560px, 92vw); }
 #session-dialog .row, #butler-launch .row, #view-settings .row { display: flex; gap: 10px; } #session-dialog .row .field, #butler-launch .row .field { flex: 1; }
-#session-out .dialog-body { width: min(1100px, 94vw); display: flex; flex-direction: column; gap: 10px; }
+#session-out { width: min(1120px, 96vw); max-width: 96vw; overflow-x: hidden; }
+#session-out .dialog-body { width: auto; max-width: 100%; box-sizing: border-box; display: flex; flex-direction: column; gap: 10px; }
 #session-out .butler-out { max-height: 62vh; min-height: 300px; }
 .acct-body { display: flex; flex-direction: column; gap: 10px; }
 .acct-dev { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 10px; background: var(--s2); }
 .acct-dev .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .acct-join { display: flex; flex-direction: column; gap: 6px; padding: 10px; border-radius: 10px; border: 1px solid var(--warn, #fdd663); }
 .acct-code { font: 600 22px/1.2 ui-monospace, monospace; letter-spacing: .2em; }
+#onboard { width: min(780px, 94vw); max-width: 94vw; overflow-x: hidden; }
+#onboard .dialog-body { width: auto; max-width: 100%; box-sizing: border-box; display: flex; flex-direction: column; gap: 12px; }
+#onboard form, #onboard section { display: flex; flex-direction: column; gap: 12px; }
+.ob-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.ob-card { display: flex; flex-direction: column; gap: 6px; text-align: left; padding: 16px; border-radius: 14px; border: 1px solid var(--line); background: var(--s2); color: var(--text); cursor: pointer; }
+.ob-card:hover, .ob-card:focus-visible { border-color: var(--primary); background: var(--s3); outline: none; }
+.ob-card:focus-visible { box-shadow: 0 0 0 2px var(--focus); }
+.ob-card span { color: var(--text-2); font-size: 13px; }
+.ob-steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }

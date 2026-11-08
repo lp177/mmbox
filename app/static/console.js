@@ -2647,7 +2647,8 @@ function renderAccount() {
       h("div", { class: "actions" }, h("button", { class: "btn text ripple", type: "button", onclick: async () => { await action({ action: "account_join_cancel" }); loadAccount(); } }, "Cancel")));
   } else {
     const inp = h("input", { placeholder: " ", autocomplete: "off", maxlength: "19" });
-    parts.push(h("p", { class: "dim" }, "This console is no device of an account. Make one on your first computer with `mmbox_console.py --account-create <recovery file>`, or join yours:"),
+    parts.push(h("div", { class: "actions" }, h("button", { class: "btn filled ripple", type: "button", onclick: () => openOnboarding() }, "Make or join my account")),
+      h("p", { class: "dim" }, "Or join yours directly:"),
       h("div", { class: "field" }, inp, h("label", {}, "The account's root fingerprint (XXXX-XXXX-XXXX-XXXX)")),
       h("div", { class: "actions" }, h("button", { class: "btn filled ripple", type: "button", onclick: async () => {
         const r = await action({ action: "account_join", account: inp.value.trim() });
@@ -2657,6 +2658,51 @@ function renderAccount() {
 }
 setInterval(loadAccount, 20000);
 setTimeout(loadAccount, 2000);
+// ---------------------------------------------------------------- onboarding: no account yet, at each launch until there is one
+const OB = { shown: false };
+function obShow(panel) { for (const id of ["ob-choice", "ob-create", "ob-done", "ob-join"]) $("#" + id).hidden = id !== panel; }
+function openOnboarding(panel = "ob-choice") {
+  const d = AC.data || {};
+  $("#ob-path").value = $("#ob-path").value || d.default_recovery || "";
+  obShow(d.joining ? "ob-join" : panel);
+  if (d.joining) $("#ob-join-out").replaceChildren("Waiting for a device of the account to approve this one. Its code: ", h("span", { class: "acct-code" }, d.my_code || "?"));
+  if (!$("#onboard").open) $("#onboard").showModal();
+}
+async function maybeOnboard() {
+  if (OB.shown || !token) return;
+  await loadAccount();
+  const d = AC.data || {};
+  if (d.available && !d.account) { OB.shown = true; openOnboarding(); }
+}
+setTimeout(maybeOnboard, 3000);
+$("#ob-go-create").addEventListener("click", () => { obShow("ob-create"); $("#ob-pw").focus(); });
+$("#ob-go-join").addEventListener("click", () => { obShow("ob-join"); $("#ob-fpin").focus(); });
+$$("[data-ob-back]").forEach((b) => b.addEventListener("click", () => obShow("ob-choice")));
+$("#ob-later").addEventListener("click", () => $("#onboard").close());
+$("#ob-close").addEventListener("click", () => $("#onboard").close());
+$("#ob-create").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const pw = $("#ob-pw").value, pw2 = $("#ob-pw2").value, err = $("#ob-create-err");
+  if (pw.length < 16) { err.textContent = "16 characters at least."; return; }
+  if (pw !== pw2) { err.textContent = "The two passphrases differ."; return; }
+  err.textContent = "";
+  const go = $("#ob-create-go"); go.disabled = true; go.classList.add("loading"); go.setAttribute("aria-busy", "true");
+  const r = await action({ action: "account_create", passphrase: pw, recovery: $("#ob-path").value.trim() });
+  go.disabled = false; go.classList.remove("loading"); go.removeAttribute("aria-busy");
+  if (!r.ok) { err.textContent = r.err || "not made"; return; }
+  $("#ob-pw").value = ""; $("#ob-pw2").value = "";
+  $("#ob-fp").textContent = r.fingerprint;
+  $("#ob-pin").textContent = `mmbox.py daemon operator --account ${r.fingerprint}`;
+  $("#ob-recovery").textContent = `Recovery file: ${r.recovery}. Copy it somewhere offline (a USB key, your password manager), then delete it from this computer. Without it and without any device, the account is lost.`;
+  obShow("ob-done");
+  loadAccount();
+});
+$("#ob-join-go").addEventListener("click", async () => {
+  const r = await action({ action: "account_join", account: $("#ob-fpin").value.trim().toUpperCase() });
+  if (!r.ok) { $("#ob-join-out").textContent = r.err || "not asked"; return; }
+  $("#ob-join-out").replaceChildren("Asked. On a device of the account, approve this console with the code ", h("span", { class: "acct-code" }, r.code), ". This window closes by itself once it is approved.");
+  const t = setInterval(async () => { await loadAccount(); if (AC.data?.account) { clearInterval(t); toast(`This console is now a device of ${AC.data.account}`); $("#onboard").close(); } }, 5000);
+});
 
 showTab(DEEP.get("tab") || localStorage.getItem("mmbox-console-tab") || "messages");
 if (DEEP.get("msg")) { const id = DEEP.get("msg"); const t = setInterval(() => { if (S.byId.has(id)) { clearInterval(t); openMessage(id); } }, 300); }

@@ -578,6 +578,53 @@
   </dialog>
 
   <!-- A box: who it is, what it does -->
+  <!-- Onboarding: this console has no account yet: make it (root key, recovery export) or join one -->
+  <dialog id="onboard" aria-labelledby="ob-title" class="wide">
+    <div class="dialog-body onboard">
+      <h2 id="ob-title">Your mmbox account</h2>
+      <section id="ob-choice">
+        <p>This console acts as an operator through an account: a root key kept on this computer, and devices (your consoles) that the root or another device approved. Nobody else, the service included, can make one.</p>
+        <div class="ob-choices">
+          <button class="ob-card ripple" type="button" id="ob-go-create"><strong>Make my account</strong><span>Your first computer: a root key and its recovery file.</span></button>
+          <button class="ob-card ripple" type="button" id="ob-go-join"><strong>Join my account</strong><span>Another computer of yours: a device of the account approves this one.</span></button>
+        </div>
+        <div class="actions"><button class="btn text ripple" type="button" id="ob-later">Later</button></div>
+      </section>
+      <form id="ob-create" hidden autocomplete="on">
+        <p>The root key stays in this computer's keyring. A copy of it, sealed with the passphrase below, is written to a recovery file: with it, and only with it, the account comes back if every device is lost. Let your password manager make and keep the passphrase.</p>
+        <input type="text" name="username" autocomplete="username" value="mmbox account recovery" hidden readonly>
+        <div class="field"><input id="ob-pw" name="password" type="password" autocomplete="new-password" minlength="16" required placeholder=" "><label for="ob-pw">Recovery passphrase (16 characters at least)</label></div>
+        <div class="field"><input id="ob-pw2" type="password" autocomplete="new-password" minlength="16" required placeholder=" "><label for="ob-pw2">The same passphrase again</label></div>
+        <div class="field"><input id="ob-path" type="text" autocomplete="off" placeholder=" "><label for="ob-path">Recovery file</label></div>
+        <p id="ob-create-err" class="error" role="alert"></p>
+        <div class="actions">
+          <button class="btn text ripple" type="button" data-ob-back>Back</button>
+          <button class="btn filled ripple" type="submit" id="ob-create-go">Make my account</button>
+        </div>
+      </form>
+      <section id="ob-done" hidden>
+        <p>Your account is made. Its root fingerprint (the account's identity):</p>
+        <p class="acct-code" id="ob-fp"></p>
+        <ul class="ob-steps">
+          <li id="ob-recovery"></li>
+          <li>On each computer whose daemon you command: <code id="ob-pin"></code> (the install script asks it); this computer's daemon pins it already.</li>
+          <li>On each service you operate: its admin adds this fingerprint to <code>MMBOX_OPERATOR_ACCOUNTS</code>.</li>
+          <li>Your other consoles: open them, choose <em>Join my account</em>, and approve them here.</li>
+        </ul>
+        <div class="actions"><button class="btn filled ripple" type="button" id="ob-close">Done</button></div>
+      </section>
+      <section id="ob-join" hidden>
+        <p>Type your account's root fingerprint (on a console of the account: Settings, Account). That console then shows this one's request: approve it there with the code shown here.</p>
+        <div class="field"><input id="ob-fpin" type="text" autocomplete="off" maxlength="19" placeholder=" "><label for="ob-fpin">Root fingerprint (XXXX-XXXX-XXXX-XXXX)</label></div>
+        <p id="ob-join-out" role="status"></p>
+        <div class="actions">
+          <button class="btn text ripple" type="button" data-ob-back>Back</button>
+          <button class="btn filled ripple" type="button" id="ob-join-go">Ask to join</button>
+        </div>
+      </section>
+    </div>
+  </dialog>
+
   <!-- A hidden session of this computer: its live output, and a line to type into it -->
   <dialog id="session-out" aria-labelledby="so-title" closedby="any" class="wide">
     <form method="dialog" class="dialog-body">

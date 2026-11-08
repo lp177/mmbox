@@ -6,18 +6,12 @@
     python3 app/install.py --uninstall  the same, removed
     python3 app/install.py --check      says whether it is there, changes nothing
 
-It then makes sure this computer holds the operator key (the console's own key pair, the one your services name as
-their operator) and that this computer's daemon obeys it. When the key is missing, it asks: import an export of it
-(`mmbox_console.py --export-key FILE` on the computer that has it; its passphrase is asked), make a new one (your
-first computer), or skip. The key is kept in this system's keyring (Secret Service on Linux desktops) or with DPAPI
-(Windows), else in a file only this user reads. Its fingerprint is then pinned on each service of this computer
-(`mmbox.py daemon operator`), unless one is pinned there already. `--import-key FILE`, `--new-key`, `--skip-key`
-answer without asking.
-
-The entry runs the console with `--open`: its window comes to the front, and the computer's daemon (its butler)
-starts with it unless Settings say otherwise; a second launch only brings the running window to the front.
-Nothing is installed system-wide and no administrator right is needed. It is done again (updated) when the
-console or Python moved since.
+Then the account (client/ACCOUNTS.md): when this console has none yet, the console opens (in front) on its
+onboarding window: make your account (your first computer: a root key, a recovery file sealed with a passphrase) or
+join it (another computer of yours, approved from a device of the account). On a computer without a display (a
+server: no console there), it asks the account's root fingerprint instead, so that this computer's daemon obeys its
+devices (`mmbox.py daemon operator --account`). `--account FINGERPRINT` answers without asking, `--skip-account`
+leaves it.
 """
 from __future__ import annotations
 
@@ -177,40 +171,40 @@ def console_cmd(*args, capture: bool = True) -> subprocess.CompletedProcess:
                           creationflags=0x08000000 if os.name == "nt" and capture else 0)
 
 
-def operator_step(a) -> int:
-    """The operator key on this computer (asked when missing), then pinned for this computer's daemon."""
-    if a.skip_key:
+def has_display() -> bool:
+    return os.name == "nt" or sys.platform == "darwin" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def account_step(a) -> int:
+    """The account: the console's onboarding window when it has none (a computer with a display), else a pin of the
+    account's root on this computer's daemon (a server)."""
+    if a.skip_account:
         return 0
-    has = console_cmd("--has-key")
-    if has.returncode == 3:
-        print(f"the operator key cannot be read: {(has.stderr or has.stdout).strip()}", file=sys.stderr)
-        return 1
-    if has.returncode == 1:
-        choice = "import" if a.import_key else "new" if a.new_key else None
-        if choice is None and sys.stdin.isatty():
-            ans = input("This computer holds no operator key. [i] import an export of yours, [n] make a new one (your first "
-                        "computer), [s] skip: ").strip().lower()[:1]
-            choice = {"i": "import", "n": "new"}.get(ans)
-        if choice == "import":
-            path = a.import_key or input("The export file (made with `mmbox_console.py --export-key FILE`): ").strip()
-            if console_cmd("--import-key", path, capture=False).returncode != 0:
-                return 1
-        elif choice == "new":
-            r = console_cmd("--whoami")
-            print(r.stdout.strip())
-            print("Name this id in MMBOX_OPERATORS of your services (their operator), then run this script again on your "
-                  "other computers with an export of it.")
-        else:
-            print("no operator key: the console starts with a new one when it opens; skipped")
-            return 0
-        has = console_cmd("--has-key")
-    print(has.stdout.strip())
-    fp = next((w.rstrip(")") for w in has.stdout.split() if w.count("-") == 3 and len(w.rstrip(")")) == 19), None)
     client = APP.parent / "client" / "mmbox.py"
-    if fp and client.is_file():
-        r = subprocess.run([sys.executable, str(client), "daemon", "operator", "--fingerprint", fp], capture_output=True, text=True,
-                           creationflags=0x08000000 if os.name == "nt" else 0)
+    show = console_cmd("--account-show")
+    if show.returncode == 0:
+        print(show.stdout.strip().splitlines()[0] if show.stdout.strip() else "account present")
+        return 0
+    if a.account:
+        r = subprocess.run([sys.executable, str(client), "daemon", "operator", "--account", a.account.strip().upper()],
+                           capture_output=True, text=True, creationflags=0x08000000 if os.name == "nt" else 0)
         print((r.stdout or r.stderr).strip())
+        return r.returncode
+    if has_display():
+        console_cmd("--has-key")  # its device key exists from its first start; the window does the rest
+        kw = {"creationflags": 0x00000008 | 0x00000200 | 0x08000000} if os.name == "nt" else {"start_new_session": True}
+        subprocess.Popen([python_gui(), str(CONSOLE), "--open"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, cwd=str(APP), **kw)
+        print("no account on this console yet: the console opens on its onboarding window (make or join your account)")
+        return 0
+    if sys.stdin.isatty():
+        fp = input("No display here: the root fingerprint of the account whose devices this computer's daemon obeys "
+                   "(XXXX-XXXX-XXXX-XXXX; empty: later): ").strip().upper()
+        if fp:
+            r = subprocess.run([sys.executable, str(client), "daemon", "operator", "--account", fp], capture_output=True, text=True)
+            print((r.stdout or r.stderr).strip())
+            return r.returncode
+    print("no account pinned: later, `mmbox.py daemon operator --account <root fingerprint>`")
     return 0
 
 
@@ -218,9 +212,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--uninstall", action="store_true", help="take the entry out of the applications menu")
     ap.add_argument("--check", action="store_true", help="say whether it is there (exit 0) or not (exit 1); change nothing")
-    ap.add_argument("--import-key", metavar="FILE", help="the operator key from this export (its passphrase is asked)")
-    ap.add_argument("--new-key", action="store_true", help="make a new operator key when none is here (your first computer)")
-    ap.add_argument("--skip-key", action="store_true", help="leave the operator key as it is")
+    ap.add_argument("--account", metavar="FINGERPRINT", help="pin this account's root for this computer's daemon (no window)")
+    ap.add_argument("--skip-account", action="store_true", help="leave the account as it is")
     a = ap.parse_args(argv)
     if not CONSOLE.is_file():
         print(f"{CONSOLE}: not found (run this script from the mmbox repository's app folder)", file=sys.stderr)
@@ -235,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{sys.platform}: not supported yet (Linux and Windows are); run `python3 {CONSOLE} --open`", file=sys.stderr)
         return 2
     if code == 0 and not a.uninstall and not a.check:
-        code = operator_step(a)
+        code = account_step(a)
     return code
 
 

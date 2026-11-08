@@ -108,3 +108,15 @@ on another computer, a device approved).
 - Tested on the bench, the service with no operator key, only the account: A obeyed; B asks to join, A sees the same
   code, a wrong code refused, the right one approved, B takes the chain and is obeyed; A revokes B: B's console is no
   operator any more and the daemon learns the revocation from the service without any op.
+
+## Onboarding (2026-11-08)
+
+- The console opens on an onboarding window at each launch while it has no account (from the applications menu, or
+  started by app/install.py): **Make my account** (the recovery passphrase twice, in password fields a password
+  manager fills and keeps, 16 characters at least; the recovery file, by default in the home folder or Documents),
+  **Join my account** (the root fingerprint; the code to type on a device of the account; the window closes once it is
+  approved), or **Later**. Settings, Account opens it again.
+- Making the account also pins it on this computer's daemon; a device that joined does the same once approved.
+- app/install.py: with a display, a console without an account is opened on that window; without a display (a server,
+  no console), it asks the account's root fingerprint and pins it (`--account FP` answers, `--skip-account` leaves it).
+  The old operator-key import/new steps are gone from it.
