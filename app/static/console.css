@@ -611,3 +611,39 @@ dialog.att-viewer { width: min(1100px, calc(100vw - 32px)); }
 @media (prefers-reduced-motion: reduce) {
   .mem-frame, .mem-bar > span { transition: none; }
 }
+
+/* ---------- held messages: their senders keep them, the recipient's computer does not accept them yet (loud, red) */
+:root { --held: #ff5449; --held-soft: rgb(255 84 73 / .14); --held-line: rgb(255 84 73 / .55); }
+.held-btn { color: #fff; background: #c62828; border-color: transparent; font-weight: 600; gap: 6px; }
+.held-btn:hover { background: #d32f2f; }
+.held-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.held-btn .ico { fill: currentColor; }
+.held-banner {
+  margin: 8px 12px 4px; padding: 12px 14px; border-radius: var(--radius); background: var(--held-soft);
+  border: 1px solid var(--held-line); box-shadow: inset 4px 0 0 var(--held); color: var(--text);
+}
+.held-head { display: flex; align-items: center; gap: 8px; }
+.held-head .ico { width: 22px; height: 22px; color: var(--held); fill: var(--held); }
+.held-head h2 { font-size: 15px; font-weight: 600; color: #ffb4ab; }
+.held-help { margin: 6px 0 8px; color: var(--text-2); font-size: 13px; }
+.held-list { list-style: none; margin: 0 0 8px; padding: 0; display: grid; gap: 2px; }
+.held-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 4px 0; border-top: 1px solid rgb(255 84 73 / .2); }
+.held-list li .dim { flex: 1; min-width: 12em; }
+.held-to strong { color: var(--text); }
+.held-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip.held { background: rgb(255 84 73 / .22); color: #ffb4ab; gap: 4px; }
+.chip.held .ico { fill: currentColor; }
+.msg.held { box-shadow: inset 3px 0 0 var(--held); background: rgb(255 84 73 / .07); }
+.msg.held .when { color: #ffb4ab; font-weight: 600; }
+.badge.held { background: var(--held); color: #fff; display: inline-flex; gap: 2px; align-items: center; }
+.badge.held .ico { width: 11px; height: 11px; fill: currentColor; }
+.node.held > svg.ico { color: var(--held); fill: var(--held); opacity: 1; }
+.node.held .name { color: #ffb4ab; }
+@media (prefers-reduced-motion: no-preference) {
+  .held-btn { animation: held-pulse 2.4s var(--ease) infinite; }
+  @keyframes held-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgb(255 84 73 / .55); } 50% { box-shadow: 0 0 0 6px rgb(255 84 73 / 0); } }
+}
+@media (forced-colors: active) {
+  .held-banner { border: 2px solid Mark; }
+  .held-btn { forced-color-adjust: none; background: Mark; color: MarkText; }
+}

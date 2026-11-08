@@ -32,6 +32,7 @@ const ICON = {
   all: "M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2Zm0 4-8 5-8-5V6l8 5 8-5Z",
   machine: "M20 18a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2H0v2h24v-2h-4ZM4 6h16v10H4V6Z",
   folder: "M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2Z",
+  warn: "M1 21h22L12 2 1 21Zm12-3h-2v-2h2v2Zm0-4h-2v-4h2v4Z",
   box: "M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2Zm0 12h-4a3 3 0 0 1-6 0H5V5h14v10Z",
   mbox: "M12 2 2 7v10l10 5 10-5V7L12 2Zm0 2.2L19.5 8 12 11.8 4.5 8 12 4.2Z",
   server: "M4 3h16a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Zm0 10h16a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Zm3-7.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0 10a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z",
@@ -107,6 +108,7 @@ const STATE_TITLE = {
   delivered: "its service says it no longer holds it (taken by its box, or deleted with it): learnt afterwards, no log nor collector of this computer saw it taken",
   stranded: "it waits in a box that closed before reading it: the relay forwards real messages to the machine box, the tool's own (ping, notice, link…) stay until the box is removed",
   dropped: "its sender gave up: no service ever accepted it (the recipient was no longer known, or never listed the sender)",
+  queued: "its sender keeps it: the service refuses it until the recipient accepts the sender's box (no client of the recipient's computer has run since it was introduced). It leaves by itself as soon as one runs: nothing to send again",
   sent: "sent; nothing says yet whether its box took it",
 };
 const HANDLED_TXT = { execute: "executed", ask: "asked the user", archived: "archived", rejected: "rejected", expired: "expired", interrupted: "interrupted",
@@ -119,7 +121,13 @@ const boxOf = (id) => S.boxes.get(id) || { id, label: null, servers: [] };
 const boxName = (id) => { if (!id) return "?"; const b = boxOf(id); return b.title || b.label || b.alias || id; };
 const boxLabel = (id) => { const b = boxOf(id); return b.label || b.alias || id; };
 // the state of a direct message in words: who took it (the session behind a machine box when known), answered
+// held: its sender keeps it queued and the service refuses it (the recipient does not accept the sender yet)
+const HELD_AFTER = 300e3, HELD_RETRY = 1800e3;  // mmbox_console.py: HELD_AFTER_S, HELD_RETRY_S
+const isHeld = (m) => !m.broadcast && m.state === "queued" && !!m.held && Date.now() - m.held.since >= HELD_AFTER;
+const heldAge = (m) => ago((Date.now() - m.held.since) / 1000).replace(" ago", "");
+const heldSilent = (m) => !!m.held && !m.held.local && Date.now() - (m.held.last || m.held.since) > HELD_RETRY;
 function stateText(m) {
+  if (isHeld(m)) return "held " + heldAge(m);
   if (m.broadcast) return STATE_TXT[m.state] || m.state || "";
   if ((m.answers || []).length) return "answered";
   if (m.state !== "read") return STATE_TXT[m.state] || m.state || "";
@@ -186,6 +194,7 @@ function filtered() {
     switch (F.view) {
       case "unread": if (!["unread", "taken"].includes(m.state)) return false; break;
       case "late": if (!isLate(m) || m.tier > LATE_TIER) return false; break;
+      case "held": if (!isHeld(m)) return false; break;
       case "read": if (m.state !== "read" && !(m.broadcast && (m.seen_by || []).length)) return false; break;
       case "pending": if (!["queued", "sent"].includes(m.state)) return false; break;
       case "undelivered": if (!["stranded", "dropped"].includes(m.state)) return false; break;
@@ -220,20 +229,21 @@ function groupKey(m) {
 }
 
 // ---------------------------------------------------------------- rendering: the tree
-function treeItem({ id, type, key, icon, name, sub, badge, dot, children, level, extra }) {
+function treeItem({ id, type, key, icon, name, sub, badge, held, dot, children, level, extra }) {
   const hasKids = children && children.length;
   const r = rightsOf({ type, key });
   const li = h("li", { role: "treeitem", id: "t-" + id, "aria-level": level, "aria-selected": String(S.node.type === type && S.node.key === key),
     "aria-expanded": hasKids ? String(S.expanded.has(id)) : null, tabindex: "-1", dataset: { type, key: key ?? "", nid: id },
     "aria-keyshortcuts": r ? "Shift+F10" : null, "aria-description": r ? `handling: ${RIGHTS_TXT[r.rights] || "as the workstations say"} (menu: Shift+F10)` : null });
   const showChip = r && r.rights && (type === "machine" || r.source === "own" || r.network);
-  const node = h("div", { class: "node ripple" },
+  const node = h("div", { class: "node ripple" + (held ? " held" : "") },
     h("span", { class: "twist" }, hasKids ? svg(ICON.chevron) : null),
     dot ? h("span", { class: "dot " + dot, title: { listening: "listening", active: "active", closed: "closed", paused: "receiving stopped" }[dot] || "" }) : null,
     svg(ICON[icon] || ICON.box),
     h("span", { class: "name", title: name + (sub ? " · " + sub : "") }, name, sub ? h("span", { class: "sub" }, sub) : null),
     showChip ? h("span", { class: "chip rights-chip " + r.rights, title: r.title + ": " + (RIGHTS_TXT[r.rights] || "?") + (r.network ? " (overrides the workstations and boxes)" : r.source === "own" && type === "box" ? " (own setting)" : "") }, RIGHTS_SHORT[r.rights] || "?") : null,
     badge ? h("span", { class: "badge", title: `${badge} unread` }, badge) : null,
+    held ? h("span", { class: "badge held", title: `${held} message(s) held: not accepted by this recipient yet` }, svg(ICON.warn, "ico tiny"), String(held)) : null,
     type === "box" && (S.snap?.pinned || []).includes(key) ? h("button", { class: "pin-btn ripple", type: "button", tabindex: "-1",
       "aria-label": `Unpin the conversation with ${name}`, title: "Pinned conversation: nothing expires. Click to unpin (each message starts the full delay again)" }, svg(ICON.pin)) : null,
     r ? h("button", { class: "node-menu ripple", type: "button", tabindex: "-1", "aria-haspopup": "menu", "aria-expanded": "false",
@@ -248,6 +258,9 @@ function renderTree() {
   const tree = $("#tree");
   const unread = new Map();
   for (const m of S.msgs) if (m.tier <= +F.tier && (m.state === "unread" || m.state === "taken") && m.to) unread.set(m.to, (unread.get(m.to) || 0) + 1);
+  const heldTo = new Map();  // whatever the verbosity: a held message is always worth seeing
+  for (const m of S.msgs) if (isHeld(m) && m.to) heldTo.set(m.to, (heldTo.get(m.to) || 0) + 1);
+  const heldSum = (ids) => ids.reduce((n, id) => n + (heldTo.get(id) || 0), 0) || null;
   const q = $("#tree-filter").value.trim().toLowerCase();
   const machines = new Map();
   for (const b of S.boxes.values()) {
@@ -264,7 +277,7 @@ function renderTree() {
   const boxItem = (b, level, pre = "b") => treeItem({ id: pre + b.id, type: "box", key: b.id, icon: b.role === "machine" ? "mbox" : "box", level,
     name: b.title || b.label || b.alias || b.id,
     sub: [b.title ? (b.label || b.id) : b.local ? (b.profile === "default" ? "here" : b.profile) : null, b.role !== "machine" ? b.model : null].filter(Boolean).join(" · ") || null,
-    badge: unread.get(b.id), dot: dotOf(b) });
+    badge: unread.get(b.id), held: heldTo.get(b.id), dot: dotOf(b) });
   const mItems = [...machines.entries()].sort((a, b) => machineName(a[0]).localeCompare(machineName(b[0]))).map(([mk, M]) => {
     const kids = [];
     if (M.box && match(M.box)) kids.push(boxItem(M.box, 3));
@@ -273,13 +286,13 @@ function renderTree() {
       if (!shown.length) continue;
       const pid = "p" + mk + ":" + wp;
       kids.push(treeItem({ id: pid, type: "project", key: mk + "\u0000" + wp, icon: "folder", level: 3, name: wp || "(no project)",
-        sub: `${shown.length}`, badge: sum(bs.map((b) => b.id)) || null, children: shown.map((b) => boxItem(b, 4)) }));
+        sub: `${shown.length}`, badge: sum(bs.map((b) => b.id)) || null, held: heldSum(bs.map((b) => b.id)), children: shown.map((b) => boxItem(b, 4)) }));
     }
     if (!kids.length && q) return null;
     const all = [M.box, ...[...M.projects.values()].flat()].filter(Boolean);
     const live = all.some((b) => b.listening || b.listening_here);
     return treeItem({ id: "m" + mk, type: "machine", key: mk, icon: "machine", level: 2, name: machineName(mk),
-      sub: M.box && M.box.label && M.box.label !== machineName(mk) ? M.box.label : null, badge: sum(all.map((b) => b.id)) || null,
+      sub: M.box && M.box.label && M.box.label !== machineName(mk) ? M.box.label : null, badge: sum(all.map((b) => b.id)) || null, held: heldSum(all.map((b) => b.id)),
       dot: live ? "listening" : all.some(isActive) ? "active" : "", children: kids });
   }).filter(Boolean);
   // Models: provider, then model, then the session boxes running it (machine boxes and the console run no model)
@@ -306,7 +319,9 @@ function renderTree() {
     extra: statsLine(s) }));
   const totalUnread = [...unread.values()].reduce((a, b) => a + b, 0);
   const keep = document.activeElement && tree.contains(document.activeElement) ? document.activeElement.dataset.nid : null;
+  const totalHeld = [...heldTo.values()].reduce((a, b) => a + b, 0);
   tree.replaceChildren(
+    totalHeld ? treeItem({ id: "held", type: "held", key: "held", icon: "folder", level: 1, name: "Held messages", sub: "not accepted yet", held: totalHeld }) : "",
     treeItem({ id: "all", type: "all", key: null, icon: "all", level: 1, name: "All messages", badge: totalUnread || null }),
     treeItem({ id: "machines", type: "group", key: "machines", icon: "machine", level: 1, name: "Machines", sub: `${machines.size}`, children: mItems }),
     treeItem({ id: "models", type: "group", key: "models", icon: "model", level: 1, name: "Models", sub: `${providers.size}`, children: pItems }),
@@ -321,6 +336,7 @@ function visibleItems() {
 function selectNode(li) {
   const type = li.dataset.type;
   if (type === "group") { toggle(li); return; }
+  if (type === "held") { showHeld(); return; }
   S.node = { type, key: li.dataset.key || null };
   S.limit = 300;
   closeReader(false);
@@ -807,7 +823,8 @@ $("#chat-ttl-reset").addEventListener("click", async () => {
 function stateChip(m) {
   if (m.broadcast) return h("span", { class: "chip broadcast" }, m.scope === "network" ? "network" : m.scope === "machine" ? "@here" : "broadcast");
   const ok = (m.answers || []).length || m.state === "read" || m.state === "delivered";
-  return h("span", { class: "chip " + (ok ? "ok" : m.state), title: (m.answers || []).length ? null : STATE_TITLE[m.state] || null }, stateText(m));
+  return h("span", { class: "chip " + (ok ? "ok" : isHeld(m) ? "held" : m.state), title: (m.answers || []).length ? null : STATE_TITLE[m.state] || null },
+    isHeld(m) ? svg(ICON.warn, "ico tiny") : null, stateText(m));
 }
 function route(m) {
   const to = m.broadcast ? (m.scope === "network" ? "the whole network" : (m.to_boxes || []).length > 1 ? `${m.to_boxes.length} channels` : "this computer") : boxName(m.to);
@@ -820,7 +837,7 @@ const isForward = (m) => m.kind === "forward" || !!m.forwarded;
 function msgRow(m) {
   const unread = isUnread(m);
   const late = isLate(m);
-  return h("div", { class: "msg ripple" + (unread ? " unread" : "") + (late ? " late" + (S.freshLate.has(m.id) ? " fresh-late" : "") : "") + (isForward(m) ? " forward" : ""),
+  return h("div", { class: "msg ripple" + (unread ? " unread" : "") + (late ? " late" + (S.freshLate.has(m.id) ? " fresh-late" : "") : "") + (isForward(m) ? " forward" : "") + (isHeld(m) ? " held" : ""),
     title: late ? `unread for ${ago((Date.now() - tsOf(m)) / 1000).replace(" ago", "")}` : null, role: "option", id: "m-" + m.id, tabindex: "-1",
     "aria-selected": String(S.selected === m.id), dataset: { id: m.id } },
     h("span", { class: "state" }, h("span", { class: "dot " + (unread ? "listening" : ["queued", "dropped", "stranded"].includes(m.state) ? "closed" : "") })),
@@ -1152,10 +1169,16 @@ function renderDetail(m, partial) {
   const fw = m.forwarded;
   const fwBlock = fw ? h("div", { class: "notice" }, h("strong", {}, "Forwarded to the machine box"), h("br"),
     `Original message from ${fw.from ? boxName(fw.from) : fw.from_label || "?"}` + (fw.stored_at ? `, stored on ${fmtFull.format(new Date(Date.parse(fw.stored_at)))}` : "") + (fw.reason ? ` — ${fw.reason}` : "")) : null;
+  const heldBlock = isHeld(m) ? h("div", { class: "held-banner", role: "note" },
+    h("div", { class: "held-head" }, svg(ICON.warn, "ico"), h("h2", {}, `Held for ${heldAge(m)}: ${recipientName(m.to)} does not accept it yet`)),
+    h("p", { class: "held-help" }, `${boxName(m.from)} keeps it and sends it again by itself. The service refuses it`
+      + (m.held.why === "full" ? " because the recipient's box is full" : " because the recipient does not list the sender yet: no client of its computer has run since the sender's box was introduced to it")
+      + ". It leaves as soon as a session of that computer runs" + (m.held.why === "full" ? " and empties its box" : "") + "; if the recipient's box closes meanwhile, it goes to its machine box. Nothing to send again."
+      + (heldSilent(m) ? ` Its sender has not retried since ${fmtFull.format(new Date(m.held.last || m.held.since))}: its computer may be off too.` : ""))) : null;
   const actBlock = m.sender_activity ? h("div", { class: "activity" }, h("strong", {}, `Activity of ${m.sender_title || boxName(m.from)} when sending`), m.sender_activity) : null;
   const body = typeof m.body === "string" ? m.body : m.preview;
   d.replaceChildren(h("div", { class: "detail" },
-    h("h2", {}, m.subject || (m.lock ? `Lock ${m.lock.name}` : "(no subject)")), chips, meta, fwBlock, actBlock,
+    h("h2", {}, m.subject || (m.lock ? `Lock ${m.lock.name}` : "(no subject)")), chips, heldBlock, meta, fwBlock, actBlock,
     body ? h("pre", { class: "body", tabindex: "0", "aria-label": "Message body" }, body + (partial && m.body_len > (m.preview || "").length ? "…" : ""))
       : h("p", { class: "notice" }, m.level === "meta" || m.level === "subject"
         ? "The content is not sent to the collector at this annotation level (a setting of the sending computer)."
@@ -1540,6 +1563,94 @@ function showLate() {
 }
 $("#late").addEventListener("click", showLate);
 
+// ---------------------------------------------------------------- held messages: their recipients do not accept them yet
+// The loudest signal of the console after the questions: a red button, a red panel above the list, a red folder in the
+// explorer, one notification (shown again only for a new held message). Their senders retry them by themselves.
+const HKEY = "mmbox-console-held-hidden";
+let heldHidden = new Set();
+try { heldHidden = new Set(JSON.parse(localStorage.getItem(HKEY) || "[]")); } catch { /* a private window */ }
+const H = { notif: null, ids: "" };
+function heldGroups(list) {
+  const g = new Map();
+  for (const m of list) {
+    const k = m.to || "?";
+    if (!g.has(k)) g.set(k, { to: k, msgs: [], from: new Set() });
+    const x = g.get(k);
+    x.msgs.push(m); x.from.add(m.from);
+  }
+  return [...g.values()].sort((a, b) => Math.min(...a.msgs.map((m) => m.held.since)) - Math.min(...b.msgs.map((m) => m.held.since)));
+}
+function recipientName(id) {
+  const b = boxOf(id), mk = machineKey(b);
+  const mach = machineName(mk);
+  return b.role === "machine" ? `${mach} (machine box)` : `${boxName(id)} on ${mach}`;
+}
+function renderHeld() {
+  const list = S.msgs.filter(isHeld);
+  const btn = $("#held-btn"), ban = $("#held-banner");
+  btn.hidden = !list.length;
+  btn.replaceChildren(svg(ICON.warn, "ico tiny"), h("span", {}, list.length === 1 ? "1 message held" : `${list.length} messages held`));
+  const shown = list.some((m) => !heldHidden.has(m.id));
+  ban.hidden = !list.length || !shown;
+  if (ban.hidden) { ban.replaceChildren(); return; }
+  const work = list.filter((m) => m.tier <= 1).length, unknown = list.filter((m) => !m.kind).length;
+  const groups = heldGroups(list);
+  ban.replaceChildren(
+    h("div", { class: "held-head" }, svg(ICON.warn, "ico"),
+      h("h2", { id: "held-title" }, `${list.length} message${list.length > 1 ? "s" : ""} held: ${groups.length > 1 ? `${groups.length} recipients do` : "the recipient does"} not accept ${list.length > 1 ? "them" : "it"} yet`)),
+    h("p", { class: "held-help" }, [work && `${work} written by agents`, list.length - work - unknown && `${list.length - work - unknown} of the tool's own (introductions, links, services)`,
+      unknown && `${unknown} not annotated (their sender does not tell this console what they are)`].filter(Boolean).join(", ") + ". "
+      + "Their senders keep them and send them again by themselves as soon as a session of the recipient's computer runs (it has not accepted the sender's box yet). Nothing is lost; nothing needs to be sent again."),
+    h("ul", { class: "held-list" }, groups.map((g) => {
+      const oldest = g.msgs.reduce((a, m) => (m.held.since < a.held.since ? m : a));
+      const silent = g.msgs.every(heldSilent);
+      return h("li", {},
+        h("span", { class: "held-to" }, h("strong", {}, recipientName(g.to))),
+        h("span", { class: "dim" }, ` — ${g.msgs.length} message${g.msgs.length > 1 ? "s" : ""} for ${heldAge(oldest)}, from ${[...g.from].map(boxName).join(", ")}`
+          + (silent ? "; their sender has not retried for 30 min (its computer may be off too)" : "")),
+        h("button", { class: "btn small text ripple", type: "button", onclick: () => showHeld(g.to) }, "Show"));
+    })),
+    h("div", { class: "held-actions" },
+      h("button", { class: "btn small ripple", type: "button", onclick: () => showHeld() }, "Show them all"),
+      h("button", { class: "btn small text ripple", type: "button", title: "The button above stays; the panel comes back with the next held message",
+        onclick: () => { for (const m of list) heldHidden.add(m.id); try { localStorage.setItem(HKEY, JSON.stringify([...heldHidden].slice(-3000))); } catch { /* */ } renderHeld(); } }, "Hide until a new one")));
+}
+function heldSignals() {
+  const list = S.msgs.filter(isHeld);
+  const ids = list.map((m) => m.id).sort().join(",");
+  if (list.length && canNotify()) {
+    const fresh = list.filter((m) => !notified.has("held:" + m.id));
+    if (ids !== H.ids && (fresh.length || !H.notif)) {
+      fresh.forEach((m) => remember("held:" + m.id));
+      if (fresh.length) {  // never again for the same ones, even after a reload
+        H.notif?.close();
+        const g = heldGroups(list);
+        const nt = new Notification(list.length === 1 ? "mmbox: 1 message held" : `mmbox: ${list.length} messages held`, {
+          body: g.slice(0, 4).map((x) => `${x.msgs.length} for ${recipientName(x.to)}`).join("; ") + ". The recipient's computer has not accepted them yet.",
+          tag: "mmbox-held", requireInteraction: true, renotify: fresh.length > 0 });
+        nt.onclick = () => { window.focus(); nt.close(); showHeld(); };
+        nt.onclose = () => { if (H.notif === nt) H.notif = null; };
+        H.notif = nt;
+      }
+    }
+    H.ids = ids;
+  } else if (H.notif && !list.length) { H.notif.close(); H.notif = null; H.ids = ""; }
+}
+// like the late button: every held message, whatever the filters; `to` narrows it to one recipient
+function showHeld(to) {
+  showTab("messages");
+  Object.assign(F, { view: "held", dir: to ? "in" : "both", source: "all", search: "", period: "0", tier: "3" });
+  for (const [sel, key] of [["#f-view", "view"], ["#f-dir", "dir"], ["#f-source", "source"], ["#f-search", "search"], ["#f-period", "period"], ["#f-tier", "tier"]]) $(sel).value = F[key];
+  saveF(); S.limit = 300; S.node = to ? { type: "box", key: to } : { type: "all", key: null }; closeReader(false); renderTree(); renderList();
+}
+$("#held-btn").addEventListener("click", () => showHeld());
+setInterval(() => {  // the ages, and what turns held with time
+  if (!S.msgs?.length || document.visibilityState !== "visible") return;
+  const n = S.msgs.filter(isHeld).length;
+  renderHeld();
+  if (n !== S.heldN) { S.heldN = n; renderTree(); renderList(); heldSignals(); }
+}, 30000);
+
 // ---------------------------------------------------------------- settings
 const TUNE_HELP = {
   relay_after_s: "a message nobody has taken in a session box goes to the machine box after this delay (120 s by default)",
@@ -1772,7 +1883,9 @@ async function pollPending() {
     const ids = r.ids || [];
     if (Q.known === null) Q.known = new Set(pendingQ().map((q) => q.id));
     const fresh = ids.filter((i) => !Q.known.has(i));
+    const held = S.msgs ? S.msgs.filter(isHeld).length : 0;  // a message turns held with time, without a new snapshot
     if (fresh.length || ids.length !== pendingQ().length || r.version !== S.version) await poll(false, true);  // it signals them
+    else if (S.msgs && held !== S.heldN) { S.heldN = held; renderHeld(); renderTree(); renderList(); heldSignals(); }
   } catch { /* the full poll reports it */ }
 }
 
@@ -1847,6 +1960,8 @@ async function poll(force = false, background = false) {
       S.servers = new Map(snap.servers.map((s) => [s.url, s]));
       S.msgs = snap.messages; S.byId = new Map(S.msgs.map((m) => [m.id, m]));
       watchAlerts(snap.version === S.firstVersion);
+      renderHeld(); heldSignals(); S.heldN = S.msgs.filter(isHeld).length;
+      if (S.wantHeld) { S.wantHeld = false; showHeld(); }
       renderSent(); renderTree(); renderList(); renderBoxes(); renderServers(); renderActivity(); renderSettings(); renderQuestionSettings();
       const first = Q.known === null;
       const ids = pendingQ().map((q) => q.id);
@@ -1973,6 +2088,7 @@ if (DEEP.get("box")) { const id = DEEP.get("box"); const t = setInterval(() => {
 if (!token) { $("#sync").textContent = "no token: open the URL the console printed"; $("#sync").classList.add("err"); }
 else {
   S.wantQuestion = DEEP.get("question") === "next";
+  S.wantHeld = DEEP.get("view") === "held";
   poll(); setInterval(() => document.visibilityState === "visible" && poll(), 5000);
   setInterval(pollPending, 4000);
   loadUsage(); setInterval(() => document.visibilityState === "visible" && loadUsage(), 60000);

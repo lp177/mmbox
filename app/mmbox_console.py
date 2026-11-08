@@ -40,6 +40,8 @@ def log(*a):
 
 
 WAITING = ("queued", "sent", "unread", "taken")  # a message's states while it is still in a box (or on its way)
+HELD_AFTER_S = 300  # a message its sender keeps queued (the service refuses it) for longer than this is "held": shown loud
+HELD_RETRY_S = 1800  # no refusal seen for this long: its sender stopped retrying (console.js: HELD_RETRY_S)
 # final states besides read: "delivered" (its service says it was consumed: what the logs of this computer and the
 # collectors could not tell, as for a message sent before a collector ran), "stranded" (it waits in a box that closed:
 # the relay forwards real messages, not the tool's own), "dropped" (its sender gave up: no service ever accepted it)
@@ -353,6 +355,7 @@ class AppWindow:
 
     # the questions: at once when the page has them, else at its next poll (what #question=next does at the opening)
     JS_QUESTION = "pendingQ().length ? openQuestions() : (S.wantQuestion = true, poll(true))"
+    JS_HELD = "showHeld()"
 
     def __init__(self, webview, url: str, shown: bool, home: Path):
         self.wv, self.home = webview, home
@@ -390,12 +393,14 @@ class AppWindow:
         self.hide()
         return False
 
-    def show(self, question: bool = False) -> None:
+    def show(self, question: bool = False, held: bool = False) -> None:
         def run():
             self.win.show()
             self.win.restore()  # out of the task bar, in front
             if question:
                 self.win.evaluate_js(self.JS_QUESTION)
+            elif held:
+                self.win.evaluate_js(self.JS_HELD)
         self.visible = True
         self._bg(run)
         self.on_change()
@@ -576,6 +581,7 @@ class Desktop:
     def __init__(self, home: Path, url_of, on_quit, app: AppWindow | None = None):
         self.ok, self.url_of, self.on_quit, self.app = False, url_of, on_quit, app
         self.note, self.dismissed, self.shown, self.tray, self.pending_n = None, set(), None, None, 0
+        self.held_note, self.held_dismissed, self.held_shown, self.held_n, self.badge = None, set(), None, 0, True
         if not desktop_session():
             return
         try:
@@ -640,6 +646,7 @@ class Desktop:
         return [("open", "Open the console", self.open),
                 ("browser", "Open the local site in the browser", self.open_browser),
                 ("questions", "No question waiting", lambda: self.open(question=True)),
+                ("held", "No message held", lambda: self.open(held=True)),
                 ("hide", "Hide in the notification area", self.hide),
                 ("sep", None, None),
                 ("quit", "Quit the console", self.on_quit)]
@@ -649,6 +656,7 @@ class Desktop:
         return {"open": ("Open the console" if app else "Open the console in the browser", True, True),
                 "browser": (None, True, bool(app)),
                 "questions": (f"Answer the questions ({n})" if n else "No question waiting", bool(n), True),
+                "held": (f"See the held messages ({self.held_n})", True, bool(self.held_n)),
                 "hide": (None, bool(app and app.visible), bool(app and app.can_hide))}
 
     def _refresh(self) -> bool:
@@ -663,11 +671,11 @@ class Desktop:
         else:
             self.open()
 
-    def open(self, question: bool = False) -> None:
+    def open(self, question: bool = False, held: bool = False) -> None:
         if self.app:
-            self.app.show(question=question)
+            self.app.show(question=question, held=held)
         else:
-            self._browser(self.url_of(question))
+            self._browser(self.url_of(question, held))
 
     def open_browser(self) -> None:
         self._browser(self.url_of(False))
@@ -685,12 +693,19 @@ class Desktop:
         if self.ok:
             self.GLib.idle_add(self._update, [dict(q) for q in pending], badge, popup)
 
+    def _icon(self) -> None:
+        """The red dot while questions wait or messages are held (the badge setting), and the tooltip says which."""
+        if not self.tray:
+            return
+        n, k = self.pending_n, self.held_n
+        tip = ", ".join(x for x in (f"{n} question(s) waiting" if n else "", f"{k} message(s) held" if k else "") if x)
+        self.tray.set_icon("mmbox-console-alert" if self.badge and (n or k) else "mmbox-console", tip or "mmbox console")
+        self.tray.refresh()
+
     def _update(self, pending, badge, popup):
         n = self.pending_n = len(pending)
-        if self.tray:
-            self.tray.set_icon("mmbox-console-alert" if badge and n else "mmbox-console",
-                               f"{n} question(s) waiting" if n else "mmbox console")
-            self.tray.refresh()
+        self.badge = badge
+        self._icon()
         ids = {q["id"] for q in pending}
         if not (popup and n) or ids <= self.dismissed:  # nothing waits, a tab shows its own, or the user closed it
             if self.note is not None and not (popup and n):
@@ -724,6 +739,59 @@ class Desktop:
         except Exception as e:
             log(f"notification: {e}")
         return False
+
+    def update_held(self, held: list[dict], badge: bool, popup: bool) -> None:
+        if self.ok:
+            self.GLib.idle_add(self._update_held, held, badge, popup)
+
+    def _update_held(self, held, badge, popup):
+        """Messages their senders keep queued because the recipient does not accept them yet (its computer has not
+        run since): the tray's dot, and one resident notification, shown again only when another message is held."""
+        self.held_n, self.badge = len(held), badge
+        self._icon()
+        ids = {m["id"] for m in held}
+        if not (popup and held) or ids <= self.held_dismissed:
+            if self.held_note is not None and not (popup and held):
+                try:
+                    self.held_note.close()
+                except Exception:
+                    pass
+                self.held_note, self.held_shown = None, None
+            return False
+        to = {}
+        for m in held:
+            to.setdefault(m.get("to_name") or m.get("to") or "?", []).append(m)
+        oldest = max(m["held"].get("age_s") or 0 for m in held)
+        title = f"mmbox: {len(held)} message(s) held"
+        body = "; ".join(f"{len(ms)} for {who}" for who, ms in sorted(to.items(), key=lambda x: -len(x[1]))[:4]) \
+            + f". The oldest for {fmt_age(oldest)}: the recipient's computer has not accepted them yet; they leave by themselves when it runs."
+        if self.held_shown == ids:  # the same messages: never popped up again because they got older
+            return False
+        icon = str(self.icons / "mmbox-console-alert.svg")
+        if self.held_note is None:
+            note = self.Notify.Notification.new(title, body, icon)
+            note.set_timeout(0)
+            note.set_urgency(self.Notify.Urgency.CRITICAL)
+            note.set_hint("resident", self.GLib.Variant.new_boolean(True))
+            note.set_hint("desktop-entry", self.GLib.Variant.new_string("mmbox-console"))
+            note.add_action("default", "Show", lambda *_: self.open(held=True))
+            note.add_action("held", "Show them", lambda *_: self.open(held=True))
+            note.connect("closed", lambda nn, ids=ids: self._held_closed(nn, ids))
+            self.held_note = note
+        else:
+            self.held_note.update(title, body, icon)
+        self.held_note.ids = ids
+        try:
+            self.held_note.show()
+            self.held_shown = ids
+        except Exception as e:
+            log(f"notification: {e}")
+        return False
+
+    def _held_closed(self, note, ids):
+        if note is self.held_note:
+            self.held_dismissed |= getattr(note, "ids", ids)
+            self.held_note, self.held_shown = None, None
 
     def _closed(self, note, ids):
         if note is self.note:
@@ -1021,8 +1089,20 @@ class State:
         tab_audio = now - self.clients.get("audio", 0) < 15
         if self.desktop:
             self.desktop.update(pend, badge=st["badge"], popup=st["popup"] and not tab_notify)
+            self.desktop.update_held(self.held(), badge=st["badge"], popup=st["popup"] and not tab_notify)
         if new and st["audio"] and not tab_audio and (p := self.sound_path()):
             Desktop.play(p)
+
+    def held(self) -> list[dict]:
+        """The messages held long enough to be shown loud: their senders keep them queued, the service refuses them."""
+        now_ms = int(time.time() * 1000)
+        with self.lock:
+            boxes = {b["id"]: b for b in self.snapshot.get("boxes") or []}
+            name = lambda i: (lambda b: " on ".join(x for x in (b.get("title") or b.get("label") or i, b.get("hostname")) if x))(boxes.get(i) or {})  # noqa: E731
+            out = [{**{k: m.get(k) for k in ("id", "from", "to", "kind", "subject", "tier")}, "to_name": name(m.get("to")),
+                    "held": {**m["held"], "age_s": (now_ms - m["held"]["since"]) / 1000}}
+                   for m in self.messages.values() if m.get("held") and now_ms - m["held"]["since"] >= HELD_AFTER_S * 1000]
+        return sorted(out, key=lambda m: m["held"]["since"])
 
     def waiting_ids(self) -> set:
         """The messages still in a box: sent and not consumed yet, unread, taken, or queued by their sender."""
@@ -1699,6 +1779,11 @@ class State:
                     if st == "queued" and m.get("state") not in ("read", "taken", "unread", "sent"):
                         m["state"] = "queued"
                         m["queued_by"] = n
+                        at = _ms(e.get("at") or p.get("ts"))
+                        if at:
+                            hd = m.setdefault("held", {"since": at, "local": n})
+                            hd["since"] = min(hd["since"], at)
+                            hd["local"] = n
                     elif st == "sent" and m.get("state") in (None, "queued", "dropped"):
                         m["state"] = "sent"
                     elif st == "dropped" and m.get("state") in (None, "queued"):
@@ -1797,6 +1882,31 @@ class State:
                                 box(note["to"], label=note["to_label"])
                     elif m.get("level") is None:
                         m["level"] = "none"
+                elif kind == "refused":  # a send the service refused while its client keeps it queued
+                    mid = ev.get("msg") or f"{u}#{ev['entry']}"
+                    m = msg(mid, ts=ev.get("ts") or M.iso(_dt(t)), frm=ev.get("from"))
+                    m["to"] = m.get("to") or ev.get("to")
+                    if m.get("state") in (None, "queued"):
+                        m["state"] = "queued"
+                    hd = m.setdefault("held", {"since": t})
+                    hd["since"], hd["last"] = min(hd["since"], t), max(hd.get("last") or 0, t)
+                    hd["why"], hd["server"] = ev.get("why") or hd.get("why"), u
+                    if u not in m["servers"]:
+                        m["servers"].append(u)
+                    if f"collector:{u}" not in m["sources"]:
+                        m["sources"].append(f"collector:{u}")
+                    if ev.get("note") and m.get("level") != "full":
+                        note, why = self.open_note(u, ev["note"], peers)
+                        m["note_status"] = why
+                        if note:
+                            from_payload(m, note, note.get("level") or "meta")
+                            m["level"] = note.get("level")
+                            box(note.get("from"), label=note.get("label"), work=note.get("work"), role=note.get("role"),
+                                hostname=(note.get("host") or {}).get("hostname"))
+                            if note.get("to") and note.get("to_label"):
+                                box(note["to"], label=note["to_label"])
+                    elif m.get("level") is None:
+                        m["level"] = "none"
                 elif kind in ("take", "done", "recover"):
                     ents = ev.get("entries") if kind == "done" else [ev.get("entry")]
                     for en in ents or []:
@@ -1839,6 +1949,15 @@ class State:
             if m.get("state") in ("unread", "taken") and not m.get("broadcast") and to and to not in active_now \
                     and (to in closed_here or box_open.get(to, (0, True))[1] is False):
                 m["state"] = "stranded"
+
+        # held: its sender keeps it queued (the service refuses it: the recipient does not list it yet, or is full).
+        # Times only (since, last refusal): the ages are computed where they are shown, or the snapshot would change
+        # at every refresh
+        for m in msgs.values():
+            if m.get("state") != "queued" or m.get("broadcast"):
+                m.pop("held", None)
+                continue
+            m["held"] = m.get("held") or {"since": _ms(m.get("ts")) or int(time.time() * 1000)}
 
         # labels and the relations of each message to the boxes
         for m in msgs.values():
@@ -1896,6 +2015,11 @@ class State:
                 self.archive.ingest(full.values(), self.conv_default_ttl())
             except Exception as e:
                 log(f"archive: {type(e).__name__}: {e}")
+
+
+def fmt_age(sec: float) -> str:
+    sec = max(0, int(sec))
+    return f"{sec // 60} min" if sec < 3600 else f"{sec / 3600:.1f} h" if sec < 86400 else f"{sec / 86400:.1f} d"
 
 
 def _ms(ts) -> int | None:
@@ -2263,7 +2387,7 @@ class Handler(BaseHTTPRequestHandler):
                 pend = st.questions.pending()
                 return self._json({"count": len(pend), "ids": [x["id"] for x in pend], "version": st.snapshot.get("version", 0),
                                    "latest": ({k: pend[-1].get(k) for k in ("id", "from", "label", "title", "subject")} if pend else None),
-                                   "desktop": bool(st.desktop and st.desktop.ok)})
+                                   "desktop": bool(st.desktop and st.desktop.ok), "held": len(st.held())})
             if u.path == "/api/usage":  # the explorer's memory frame and the memory view
                 return self._json(st.usage(fresh=(q.get("fresh") or ["0"])[0] == "1"))
             if u.path == "/api/sound":  # the operator's own sound (the presets are static files)
@@ -2392,7 +2516,7 @@ def main():
     Handler.state, Handler.token, Handler.port = state, secrets.token_urlsafe(24), a.port
     httpd = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     url = f"http://127.0.0.1:{a.port}/#token={Handler.token}"
-    url_of = lambda question=False: url + ("&question=next" if question else "")  # noqa: E731
+    url_of = lambda question=False, held=False: url + ("&question=next" if question else "&view=held" if held else "")  # noqa: E731
     app = None if a.browser else app_window(url, a.open or a.no_tray, op.home)
     if not a.no_tray:
         def quit_console():

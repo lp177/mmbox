@@ -22,6 +22,7 @@
     </nav>
     <div class="appbar-end">
       <button id="questions-btn" class="btn small question-btn ripple" type="button" hidden aria-haspopup="dialog"></button>
+      <button id="held-btn" class="btn small held-btn ripple" type="button" hidden title="Messages their senders keep: the recipient's computer does not accept them yet"></button>
       <button id="late" class="btn small late-btn ripple" type="button" hidden title="Messages unread for longer than the threshold (Settings)"></button>
       <span id="sync" class="sync" role="status" aria-live="polite">connecting…</span>
       <button id="refresh" class="btn icon ripple" type="button" aria-label="Refresh now" title="Refresh now">
@@ -68,6 +69,7 @@
               <option value="all">All</option>
               <option value="unread">Unread</option>
               <option value="late">Unread for too long</option>
+              <option value="held">Held (not accepted by the recipient yet)</option>
               <option value="read">Taken</option>
               <option value="pending">Queued / sent</option>
               <option value="undelivered">Never read (closed box, dropped)</option>
@@ -130,6 +132,7 @@
             <label for="f-source">Source</label>
           </div>
         </div>
+        <section id="held-banner" class="held-banner" aria-labelledby="held-title" hidden></section>
         <div class="list-head">
           <p id="list-count" class="dim" role="status" aria-live="polite"></p>
           <p id="scope" class="scope"></p>

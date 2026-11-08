@@ -36,8 +36,8 @@ Keys (all under mmbox:, the only prefix the gateway's Redis user may touch):
   colconf               hash: the collector's settings, changed by an operator (/v1/col/config): keep_ms, and a hold
                         (hold_until_ms, hold_minid) under which nothing is trimmed (``reset the TTLs to 48 h'')
   stats                 stream: one entry per message or post (its size only), 7 days: the network's traffic (/v1/stats)
-  col                   stream: the collector's journal (MMBOX_COLLECTOR on): metadata of each send, take, done,
-                        post, box opened / closed / expired, plus the client's annotation sealed for the operator's
+  col                   stream: the collector's journal (MMBOX_COLLECTOR on): metadata of each send, refused send (once per
+                        message every 10 min), take, done, post, box opened / closed / expired, plus the client's annotation sealed for the operator's
                         key (never readable by the service). Read by the operators only (MMBOX_OPERATORS)
 
 Nothing grows without end: card, links and box of an identity expire after IDLE_TTL without any request from it (it
@@ -537,6 +537,25 @@ async def links_put(request: web.Request) -> web.Response:
     return ok({"links": len(set(peers))})
 
 
+REFUSED_EVERY_S = 600  # a send its client retries at each pass is journaled once per message in this time
+
+
+async def refused(r: aioredis.Redis, me: str, to: str, env: dict, data: dict, why: str) -> None:
+    """A send refused while its client keeps it queued (the recipient does not list the sender yet, or its box is
+    full): one `refused` event in the collector's journal, so that the operator's console shows the message held, from
+    whichever computer it comes. At most once per message every REFUSED_EVERY_S, whatever the retries."""
+    if not COLLECTOR:
+        return
+    mid = str(env.get("id") or "")
+    try:
+        if not await r.set(f"mmbox:refused:{me}:{to}:{mid}", "1", nx=True, ex=REFUSED_EVERY_S):
+            return
+    except Exception:
+        return
+    await col(r, {"ev": "refused", "from": me, "to": to, "msg": mid, "ts": str(env.get("ts") or ""), "why": why,
+                  "note": note_of(data, me)})
+
+
 async def send(request: web.Request) -> web.Response:
     me, data = await signed_json(request)
     to = need(data, "to", ID_RE)
@@ -555,9 +574,11 @@ async def send(request: web.Request) -> web.Response:
         if (_loads(await r.get(f"mmbox:box:{to}")) or {}).get("closed_ms"):
             raise _http(410, "this box closed: write to its machine box")
     elif to not in OPERATORS and not await r.hexists(f"mmbox:links:{to}", me):
+        await refused(r, me, to, env, data, "not_listed")
         raise _http(403, "the recipient does not list the sender among its peers (not paired, or its links are not synced)")
     box = f"mmbox:in:{to}"
     if await r.xlen(box) >= MAX_ENTRIES:
+        await refused(r, me, to, env, data, "full")
         raise _http(429, f"the recipient's box is full ({MAX_ENTRIES} entries waiting): the sender keeps it queued")
     minid = f"{int(time.time() * 1000) - KEEP_MS}-0"  # what nobody took within the clients' keep time goes
     entry = await r.xadd(box, {"from": me, "env": raw}, minid=minid, approximate=True)

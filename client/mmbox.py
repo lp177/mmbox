@@ -1468,44 +1468,74 @@ def sync_local_links(user: str | None = None) -> None:
             gw_sync(b)
 
 
+BOOKKEEPING_KINDS = ("transport", "link", "introduce", "retire", "ping", "pong")  # sent by the tool itself, redone when needed
+
+
 def flush_outbox(me: "Me") -> int:
-    """Messages the service refused (the peer had not listed us yet, or was not on it), sent again now; dropped with
-    an alert after RECEIPT_TTL_S. Returns how many went out."""
+    """Messages the service refused (the peer had not listed us yet, or was not on it), sent again now. Never an
+    agent's to resend: the client does it, at each pass, until RECEIPT_TTL_S.
+
+    - the tool's own bookkeeping (BOOKKEEPING_KINDS): retried and dropped without a word (it is redone when needed);
+    - a message for a session box that closed meanwhile: written again to the machine box it named, nothing lost;
+    - any other: one alert after 15 min (the peer has not accepted this box yet: nothing to resend), dropped with an
+      alert after RECEIPT_TTL_S.
+    Returns how many went out."""
     q = (me.local.load("state.json", {}) or {}).get("outbox") or []
     if not q:
         return 0
-    peers, keep, sent, alerts = peers_load(me.local), [], 0, []
+    peers, keep, sent, alerts, added = peers_load(me.local), [], 0, [], set()
+
+    def drop(item, peer, reason):
+        p = item.get("payload") or {}  # the log says it too, or the message stays "queued" there for ever
+        me.local.append_log({"dir": "out", "id": item["msg_id"], "peer": item["peer_id"], "status": "dropped", "at": iso(),
+                             "payload": {k: p[k] for k in ("v", "id", "ts", "from", "to", "kind", "subject", "project", "re")
+                                         if k in p}, "reason": reason})
+
     for item in q:
         peer = peers.get(item["peer_id"])
-        gw, r, _failed = send_env(me, peer, item["env"], item.get("payload")) if peer else (None, {}, [])
+        p = item.get("payload") or {}
+        own = p.get("kind") in BOOKKEEPING_KINDS
+        gw, r, _failed = send_env(me, peer, item["env"], p) if peer else (None, {}, [])
+        age = time.time() - item["at"]
         if r.get("ok"):
             me.local.append_log({"dir": "out", "id": item["msg_id"], "peer": item["peer_id"], "status": "sent", "at": iso(),
-                                 "payload": item["payload"], "via": "gateway", "gateway": gw.url, "entry": r["entry"],
-                                 "to": peer["id"]})
+                                 "payload": p, "via": "gateway", "gateway": gw.url, "entry": r["entry"], "to": peer["id"]})
             sent += 1
-        elif not item.get("warned") and time.time() - item["at"] > 900 and peer:
-            alerts.append(("unsent", peer, item["msg_id"], time.time() - item["at"],
-                           "not accepted for 15 min on " + (", ".join(shared_urls(me, peer)) or "any shared service")
-                           + ": the peer does not list this box (its box closed, or it does not know this one yet). "
-                           "Kept and sent again by itself; ask it to introduce this box, or write to its machine box"))
-            item["warned"] = True
-            keep.append(item)
-        elif time.time() - item["at"] > RECEIPT_TTL_S or not peer:
-            alerts.append(("unsent", peer or {"alias": item["peer_id"], "user": "?", "label": "?"}, item["msg_id"],
-                           time.time() - item["at"], "the service never accepted it (the peer is not on it, or never "
-                           "listed this box); dropped"))
-            p = item.get("payload") or {}  # the log says it too, or the message stays "queued" there for ever
-            me.local.append_log({"dir": "out", "id": item["msg_id"], "peer": item["peer_id"], "status": "dropped", "at": iso(),
+        elif peer and peer.get("retired_at") and own:
+            drop(item, peer, f"{peer['alias']} closed its box on {peer['retired_at']}")
+        elif peer and peer.get("retired_at") and (mid := peer.get("retired_machine")) and (mach := peers.get(mid)) \
+                and rights_of(peers, mach) is not None and not mach.get("revoked_at"):
+            new = send_payload(me, mid, mach, p.get("project") or me.project(None), p.get("subject", ""),
+                               f"(written to {peer['alias']}, whose box closed on {peer['retired_at']} before it accepted "
+                               f"this one: sent to its machine box instead)\n\n{p.get('body', '')}", p.get("kind") or "info",
+                               p.get("re"), bool(p.get("reply_expected")),
+                               extra={**{k: p[k] for k in ("attachments", "via_session") if k in p},
+                                      "rerouted_from": {"id": peer["id"], "label": peer.get("label"), "msg_id": item["msg_id"]}})
+            added.add(new)
+            me.local.append_log({"dir": "out", "id": item["msg_id"], "peer": item["peer_id"], "status": "rerouted", "at": iso(),
                                  "payload": {k: p[k] for k in ("v", "id", "ts", "from", "to", "kind", "subject", "project", "re")
-                                             if k in p},
-                                 "reason": "the peer is no longer known" if not peer else
-                                           f"not accepted by any shared service for {RECEIPT_TTL_S / 86400:g} days"})
+                                             if k in p}, "reason": f"its box closed: sent to {mach['alias']} as {new}"})
+        elif age > RECEIPT_TTL_S or not peer:
+            reason = "the peer is no longer known" if not peer else \
+                f"not accepted by any shared service for {RECEIPT_TTL_S / 86400:g} days"
+            if not own:
+                alerts.append(("unsent", peer or {"alias": item["peer_id"], "user": "?", "label": "?"}, item["msg_id"], age,
+                               "the service never accepted it (the peer is not on it, or never listed this box); dropped"))
+            drop(item, peer, reason)
         else:
+            if not own and not item.get("warned") and age > 900:
+                alerts.append(("unsent", peer, item["msg_id"], age,
+                               "not accepted for 15 min on " + (", ".join(shared_urls(me, peer)) or "any shared service")
+                               + ": the peer does not list this box yet (no client of its computer has run since this box "
+                               "was introduced to it). Kept and sent again by itself as soon as it does, or to its machine "
+                               "box if its box closed: do not send it again"))
+                item["warned"] = True
             keep.append(item)
     warned = {k["msg_id"] for k in keep if k.get("warned")}
+    kept = {k["msg_id"] for k in keep} | added
     me.local.update("state.json", lambda st: st.__setitem__("outbox", [{**i, **({"warned": True} if i["msg_id"] in warned else {})}
                                                                       for i in (st.get("outbox") or [])
-                                                                      if i["msg_id"] in {k["msg_id"] for k in keep}]))
+                                                                      if i["msg_id"] in kept]))
     if alerts:
         notify(me, Store(me.local), me.conf.get("project") or "", alerts)
     return sent
@@ -3427,12 +3457,12 @@ def close_session(y: Me, project: str, why: str, say) -> Me:
     ypeers, told, skipped = peers_load(y.local), [], 0
     for pid, peer in ypeers.items():
         if peer.get("local_profile") or peer.get("revoked_at") or peer.get("revoked_by_peer") or peer.get("retired_at") \
-                or rights_of(ypeers, peer) is None or peer.get("project", project) != project:
+                or rights_of(ypeers, peer) is None:
             continue
         if "retire" not in (peer.get("caps") or []):
             skipped += 1  # an older client would take it for an ordinary message
             continue
-        send_payload(y, pid, peer, project, "session closed",
+        send_payload(y, pid, peer, peer.get("project") or project, "session closed",
                      f"{y.label} closed its box ({why}). Write to its machine box" + (f" {m.label}" if m else "")
                      + " instead; if the session comes back, it introduces itself again.", "retire", None, False,
                      extra={"machine": {"id": m.id, "label": m.label} if m else None})
@@ -4034,12 +4064,12 @@ def enable_gateway(me: Me, url: str, project: str, announce: bool = True) -> Non
     peers = peers_load(me.local)
     for pid, peer in peers.items():
         if peer.get("local_profile") or peer.get("revoked_at") or peer.get("revoked_by_peer") or peer.get("retired_at") \
-                or rights_of(peers, peer) is None or peer.get("project", project) != project:
+                or rights_of(peers, peer) is None:
             continue
         if "transport" not in (peer.get("caps") or []):
             print(f"GATEWAY: {peer['alias']} not told (its client predates the gateway); it learns it when it announces its own")
             continue
-        tell_gateway(me, pid, peer, project, gw.url)
+        tell_gateway(me, pid, peer, peer.get("project") or project, gw.url)
         print(f"GATEWAY: told {peer['alias']} ({peer['user']}, {peer['label']})")
 
 
@@ -5086,11 +5116,12 @@ def introduce(me: Me, parent: str, project: str) -> int:
     card = me.signed({**me.card(), "host": host_facts(me.local), **({"gateway": me.conf["gateway"]} if me.conf.get("gateway") else {}),
                       **({"gateways": gw_urls(me)} if len(gw_urls(me)) > 1 else {})})
     ppeers, n = peers_load(pme.local), 0
-    for pid, peer in ppeers.items():
+    for pid, peer in ppeers.items():  # every peer the box inherits, whatever its project (peers_load ignores it too):
+        # one left out never lists the box, and refuses all it sends; a closed session box would never read it
         if rights_of(ppeers, peer) is None or peer.get("revoked_at") or peer.get("revoked_by_peer") \
-                or peer.get("project", project) != project or peer.get("local_profile"):
+                or peer.get("retired_at") or peer.get("local_profile"):
             continue  # the sessions of this computer know each other already
-        send_payload(pme, pid, peer, project, f"introduces {me.label}",
+        send_payload(pme, pid, peer, peer.get("project") or project, f"introduces {me.label}",
                      f"{me.label} ({me.agent}) is another agent session of {pme.label} on the same computer. Trust it with the "
                      f"rights you gave {pme.label}; its fingerprint is {fingerprint(me.sign_pub, me.box_pub)}.", "introduce", None, False,
                      extra={"card": card})
@@ -5964,10 +5995,11 @@ def cmd_sent(a, local: Local):
             print(f"{p['ts']} -> {peers.get(e['peer'], {}).get('alias', e['peer'])} [{ {'consumed': 'consumed', 'taken': 'being read', 'waiting': 'waiting'}.get(st, st) } · gateway] "
                   f"{p.get('kind')}: {p.get('subject', '')} ({e['id']})")
             continue
-        if e.get("status") in ("queued", "not sent", "dropped"):
+        if e.get("status") in ("queued", "not sent", "dropped", "rerouted"):
             p = e["payload"]
             what = {"queued": "queued: not accepted by the service yet", "not sent": "not sent",
-                    "dropped": f"dropped, never accepted: {e.get('reason') or 'see the alert'}"}[e["status"]]
+                    "dropped": f"dropped, never accepted: {e.get('reason') or 'see the alert'}",
+                    "rerouted": f"rerouted: {e.get('reason') or 'sent to its machine box'}"}[e["status"]]
             print(f"{p.get('ts', e.get('at'))} -> {peers.get(e['peer'], {}).get('alias', e['peer'])} [{what}] "
                   f"{p.get('kind')}: {p.get('subject', '')} ({e['id']})")
             continue
