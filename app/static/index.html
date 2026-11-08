@@ -4,15 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>mmbox console</title>
+  <title>mmbox</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="console.css">
   <script src="console.js" defer></script>
 </head>
 <body>
+  <!-- the start screen: shown at once, until the first view of the boxes arrives (the first refresh reads every service) -->
+  <div id="splash" class="splash" role="status" aria-live="polite">
+    <div class="splash-in">
+      <img src="/icon.svg" alt="" class="splash-logo" width="112" height="112">
+      <div class="splash-name">mmbox</div>
+      <div class="splash-bar" aria-hidden="true"><span></span></div>
+      <div class="splash-text" id="splash-text">Starting: reading the services…</div>
+    </div>
+  </div>
   <a class="skip" href="#main">Skip to content</a>
   <header class="appbar">
-    <h1 class="brand"><img class="logo" src="/icon.svg" alt="" width="28" height="28">mmbox <span class="dim">console</span></h1>
+    <h1 class="brand"><img class="logo" src="/icon.svg" alt="" width="28" height="28">mmbox</h1>
     <nav class="tabs" role="tablist" aria-label="Views">
       <button class="tab ripple" role="tab" id="tab-messages" aria-controls="view-messages" aria-selected="true">Messages</button>
       <button class="tab ripple" role="tab" id="tab-boxes" aria-controls="view-boxes" aria-selected="false" tabindex="-1">Boxes</button>
@@ -593,7 +602,13 @@
       <form id="ob-create" hidden autocomplete="on">
         <p>The root key stays in this computer's keyring. A copy of it, sealed with the passphrase below, is written to a recovery file: with it, and only with it, the account comes back if every device is lost. Let your password manager make and keep the passphrase.</p>
         <input type="text" name="username" autocomplete="username" value="mmbox account recovery" hidden readonly>
-        <div class="field"><input id="ob-pw" name="password" type="password" autocomplete="new-password" minlength="16" required placeholder=" "><label for="ob-pw">Recovery passphrase (16 characters at least)</label></div>
+        <div class="field"><input id="ob-pw" name="password" type="password" autocomplete="new-password" minlength="16" required placeholder=" " spellcheck="false" autocapitalize="off"><label for="ob-pw">Recovery passphrase (16 characters at least)</label></div>
+        <div class="ob-pw-tools">
+          <button class="btn small ripple" type="button" id="ob-gen" title="12 words from the system's random generator (132 bits)">Generate</button>
+          <button class="btn small ripple" type="button" id="ob-copy">Copy</button>
+          <button class="btn small text ripple" type="button" id="ob-show" aria-pressed="false">Show</button>
+          <span class="dim" id="ob-pw-note" role="status"></span>
+        </div>
         <div class="field"><input id="ob-pw2" type="password" autocomplete="new-password" minlength="16" required placeholder=" "><label for="ob-pw2">The same passphrase again</label></div>
         <div class="field"><input id="ob-path" type="text" autocomplete="off" placeholder=" "><label for="ob-path">Recovery file</label></div>
         <p id="ob-create-err" class="error" role="alert"></p>

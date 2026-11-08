@@ -24,7 +24,8 @@ from pathlib import Path
 
 APP = Path(__file__).resolve().parent
 CONSOLE = APP / "mmbox_console.py"
-NAME = "mmbox console"
+NAME = "mmbox"
+OLD_NAMES = ("mmbox console",)  # entries of earlier versions, replaced
 ID = "mmbox-console"  # the window's class (GLib prgname) and the entry's file name
 
 
@@ -53,7 +54,7 @@ GenericName=Agents' mailbox console
 Comment=The operator's console of mmbox: messages, boxes, questions, the butler
 Exec="{python_gui()}" "{CONSOLE}" --open
 Path={APP}
-Icon={ID}
+Icon={linux_paths()["svg"]}
 Terminal=false
 Categories=Network;
 Keywords=mmbox;agents;mailbox;butler;
@@ -104,9 +105,9 @@ def refresh_linux_caches(p: dict) -> None:
 
 
 # ---------------------------------------------------------------- Windows (Start menu)
-def windows_link() -> Path:
+def windows_link(name: str = NAME) -> Path:
     return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Microsoft" / "Windows" / \
-        "Start Menu" / "Programs" / f"{NAME}.lnk"
+        "Start Menu" / "Programs" / f"{name}.lnk"
 
 
 def powershell(script: str) -> tuple[int, str]:
@@ -131,6 +132,8 @@ def windows_install(check: bool) -> int:
         print("not installed" if not link.is_file() else f"installed but out of date (the console or Python moved): {link}")
         return 1
     link.parent.mkdir(parents=True, exist_ok=True)
+    for old in OLD_NAMES:
+        windows_link(old).unlink(missing_ok=True)
     code, out = powershell(
         f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({ps_quote(link)});"
         f"$s.TargetPath={ps_quote(target)}; $s.Arguments={ps_quote(args)}; $s.WorkingDirectory={ps_quote(APP)};"
@@ -144,6 +147,8 @@ def windows_install(check: bool) -> int:
 
 
 def windows_uninstall(check: bool) -> int:
+    for old in OLD_NAMES:
+        windows_link(old).unlink(missing_ok=True)
     link = windows_link()
     if check:
         print("installed" if link.is_file() else "not installed")

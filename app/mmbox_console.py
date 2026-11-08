@@ -545,7 +545,7 @@ class AppWindow:
                 width, height = max(1100, int(geo.width * 0.7)), max(760, int(geo.height * 0.8))
             except Exception as e:
                 log(f"window: {type(e).__name__}: {e}")
-        self.win = webview.create_window("mmbox console", url, width=width, height=height, min_size=(760, 520),
+        self.win = webview.create_window("mmbox", url, width=width, height=height, min_size=(760, 520),
                                          hidden=not shown, background_color="#121212", text_select=True)
         self.win.events.closing += self._closing
 
@@ -629,7 +629,7 @@ class SniTray:
         from gi.repository import Dbusmenu
         Gio, GLib = d.Gio, d.GLib
         self.d, self.D, self.GLib, self.Gio = d, Dbusmenu, GLib, Gio
-        self.icon, self.tip = "mmbox-console", "mmbox console"
+        self.icon, self.tip = "mmbox-console", "mmbox"
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
         self.server = Dbusmenu.Server.new("/MenuBar")
@@ -674,10 +674,10 @@ class SniTray:
 
     def _get(self, bus, sender, path, iface, prop):
         V = self.GLib.Variant
-        return {"Category": V("s", "Communications"), "Id": V("s", "mmbox-console"), "Title": V("s", "mmbox console"),
+        return {"Category": V("s", "Communications"), "Id": V("s", "mmbox-console"), "Title": V("s", "mmbox"),
                 "Status": V("s", "Active"), "WindowId": V("i", 0), "IconThemePath": V("s", str(self.d.icons)),
                 "IconName": V("s", self.icon), "AttentionIconName": V("s", "mmbox-console-alert"),
-                "ToolTip": V("(sa(iiay)ss)", (self.icon, [], "mmbox console", self.tip)),
+                "ToolTip": V("(sa(iiay)ss)", (self.icon, [], "mmbox", self.tip)),
                 "ItemIsMenu": V("b", False), "Menu": V("o", "/MenuBar")}.get(prop)
 
     def _signal(self, name: str) -> None:
@@ -712,7 +712,7 @@ class AyatanaTray:
         self.d = d
         ind = AI.Indicator.new_with_path("mmbox-console", "mmbox-console", AI.IndicatorCategory.COMMUNICATIONS, str(d.icons))
         ind.set_status(AI.IndicatorStatus.ACTIVE)
-        ind.set_title("mmbox console")
+        ind.set_title("mmbox")
         menu, self.items = Gtk.Menu(), {}
         for key, label, act in d.menu():
             it = Gtk.SeparatorMenuItem() if key == "sep" else Gtk.MenuItem(label=label)
@@ -786,7 +786,7 @@ class Desktop:
 
     def _build(self) -> bool:
         try:
-            self.Notify.init("mmbox console")
+            self.Notify.init("mmbox")
         except Exception as e:
             log(f"notifications unavailable: {e}")
         watcher = self.Gio.bus_get_sync(self.Gio.BusType.SESSION, None).call_sync(
@@ -867,7 +867,7 @@ class Desktop:
             return
         n, k = self.pending_n, self.held_n
         tip = ", ".join(x for x in (f"{n} question(s) waiting" if n else "", f"{k} message(s) held" if k else "") if x)
-        self.tray.set_icon("mmbox-console-alert" if self.badge and (n or k) else "mmbox-console", tip or "mmbox console")
+        self.tray.set_icon("mmbox-console-alert" if self.badge and (n or k) else "mmbox-console", tip or "mmbox")
         self.tray.refresh()
 
     def _update(self, pending, badge, popup):
@@ -3167,6 +3167,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"count": len(pend), "ids": [x["id"] for x in pend], "version": st.snapshot.get("version", 0),
                                    "latest": ({k: pend[-1].get(k) for k in ("id", "from", "label", "title", "subject")} if pend else None),
                                    "desktop": bool(st.desktop and st.desktop.ok), "held": len(st.held())})
+            if u.path == "/api/passphrase":  # the onboarding's Generate: a recovery passphrase from the system's CSPRNG
+                try:
+                    return self._json({"ok": True, **recovery_passphrase()})
+                except (OSError, RuntimeError) as e:
+                    return self._json({"ok": False, "err": str(e)})
             if u.path == "/api/account":  # Settings: the account, its devices, the requests to approve
                 return self._json(st.account_state())
             if u.path == "/api/butler":  # the Butler tab: its state, inventory, started sessions, chat
@@ -3326,14 +3331,14 @@ def main():
         log("already running: its window is brought to the front")
         return
     state = State(op, a.days)
-    log(f"client {CLIENT}; operator {op.id} ({op.fingerprint}); first refresh…")
-    try:
-        state.refresh()
-    except Exception as e:
-        log(f"first refresh failed: {type(e).__name__}: {e}")
+    log(f"client {CLIENT}; operator {op.id} ({op.fingerprint}); first refresh in the background, the window opens now")
 
     def loop():
         n = 0
+        try:  # the first refresh, while the window shows its start screen (it reads every service: seconds)
+            state.refresh()
+        except Exception as e:
+            log(f"first refresh failed: {type(e).__name__}: {e}")
         while True:
             time.sleep(max(2.0, a.refresh))
             try:
@@ -3398,6 +3403,27 @@ def main():
 
 
 # ---------------------------------------------------------------- the account (client/ACCOUNTS.md): root key, device chain
+# The recovery passphrase the onboarding offers: 12 words drawn uniformly from the BIP39 English list (2048 words: 11
+# bits each, 132 bits, no modulo bias) with `secrets`, the system's CSPRNG (getrandom / os.urandom). Never Math.random,
+# a Mersenne Twister or a time seed: the wallet thefts of Randstorm (BitcoinJS falling back to Math.random), Milk Sad
+# (bx seed: mt19937 seeded with 32 bits of time), the Debian OpenSSL key space (PID-seeded) all came from that. The list
+# is checked against its published SHA-256 before use: a truncated or altered list is refused.
+BIP39_SHA256 = "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda"
+PASSPHRASE_WORDS = 12
+
+
+def recovery_passphrase() -> dict:
+    raw = (Path(__file__).resolve().parent / "bip39-english.txt").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BIP39_SHA256:
+        raise RuntimeError("bip39-english.txt does not match its published SHA-256: refused")
+    words = raw.decode("ascii").split()
+    if len(words) != 2048 or len(set(words)) != 2048:
+        raise RuntimeError("bip39-english.txt: not 2048 distinct words")
+    phrase = " ".join(secrets.choice(words) for _ in range(PASSPHRASE_WORDS))
+    return {"phrase": phrase, "words": PASSPHRASE_WORDS, "bits": PASSPHRASE_WORDS * 11,
+            "source": "the system's CSPRNG (Python secrets), BIP39 English list"}
+
+
 def default_recovery_path() -> Path:
     """Where the onboarding offers to write the recovery export: the user's Documents (Windows) or home folder."""
     docs = Path.home() / "Documents"
@@ -3638,7 +3664,7 @@ def app_window(url: str, shown: bool, home: Path) -> AppWindow | None:
             gi.require_version("GdkPixbuf", "2.0")
             from gi.repository import GLib
             GLib.set_prgname("mmbox-console")  # the window's class, and where WebKit keeps the page's storage
-            GLib.set_application_name("mmbox console")
+            GLib.set_application_name("mmbox")
         import webview
     except (ImportError, ValueError) as e:
         log(f"no window of its own ({e}): install pywebview (Debian: python3-webview); the browser opens the console")

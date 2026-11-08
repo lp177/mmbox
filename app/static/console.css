@@ -714,3 +714,16 @@ dialog.att-viewer { width: min(1100px, calc(100vw - 32px)); }
 .ob-card:focus-visible { box-shadow: 0 0 0 2px var(--focus); }
 .ob-card span { color: var(--text-2); font-size: 13px; }
 .ob-steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+/* the start screen (a placeholder animation, until the chosen one) */
+.splash { position: fixed; inset: 0; z-index: 9999; display: grid; place-items: center; background: var(--bg, #121212); transition: opacity .35s ease; }
+.splash.gone { opacity: 0; pointer-events: none; }
+.splash-in { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.splash-logo { width: 112px; height: 112px; border-radius: 24px; filter: drop-shadow(0 8px 24px rgb(0 0 0 / .5)); animation: splash-breathe 2.4s ease-in-out infinite; }
+.splash-name { font-size: 28px; font-weight: 600; letter-spacing: .08em; color: var(--text); }
+.splash-bar { width: 180px; height: 3px; border-radius: 3px; background: rgb(255 255 255 / .08); overflow: hidden; }
+.splash-bar span { display: block; width: 40%; height: 100%; border-radius: 3px; background: linear-gradient(90deg, transparent, #d8b56a, transparent); animation: splash-slide 1.4s ease-in-out infinite; }
+.splash-text { font-size: 13px; color: var(--text-3, #9aa0a6); }
+@keyframes splash-breathe { 0%, 100% { transform: scale(1); filter: drop-shadow(0 8px 24px rgb(0 0 0 / .5)); } 50% { transform: scale(1.04); filter: drop-shadow(0 10px 32px rgb(216 181 106 / .25)); } }
+@keyframes splash-slide { 0% { transform: translateX(-110%); } 100% { transform: translateX(260%); } }
+@media (prefers-reduced-motion: reduce) { .splash-logo, .splash-bar span { animation: none; } .splash-bar span { width: 100%; opacity: .5; } }
+.ob-pw-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
