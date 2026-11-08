@@ -256,3 +256,8 @@ box for a session the operator starts.
   output) is asked by an `op` message signed by the operator's console and sent to the butler's box. The client accepts
   an `op` only from the operator key it pinned (`collector enable … --fingerprint`), and only in the butler's box; the
   daemon answers with an `op_result` to the operator's box. Messages from peers are never ops, whatever their rights.
+  `mmbox.py daemon operator [--fingerprint FP]` shows the pins of this computer's services and pins FP where none is
+  (never replacing one); `daemon install` asks for it on a terminal when a service has none.
+- **Windows**: the service is a shortcut in the user's Startup folder running pythonw (a logon task needs an
+  administrator); hidden Claude Code sessions work there (tested on a Windows computer: no window, input and output, stop); the IDE
+  extensions' CLIs are taken for this system only (`codex.exe`, not the Linux build some ship).

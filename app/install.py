@@ -6,6 +6,14 @@
     python3 app/install.py --uninstall  the same, removed
     python3 app/install.py --check      says whether it is there, changes nothing
 
+It then makes sure this computer holds the operator key (the console's own key pair, the one your services name as
+their operator) and that this computer's daemon obeys it. When the key is missing, it asks: import an export of it
+(`mmbox_console.py --export-key FILE` on the computer that has it; its passphrase is asked), make a new one (your
+first computer), or skip. The key is kept in this system's keyring (Secret Service on Linux desktops) or with DPAPI
+(Windows), else in a file only this user reads. Its fingerprint is then pinned on each service of this computer
+(`mmbox.py daemon operator`), unless one is pinned there already. `--import-key FILE`, `--new-key`, `--skip-key`
+answer without asking.
+
 The entry runs the console with `--open`: its window comes to the front, and the computer's daemon (its butler)
 starts with it unless Settings say otherwise; a second launch only brings the running window to the front.
 Nothing is installed system-wide and no administrator right is needed. It is done again (updated) when the
@@ -154,20 +162,81 @@ def windows_uninstall(check: bool) -> int:
     return 0
 
 
+def window_note() -> str | None:
+    """The console opens its own window with pywebview; without it, in the default browser. Said, never installed."""
+    p = subprocess.run([sys.executable, "-c", "import webview"], capture_output=True, text=True,
+                       creationflags=0x08000000 if os.name == "nt" else 0)
+    if p.returncode == 0:
+        return None
+    how = "py -3 -m pip install --user pywebview" if os.name == "nt" else "sudo apt install python3-webview (Debian), or pip install --user pywebview"
+    return f"note: pywebview is not installed for {sys.executable}: the console opens in your browser instead of its own window ({how})"
+
+
+def console_cmd(*args, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(CONSOLE), *args], capture_output=capture, text=True,
+                          creationflags=0x08000000 if os.name == "nt" and capture else 0)
+
+
+def operator_step(a) -> int:
+    """The operator key on this computer (asked when missing), then pinned for this computer's daemon."""
+    if a.skip_key:
+        return 0
+    has = console_cmd("--has-key")
+    if has.returncode == 3:
+        print(f"the operator key cannot be read: {(has.stderr or has.stdout).strip()}", file=sys.stderr)
+        return 1
+    if has.returncode == 1:
+        choice = "import" if a.import_key else "new" if a.new_key else None
+        if choice is None and sys.stdin.isatty():
+            ans = input("This computer holds no operator key. [i] import an export of yours, [n] make a new one (your first "
+                        "computer), [s] skip: ").strip().lower()[:1]
+            choice = {"i": "import", "n": "new"}.get(ans)
+        if choice == "import":
+            path = a.import_key or input("The export file (made with `mmbox_console.py --export-key FILE`): ").strip()
+            if console_cmd("--import-key", path, capture=False).returncode != 0:
+                return 1
+        elif choice == "new":
+            r = console_cmd("--whoami")
+            print(r.stdout.strip())
+            print("Name this id in MMBOX_OPERATORS of your services (their operator), then run this script again on your "
+                  "other computers with an export of it.")
+        else:
+            print("no operator key: the console starts with a new one when it opens; skipped")
+            return 0
+        has = console_cmd("--has-key")
+    print(has.stdout.strip())
+    fp = next((w.rstrip(")") for w in has.stdout.split() if w.count("-") == 3 and len(w.rstrip(")")) == 19), None)
+    client = APP.parent / "client" / "mmbox.py"
+    if fp and client.is_file():
+        r = subprocess.run([sys.executable, str(client), "daemon", "operator", "--fingerprint", fp], capture_output=True, text=True,
+                           creationflags=0x08000000 if os.name == "nt" else 0)
+        print((r.stdout or r.stderr).strip())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--uninstall", action="store_true", help="take the entry out of the applications menu")
     ap.add_argument("--check", action="store_true", help="say whether it is there (exit 0) or not (exit 1); change nothing")
+    ap.add_argument("--import-key", metavar="FILE", help="the operator key from this export (its passphrase is asked)")
+    ap.add_argument("--new-key", action="store_true", help="make a new operator key when none is here (your first computer)")
+    ap.add_argument("--skip-key", action="store_true", help="leave the operator key as it is")
     a = ap.parse_args(argv)
     if not CONSOLE.is_file():
         print(f"{CONSOLE}: not found (run this script from the mmbox repository's app folder)", file=sys.stderr)
         return 2
+    if not a.uninstall and (note := window_note()):
+        print(note)
     if os.name == "nt":
-        return windows_uninstall(a.check) if a.uninstall else windows_install(a.check)
-    if sys.platform.startswith("linux") or "bsd" in sys.platform:
-        return linux_uninstall(a.check) if a.uninstall else linux_install(a.check)
-    print(f"{sys.platform}: not supported yet (Linux and Windows are); run `python3 {CONSOLE} --open`", file=sys.stderr)
-    return 2
+        code = windows_uninstall(a.check) if a.uninstall else windows_install(a.check)
+    elif sys.platform.startswith("linux") or "bsd" in sys.platform:
+        code = linux_uninstall(a.check) if a.uninstall else linux_install(a.check)
+    else:
+        print(f"{sys.platform}: not supported yet (Linux and Windows are); run `python3 {CONSOLE} --open`", file=sys.stderr)
+        return 2
+    if code == 0 and not a.uninstall and not a.check:
+        code = operator_step(a)
+    return code
 
 
 if __name__ == "__main__":

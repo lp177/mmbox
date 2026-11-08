@@ -151,30 +151,170 @@ def console_home() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mmbox-console"
 
 
+class KeyStore:
+    """Where the operator's private key lives, as safely as this system allows: the Secret Service (GNOME Keyring,
+    KWallet: Linux desktops), DPAPI (Windows: encrypted for this user, file identity.dpapi), else a file readable by
+    this user only (identity.json, 0600: a server without a keyring), said in the log. `identity.where` names the
+    store; when it names a store that does not answer (a locked keyring), the console stops: it never makes a new key
+    over the one that store holds (a new key is no longer the services' operator)."""
+
+    def __init__(self, home: Path):
+        self.home = home
+        self.where_file = home / "identity.where"
+
+    # -- the stores
+    def _secret(self):
+        if os.name == "nt" or sys.platform == "darwin" or not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+            return None
+        try:
+            import gi
+            gi.require_version("Secret", "1")
+            from gi.repository import Secret
+            schema = Secret.Schema.new("org.mmbox.console", Secret.SchemaFlags.NONE, {"home": Secret.SchemaAttributeType.STRING})
+            return Secret, schema
+        except (ImportError, ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def _dpapi(data: bytes, protect: bool) -> bytes:
+        import ctypes
+        from ctypes import wintypes
+
+        class Blob(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+        buf = ctypes.create_string_buffer(data, len(data))
+        inp, out = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), Blob()
+        c32 = ctypes.windll.crypt32
+        ok = (c32.CryptProtectData(ctypes.byref(inp), "mmbox console operator key", None, None, None, 0x1, ctypes.byref(out))
+              if protect else c32.CryptUnprotectData(ctypes.byref(inp), None, None, None, None, 0x1, ctypes.byref(out)))
+        if not ok:
+            raise OSError(f"DPAPI {'protect' if protect else 'unprotect'} failed ({ctypes.GetLastError()})")
+        try:
+            return ctypes.string_at(out.pbData, out.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(out.pbData)
+
+    def where(self) -> str | None:
+        try:
+            return self.where_file.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return "file" if (self.home / "identity.json").is_file() else None
+
+    def load(self) -> dict | None:
+        """The operator identity, or None when this console has none yet; raises when its store does not answer."""
+        w = self.where()
+        if w is None:
+            return None
+        if w == "dpapi":
+            return json.loads(self._dpapi((self.home / "identity.dpapi").read_bytes(), False).decode("utf-8"))
+        if w == "secret-service":
+            sec = self._secret()
+            v = sec[0].password_lookup_sync(sec[1], {"home": str(self.home)}, None) if sec else None
+            if not v:
+                raise RuntimeError("the operator key is kept in this session's keyring (Secret Service), which does not "
+                                   "answer or is locked: unlock it (log in to the desktop), then start the console again")
+            return json.loads(v)
+        return json.loads((self.home / "identity.json").read_text(encoding="utf-8"))
+
+    def save(self, ident: dict) -> str:
+        """Kept in the safest store this system has; the plain file goes once the key is safely elsewhere."""
+        data = json.dumps(ident, indent=1)
+        where = "file"
+        if os.name == "nt":
+            try:
+                blob = self._dpapi(data.encode("utf-8"), True)
+                self._write(self.home / "identity.dpapi", blob)
+                if self._dpapi(blob, False).decode("utf-8") == data:
+                    where = "dpapi"
+            except OSError as e:
+                log(f"DPAPI unavailable ({e}): the operator key stays in a file of this user")
+        elif (sec := self._secret()) is not None:
+            try:
+                ok = sec[0].password_store_sync(sec[1], {"home": str(self.home)}, sec[0].COLLECTION_DEFAULT,
+                                                "mmbox console operator key", data, None)
+                if ok and sec[0].password_lookup_sync(sec[1], {"home": str(self.home)}, None) == data:
+                    where = "secret-service"
+            except Exception as e:  # noqa: BLE001 - no Secret Service on this session: a file of this user then
+                log(f"no keyring answers ({type(e).__name__}: {e}): the operator key stays in a file of this user (0600)")
+        if where == "file":
+            self._write(self.home / "identity.json", data.encode("utf-8"))
+        else:
+            self._shred(self.home / "identity.json")
+        self._write(self.where_file, where.encode("utf-8"))
+        return where
+
+    @staticmethod
+    def _write(p: Path, data: bytes) -> None:
+        tmp = p.with_name(p.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, p)
+
+    @staticmethod
+    def _shred(p: Path) -> None:
+        if p.is_file():
+            try:
+                p.write_bytes(os.urandom(max(64, p.stat().st_size)))
+            except OSError:
+                pass
+            p.unlink(missing_ok=True)
+
+
+def new_identity() -> dict:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    raw = dict(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw,
+               encryption_algorithm=serialization.NoEncryption())
+    return {"id": "m" + M.rand_b32(12), "sign_key": M.b64e(Ed25519PrivateKey.generate().private_bytes(**raw)),
+            "box_key": M.b64e(X25519PrivateKey.generate().private_bytes(**raw)), "created": M.iso()}
+
+
+def seal_identity(ident: dict, passphrase: str) -> dict:
+    """An export of the operator key for another computer of the same operator: scrypt and ChaCha20-Poly1305."""
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    salt, nonce = os.urandom(16), os.urandom(12)
+    key = Scrypt(salt=salt, length=32, n=2 ** 17, r=8, p=1).derive(passphrase.encode("utf-8"))
+    ct = ChaCha20Poly1305(key).encrypt(nonce, json.dumps(ident).encode("utf-8"), b"mmbox-operator-key")
+    return {"mmbox_operator_key": 1, "id": ident["id"], "kdf": {"name": "scrypt", "n": 2 ** 17, "r": 8, "p": 1},
+            "salt": M.b64e(salt), "nonce": M.b64e(nonce), "ct": M.b64e(ct)}
+
+
+def open_identity(blob: dict, passphrase: str) -> dict:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    k = blob.get("kdf") or {}
+    key = Scrypt(salt=M.b64d(blob["salt"]), length=32, n=int(k.get("n", 2 ** 17)), r=int(k.get("r", 8)),
+                 p=int(k.get("p", 1))).derive(passphrase.encode("utf-8"))
+    try:
+        return json.loads(ChaCha20Poly1305(key).decrypt(M.b64d(blob["nonce"]), M.b64d(blob["ct"]), b"mmbox-operator-key"))
+    except InvalidTag:
+        raise ValueError("wrong passphrase, or a damaged export") from None
+
+
 class Operator:
     """This console's key pair: it signs the operator's requests and opens the annotations sealed for it."""
 
-    def __init__(self):
-        from cryptography.hazmat.primitives import serialization
+    def __init__(self, create: bool = True):
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
         home = console_home()
         home.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
             os.chmod(home, 0o700)
-        p = home / "identity.json"
-        if not p.exists():
-            raw = dict(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw,
-                       encryption_algorithm=serialization.NoEncryption())
-            ident = {"id": "m" + M.rand_b32(12), "sign_key": M.b64e(Ed25519PrivateKey.generate().private_bytes(**raw)),
-                     "box_key": M.b64e(X25519PrivateKey.generate().private_bytes(**raw)), "created": M.iso()}
-            tmp = p.with_suffix(".tmp")
-            tmp.write_text(json.dumps(ident, indent=1), encoding="utf-8")
-            if os.name != "nt":
-                os.chmod(tmp, 0o600)
-            os.replace(tmp, p)
-            log(f"operator identity created: {ident['id']} in {home}")
-        ident = json.loads(p.read_text(encoding="utf-8"))
+        self.store = KeyStore(home)
+        ident = self.store.load()
+        if ident is None:
+            if not create:
+                raise LookupError("no operator key on this computer yet")
+            ident = new_identity()
+            log(f"operator identity created: {ident['id']} ({self.store.save(ident)})")
+        elif self.store.where() == "file" and (os.name == "nt" or self.store._secret()):
+            log(f"operator key moved to {self.store.save(ident)} (it was a plain file)")
         self.id = ident["id"]
         self.sign = Ed25519PrivateKey.from_private_bytes(M.b64d(ident["sign_key"]))
         self.box = X25519PrivateKey.from_private_bytes(M.b64d(ident["box_key"]))
@@ -2987,12 +3127,21 @@ def main():
     ap.add_argument("--browser", action="store_true",
                     help="no window of its own: the icon and --open open the console in the default browser")
     ap.add_argument("--whoami", action="store_true", help="print the operator id and fingerprint, then exit")
+    ap.add_argument("--has-key", action="store_true", help="exit 0 when this computer holds the operator key, 1 when not "
+                                                          "(nothing made); prints where it is kept")
+    ap.add_argument("--export-key", metavar="FILE", help="write the operator key to FILE, sealed with a passphrase asked "
+                                                        "twice, for another computer of the same operator; then exit")
+    ap.add_argument("--import-key", metavar="FILE", help="take the operator key from such a FILE (its passphrase asked), kept "
+                                                        "in this system's keyring or DPAPI; then exit")
+    ap.add_argument("--force", action="store_true", help="with --import-key: replace another operator key held here")
     ap.add_argument("--no-tray", action="store_true", help="no icon in the notification area, no system notification")
     a = ap.parse_args()
     CLIENT = find_client(a.client)
     M = load_client(CLIENT)
     M.pin_hosts()
     B = load_butler()
+    if a.has_key or a.export_key or a.import_key:
+        sys.exit(key_command(a))
     op = Operator()
     if a.whoami:
         print(f"operator id {op.id}\nfingerprint {op.fingerprint}\nkeys in {op.home}")
@@ -3062,6 +3211,55 @@ def main():
     except KeyboardInterrupt:
         pass
     httpd.shutdown()
+
+
+def key_command(a) -> int:
+    """--has-key, --export-key, --import-key: the operator key between the computers of one operator."""
+    import getpass
+    store = KeyStore(console_home())
+    console_home().mkdir(parents=True, exist_ok=True)
+    try:
+        ident = store.load()
+    except (RuntimeError, OSError, ValueError) as e:
+        print(f"the operator key cannot be read: {e}", file=sys.stderr)
+        return 3
+    if a.has_key:
+        if not ident:
+            print("no operator key on this computer")
+            return 1
+        op = Operator(create=False)
+        print(f"operator key {op.id} (fingerprint {op.fingerprint}) kept in {store.where()}")
+        return 0
+    if a.export_key:
+        if not ident:
+            print("no operator key here to export", file=sys.stderr)
+            return 1
+        pw = getpass.getpass("A passphrase for this export (12 characters at least): ")
+        if len(pw) < 12 or pw != getpass.getpass("The same passphrase again: "):
+            print("not exported: the passphrases differ, or it is shorter than 12 characters", file=sys.stderr)
+            return 1
+        out = Path(a.export_key)
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(seal_identity(ident, pw), f)
+        print(f"exported to {out} (sealed): carry it to the other computer, import it there, then delete it")
+        return 0
+    blob = json.loads(Path(a.import_key).read_text(encoding="utf-8"))
+    if not blob.get("mmbox_operator_key"):
+        print(f"{a.import_key}: not an operator key export", file=sys.stderr)
+        return 1
+    if ident and ident.get("id") != blob.get("id") and not a.force:
+        print(f"this computer holds another operator key ({ident.get('id')}): --force replaces it", file=sys.stderr)
+        return 1
+    try:
+        new = open_identity(blob, getpass.getpass(f"The passphrase of {a.import_key}: "))
+    except ValueError as e:
+        print(f"not imported: {e}", file=sys.stderr)
+        return 1
+    where = store.save(new)
+    op = Operator(create=False)
+    print(f"operator key {op.id} (fingerprint {op.fingerprint}) imported, kept in {where}; delete {a.import_key} now")
+    return 0
 
 
 def show_running(home: Path, port: int) -> bool:

@@ -2304,7 +2304,7 @@ function renderButlerAll() {
       h("header", {}, h("span", { class: "dot " + (live ? "listening" : b.closed_at ? "closed" : ""), title: live ? "running" : "not running" }),
         h("strong", {}, machineName(machineKey(b))), b.local ? h("span", { class: "chip info" }, "this computer") : null,
         h("button", { class: "btn small text ripple", type: "button", onclick: (e) => butlerRefreshOne(e.currentTarget, b) }, "Refresh")),
-      h("div", { class: "dim" }, inv.at ? `probed ${fmtFull.format(new Date(inv.at * 1000))}` + (inv.tmux === false ? " · no tmux" : "") : "no inventory declared yet (an older client, or never probed)"),
+      h("div", { class: "dim" }, inv.at ? `probed ${fmtFull.format(new Date(inv.at * 1000))}` + (inv.tmux === false ? " · no tmux (Claude Code only)" : "") : "no inventory declared yet (an older client, or never probed)"),
       ag.length ? h("ul", {}, ...ag.map((a) => h("li", {}, h("strong", {}, a.agent), ` ${a.version || ""}`,
         a.logged_in === false ? h("span", { class: "chip stopped" }, "not logged in") : null,
         h("div", { class: "dim" }, (a.models || []).join(", ") || "models unknown")))) : null);
@@ -2328,7 +2328,7 @@ function renderButlerChat(chat) {
   if (stick) log.scrollTop = log.scrollHeight;
 }
 function renderButlerInventory(inv) {
-  $("#butler-inv-at").textContent = inv.at ? `Probed ${fmtFull.format(new Date(inv.at * 1000))}, again every ${Math.round((BT.data?.inventory_every_s || 21600) / 3600)} h or on Refresh` + (inv.tmux === false ? " · tmux is missing: no session can be started" : "") : "Not probed yet.";
+  $("#butler-inv-at").textContent = inv.at ? `Probed ${fmtFull.format(new Date(inv.at * 1000))}, again every ${Math.round((BT.data?.inventory_every_s || 21600) / 3600)} h or on Refresh` + (inv.tmux === false ? " · no tmux: Claude Code sessions only (hidden), not the other agents" : "") : "Not probed yet.";
   $("#butler-inv").replaceChildren(...(inv.agents || []).map((a) => h("tr", { class: a.available ? "" : "dim" },
     h("td", {}, a.agent, h("div", { class: "dim" }, a.provider)),
     h("td", {}, a.available ? (a.version || "?") : "not installed"),
@@ -2352,7 +2352,7 @@ function renderButlerForm(d) {
   const cur = agents.find((a) => a.agent === as.value) || agents[0];
   $("#bn-models").replaceChildren(...(cur?.models || []).map((m) => h("option", { value: m })));
   if (!$("#bn-model").value && cur?.models?.length && !BT.modelTouched) $("#bn-model").value = cur.models[0];  // its first model by default
-  $("#bn-go").disabled = !agents.length || d.inventory?.tmux === false;
+  $("#bn-go").disabled = !agents.length;
 }
 function renderButlerStarted(started) {
   const rows = Object.values(started).sort((a, b) => b.at - a.at).slice(0, 30);

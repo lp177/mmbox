@@ -121,12 +121,22 @@ def find_cli(cli: str, agent: str = "") -> str | None:
     p = shutil.which(cli)
     if p:
         return p
+    names = [f"{cli}.exe", f"{cli}.cmd"] if os.name == "nt" else [cli]
+    mine = "windows" if os.name == "nt" else "darwin" if sys.platform == "darwin" else "linux"
+    others = {"windows", "darwin", "macos", "linux"} - {mine} - ({"macos"} if mine == "darwin" else set())
     for d in (Path.home() / ".vscode" / "extensions", Path.home() / ".vscode-server" / "extensions",
               Path.home() / ".cursor" / "extensions"):
-        if d.is_dir():  # the IDE extensions ship their CLI (Codex, Claude Code)
-            for c in sorted(d.glob(f"*/bin/*/{cli}"), reverse=True) + sorted(d.glob(f"*/bin/{cli}"), reverse=True):
-                if c.is_file() and os.access(c, os.X_OK):
-                    return str(c)
+        if not d.is_dir():
+            continue
+        # the IDE extensions ship their CLI (Codex, Claude Code), sometimes for several systems (bin/linux-x86_64 in a
+        # Windows extension): the build of this system only
+        found = [c for n in names for c in list(d.glob(f"*/bin/*/{n}")) + list(d.glob(f"*/bin/{n}"))]
+        for c in sorted(found, reverse=True):
+            parts = {p.split("-")[0].lower() for p in c.parts[-3:-1]}
+            if parts & others and not parts & {mine, "macos" if mine == "darwin" else mine}:
+                continue
+            if c.is_file() and (os.name == "nt" or os.access(c, os.X_OK)):
+                return str(c)
     return None
 
 
@@ -174,14 +184,16 @@ def probe() -> dict:
             m = re.search(r'"model"\s*:\s*\{?[^}]*?"name"\s*:\s*"([^"]+)"', read(Path.home() / ".gemini" / "settings.json"))
             models, source = ([m.group(1)] if m else []), "its configuration (~/.gemini/settings.json)"
             rec["logged_in"] = (Path.home() / ".gemini" / "oauth_creds.json").is_file() or bool(os.environ.get("GEMINI_API_KEY"))
-        rec.update(models=models, models_source=source, can_start=name in ("claude-code", "codex", "gemini"))
+        rec.update(models=models, models_source=source,  # Claude Code: hidden anywhere; the others: tmux only
+                   can_start=name == "claude-code" or (name in ("codex", "gemini") and os.name != "nt" and bool(shutil.which("tmux"))))
         out.append(rec)
     inv = {"at": time.time(), "host": HOST, "agents": out,
            "tmux": bool(shutil.which("tmux"))}
     jsave("inventory.json", inv)
     publish(inv)
     log("daemon", "inventory: " + ", ".join(f"{r['agent']} {r.get('version') or ''} ({len(r.get('models') or [])} model(s))"
-                                            for r in out if r["available"]) + ("" if inv["tmux"] else "; no tmux: no session start"))
+                                            for r in out if r["available"]) + ("" if inv["tmux"] else
+                                            "; no tmux: Claude Code sessions only (hidden), not the other agents"))
     return inv
 
 
@@ -489,8 +501,12 @@ def stop_session(s: dict) -> dict:
     t = str(s.get("tmux") or "")
     if t.startswith("hidden:"):
         (session_dir(t[7:]) / "stop").touch()
-        return {"stopped": t}
-    run(["tmux", "kill-session", "-t", t], 10)
+    else:
+        run(["tmux", "kill-session", "-t", t], 10)
+    st = jload("state.json", {})
+    if s.get("profile") in (st.get("started") or {}):
+        st["started"][s["profile"]]["state"] = "stopped"
+        jsave("state.json", st)
     return {"stopped": t}
 
 
@@ -583,10 +599,15 @@ def resume_session(y, why: str) -> dict:
 
 
 def check_started() -> None:
-    """The sessions the butler started: listening (done), or failed after START_WAIT_S (the tmux pane's tail kept)."""
+    """The sessions the butler started: listening (done), or failed after START_WAIT_S (the tmux pane's tail kept);
+    a hidden one whose agent ended is `ended`."""
     st = jload("state.json", {})
     changed = False
     for name, s in (st.get("started") or {}).items():
+        if s.get("state") in ("starting", "listening") and str(s.get("tmux")).startswith("hidden:") \
+                and jload_path_any(session_dir(s["tmux"][7:]) / "meta.json", {}).get("state") == "ended":
+            s["state"], changed = "ended", True
+            continue
         if s.get("state") != "starting":
             continue
         y = M.load_me(name)
@@ -994,7 +1015,8 @@ def status() -> dict:
     pid = read(home() / "butler.pid").strip()
     alive = pid.isdigit() and M.pid_alive(int(pid))  # never os.kill(pid, 0): on Windows it terminates the process
     b = butler_me(create=False)
-    return {"running": alive and time.time() - float(st.get("beat") or 0) < LOOP_S * 8, "pid": int(pid) if pid.isdigit() else None,
+    running = alive and time.time() - float(st.get("beat") or 0) < LOOP_S * 8
+    return {"running": running, "pid": int(pid) if running else None,
             "box": {"id": b.id, "label": b.label} if b else None, "beat": st.get("beat"), "home": str(home()),
             "inventory": jload("inventory.json", {}), "started": st.get("started") or {}, "claims": st.get("claims") or {},
             "fails": st.get("fails") or {}, "config": config(), "folders": project_folders(),
@@ -1045,18 +1067,59 @@ WantedBy=default.target
             code, out = run(["launchctl", "load", "-w", str(plist)], 30)
             done.append("launchctl load: " + ("ok" if code == 0 else out.strip()[:200]))
     elif os.name == "nt":
+        # a shortcut in this user's Startup folder: started at each logon, without any administrator right (a logon
+        # task, schtasks /SC ONLOGON, needs an elevated prompt), pythonw: no window
         pyw = Path(sys.executable).with_name("pythonw.exe")
         exe = str(pyw if pyw.is_file() else sys.executable)
-        tr = f'"{exe}" "{client}" daemon run'
-        code, out = run(["schtasks", "/Create", "/TN", "mmbox-daemon", "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", tr], 60)
-        done.append("schtasks /Create mmbox-daemon (at logon, " + ("pythonw: no window" if pyw.is_file() else "python") + "): "
-                    + ("ok" if code == 0 else out.strip()[:300]))
-        if start and code == 0:
-            code, out = run(["schtasks", "/Run", "/TN", "mmbox-daemon"], 60)
-            done.append("schtasks /Run: " + ("ok" if code == 0 else out.strip()[:200]))
+        link = startup_link()
+        q = lambda v: "'" + str(v).replace("'", "''") + "'"  # noqa: E731
+        code, out = run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+                         f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({q(link)}); $s.TargetPath={q(exe)};"
+                         f"$s.Arguments={q(chr(34) + client + chr(34) + ' daemon run')}; $s.WorkingDirectory={q(home())};"
+                         f"$s.WindowStyle=7; $s.Description='mmbox daemon'; $s.Save()"], 60)
+        if code != 0 or not link.is_file():
+            raise RuntimeError(f"the Startup shortcut could not be made: {out.strip()[:300]}")
+        done.append(f"written {link} (started at each logon, " + ("pythonw: no window)" if pyw.is_file() else "python)"))
+        if start and not status()["running"]:
+            subprocess.Popen([exe, client, "daemon", "run"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=DETACHED | NOWIN)
+            done.append("started now")
     else:
         done.append(f"{sys.platform}: no service installer; run `mmbox.py daemon run` at login yourself")
     return done
+
+
+def operator_pins(fingerprint: str | None = None, ask: bool = False) -> tuple[bool, list[str]]:
+    """The operator key the daemon obeys, pinned on each service this computer's machine box is on (an `op` is accepted
+    from that key only). With `fingerprint` (or asked, on a terminal), the services without a pin get it (`collector
+    enable --level off`: questions and ops, no annotation); an existing pin is never replaced here. (all pinned, lines)"""
+    m = M.machine_me()
+    if not m:
+        return False, ["no machine box on this computer: run `mmbox.py start --session <name>` once first"]
+    urls, lines = M.gw_urls(m), []
+    missing = [u for u in urls if not M.operator_pin(u)]
+    for u in urls:
+        if (c := M.operator_pin(u)) is not None:
+            lines.append(f"{u}: operator {c.get('id')} pinned (fingerprint {c.get('fingerprint')})"
+                         + (f" - NOT the key {fingerprint} given: kept; `mmbox.py collector enable {u} --fingerprint "
+                            f"{fingerprint}` replaces it" if fingerprint and fingerprint != c.get("fingerprint") else ""))
+    if missing and not fingerprint and ask and sys.stdin.isatty():
+        fingerprint = input(f"The fingerprint of your operator key, as your console shows it (`mmbox_console.py --has-key`), "
+                            f"for {', '.join(missing)} (empty: later): ").strip() or None
+    for u in missing:
+        if not fingerprint:
+            lines.append(f"{u}: no operator key pinned: the daemon refuses every op there until one is "
+                         f"(`mmbox.py daemon operator --fingerprint <it>`)")
+            continue
+        code, out = run([sys.executable, str(Path(M.__file__).resolve()), "collector", "enable", u, "--level", "off",
+                         "--fingerprint", fingerprint], 60)
+        lines.append(f"{u}: " + ("operator key pinned" if code == 0 and M.operator_pin(u) else f"not pinned: {out.strip()[-300:]}"))
+    return all(M.operator_pin(u) for u in urls), lines
+
+
+def startup_link() -> Path:
+    return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Microsoft" / "Windows" / \
+        "Start Menu" / "Programs" / "Startup" / "mmbox daemon.lnk"
 
 
 def uninstall_service() -> list[str]:
@@ -1071,9 +1134,15 @@ def uninstall_service() -> list[str]:
         plist.unlink(missing_ok=True)
         done.append("launchd agent removed")
     elif os.name == "nt":
-        run(["schtasks", "/End", "/TN", "mmbox-daemon"], 30)
-        code, out = run(["schtasks", "/Delete", "/TN", "mmbox-daemon", "/F"], 30)
-        done.append("logon task removed" if code == 0 else out.strip()[:200])
+        link = startup_link()
+        if link.is_file():
+            link.unlink()
+            done.append(f"removed {link}")
+        else:
+            done.append("no Startup shortcut")
+        if (pid := status().get("pid")):
+            run(["taskkill", "/PID", str(pid), "/F"], 30)
+            done.append(f"daemon pid {pid} stopped")
     return done
 
 
@@ -1101,10 +1170,14 @@ def main(module, argv: list[str]) -> int:
     x.add_argument("text")
     x = sp.add_parser("log", help="the butler's log (JSON lines)")
     x.add_argument("-n", type=int, default=50)
-    x = sp.add_parser("install", help="run the daemon as a service of this user: systemd, launchd, a Windows logon task")
+    x = sp.add_parser("install", help="run the daemon as a service of this user: systemd, launchd, a Windows Startup shortcut")
     x.add_argument("--systemd", action="store_true", help=argparse.SUPPRESS)  # the old spelling
     x.add_argument("--no-start", action="store_true", help="install it, start it at the next login only")
+    x.add_argument("--operator-fingerprint", help="the operator key it obeys, pinned where none is (asked otherwise)")
     sp.add_parser("uninstall", help="remove that service")
+    x = sp.add_parser("operator", help="the operator key the daemon obeys: pinned on each service of this computer")
+    x.add_argument("--fingerprint", help="pin this operator key where none is pinned (asked on a terminal otherwise)")
+    x.add_argument("--operator-fingerprint", dest="fingerprint", help=argparse.SUPPRESS)
     x = sp.add_parser("session-run", help=argparse.SUPPRESS)  # a hidden session's runner (started by the daemon)
     x.add_argument("name")
     x = sp.add_parser("session-input", help="type a line into a hidden session the daemon started")
@@ -1137,7 +1210,19 @@ def main(module, argv: list[str]) -> int:
     elif a.cmd == "log":
         print("\n".join(read(home() / "butler.log").splitlines()[-a.n:]))
     elif a.cmd == "install":
-        print("\n".join(install_service(start=not a.no_start)))
+        ok, lines = operator_pins(a.operator_fingerprint, ask=True)
+        print("\n".join(lines))
+        try:
+            print("\n".join(install_service(start=not a.no_start)))
+        except (RuntimeError, OSError) as e:
+            print(f"FAILED: {e}", file=sys.stderr)
+            return 1
+        if not ok:
+            print("WARNING: the daemon runs, but obeys no operator on the services listed above until its key is pinned")
+    elif a.cmd == "operator":
+        ok, lines = operator_pins(a.fingerprint, ask=True)
+        print("\n".join(lines))
+        return 0 if ok else 1
     elif a.cmd == "uninstall":
         print("\n".join(uninstall_service()))
     elif a.cmd == "session-run":
