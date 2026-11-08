@@ -1579,7 +1579,7 @@ function showTab(name) {
     $("#" + t.getAttribute("aria-controls")).hidden = !on;
   }
   butlerTab(name === "butler");
-  if (name === "settings" && token) loadButlerSettings();
+  if (name === "settings" && token) { loadButlerSettings(); loadAccount(); }
   localStorage.setItem("mmbox-console-tab", name);
 }
 $(".tabs").addEventListener("click", (e) => { const t = e.target.closest(".tab"); if (t) showTab(t.id.slice(4)); });
@@ -2604,6 +2604,59 @@ $("#so-send").addEventListener("click", async () => {
 $("#so-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#so-send").click(); } });
 $("#so-stop").addEventListener("click", () => SO.name && confirmRun(`Stop ${SO.name}?`, "Its agent stops; its box closes after an hour without use, and what waits for it then goes to its project's box.",
   { action: "session_stop", profile: SO.name }, { okLabel: "Stop it" }));
+
+// ---------------------------------------------------------------- the account (client/ACCOUNTS.md): devices, approvals, joining
+const AC = { data: null, seen: new Set() };
+async function loadAccount() {
+  if (!token) return;
+  let d;
+  try { d = await api("/api/account"); } catch { return; }
+  AC.data = d;
+  for (const j of d.joins || []) if (!AC.seen.has(j.id)) {
+    AC.seen.add(j.id);
+    toast(`A device asks to join your account: ${j.label || j.id} on ${j.host || "?"} (Settings, Account)`);
+    if (window.Notification?.permission === "granted") new Notification("mmbox: a device asks to join your account", { body: `${j.label || j.id} on ${j.host || "?"}`, tag: "mmbox-join-" + j.id });
+  }
+  if (!$("#view-settings").hidden) renderAccount();
+}
+function renderAccount() {
+  const d = AC.data || {}, body = $("#acct-body");
+  if (d.available === false) { body.replaceChildren(h("p", { class: "dim" }, "The client has no accounts yet: update it.")); return; }
+  const parts = [];
+  if (d.account) {
+    parts.push(h("p", {}, h("strong", {}, d.account), h("span", { class: "dim" }, ` · root ${d.fingerprint} · ${d.length} link(s), newest ${fmtFull.format(new Date(d.head_ts * 1000))}` + (d.root_here ? " · its root key is kept here" : ""))));
+    parts.push(h("p", { class: "dim" }, `Each computer obeys this account once it pinned its root: mmbox.py daemon operator --account ${d.fingerprint}`));
+    for (const v of d.devices || []) parts.push(h("div", { class: "acct-dev" }, h("span", { class: "grow" }, h("strong", {}, v.label || v.id), h("span", { class: "dim" }, ` on ${v.host || "?"} · ${v.id}`)),
+      v.id === d.this ? h("span", { class: "chip info" }, "this console") : h("button", { class: "btn small text danger ripple", type: "button",
+        onclick: () => confirmRun(`Revoke ${v.label || v.id}?`, "It can no longer act as this account anywhere, as soon as the computers read the chain again (10 min at most). A revoked device never comes back: it joins again as a new one.",
+          { action: "account_revoke", device: v.id }, { okLabel: "Revoke", after: loadAccount }) }, "Revoke")));
+    if ((d.revoked || []).length) parts.push(h("p", { class: "dim" }, `${d.revoked.length} revoked device(s)`));
+    for (const j of d.joins || []) {
+      const inp = h("input", { placeholder: " ", inputmode: "numeric", maxlength: "6", autocomplete: "off" });
+      parts.push(h("div", { class: "acct-join" }, h("strong", {}, `${j.label || j.id} on ${j.host || "?"} asks to join`),
+        h("p", { class: "dim" }, "Type the 6 digits that device shows. Only approve a device you are setting up yourself, now."),
+        h("div", { class: "field" }, inp, h("label", {}, "Its code")),
+        h("div", { class: "actions" },
+          h("button", { class: "btn filled ripple", type: "button", onclick: async () => { const r = await action({ action: "account_approve", device: j.id, code: inp.value.trim() }); toast(r.ok ? "Approved: it is a device of the account" : "Not approved: " + (r.err || "?")); loadAccount(); } }, "Approve"),
+          h("button", { class: "btn text ripple", type: "button", onclick: async () => { await action({ action: "account_decline", device: j.id }); loadAccount(); } }, "Decline"))));
+    }
+    (d.errors || []).forEach((e) => parts.push(h("p", { class: "error" }, e)));
+  } else if (d.joining) {
+    parts.push(h("p", {}, `Waiting for a device of ${d.joining.account} to approve this console.`),
+      h("p", {}, "Its code, to type on that device: ", h("span", { class: "acct-code" }, d.my_code || "?")),
+      h("div", { class: "actions" }, h("button", { class: "btn text ripple", type: "button", onclick: async () => { await action({ action: "account_join_cancel" }); loadAccount(); } }, "Cancel")));
+  } else {
+    const inp = h("input", { placeholder: " ", autocomplete: "off", maxlength: "19" });
+    parts.push(h("p", { class: "dim" }, "This console is no device of an account. Make one on your first computer with `mmbox_console.py --account-create <recovery file>`, or join yours:"),
+      h("div", { class: "field" }, inp, h("label", {}, "The account's root fingerprint (XXXX-XXXX-XXXX-XXXX)")),
+      h("div", { class: "actions" }, h("button", { class: "btn filled ripple", type: "button", onclick: async () => {
+        const r = await action({ action: "account_join", account: inp.value.trim() });
+        toast(r.ok ? `Asked; approve it on a device of the account with the code ${r.code}` : "Not asked: " + (r.err || "?")); loadAccount(); } }, "Join")));
+  }
+  body.replaceChildren(...parts);
+}
+setInterval(loadAccount, 20000);
+setTimeout(loadAccount, 2000);
 
 showTab(DEEP.get("tab") || localStorage.getItem("mmbox-console-tab") || "messages");
 if (DEEP.get("msg")) { const id = DEEP.get("msg"); const t = setInterval(() => { if (S.byId.has(id)) { clearInterval(t); openMessage(id); } }, 300); }

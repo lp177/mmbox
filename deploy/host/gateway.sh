@@ -12,6 +12,7 @@
 #   MMBOX_SRC_DIR, MMBOX_GATEWAY_PORT (8095), MMBOX_REDIS_PORT (6390), MMBOX_LOOPBACK_IP (169.254.1.3),
 #   MMBOX_PODMAN_USER (podman),
 #   MMBOX_OPERATORS=<console id>[,<id>]   mmbox consoles that read the whole table of active boxes
+#   MMBOX_OPERATOR_ACCOUNTS=<root fingerprint>[,…]   accounts whose active devices are operators (client/ACCOUNTS.md)
 #   MMBOX_COLLECTOR=1 [MMBOX_COLLECTOR_DAYS=7]   the collector's journal, read by those operators
 #   MMBOX_DOMAIN (none: no vhost), MMBOX_NGINX (1; 0: no vhost), MMBOX_ALLOW ("10.8.0.0/24 192.0.2.7": the allowed
 #   addresses; none: open to all), MMBOX_NGINX_SERVER_EXTRA (lines for the server block: ssl_certificate…),
@@ -100,6 +101,9 @@ unset GW_PW
 
 # ---------------------------------------------------------------- the unit
 OPERATORS="${MMBOX_OPERATORS:-}"
+OP_ACCOUNTS="${MMBOX_OPERATOR_ACCOUNTS:-}"
+[[ -z "$OP_ACCOUNTS" || "$OP_ACCOUNTS" =~ ^[0-9A-F]{4}(-[0-9A-F]{4}){3}(,[0-9A-F]{4}(-[0-9A-F]{4}){3})*$ ]] \
+    || { err "MMBOX_OPERATOR_ACCOUNTS: account root fingerprints, comma separated"; exit 1; }
 [[ -z "$OPERATORS" || "$OPERATORS" =~ ^m[0-9a-z]{12}(,m[0-9a-z]{12})*$ ]] || { err "MMBOX_OPERATORS: mmbox ids, comma separated"; exit 1; }
 COL_ON="$([[ "${MMBOX_COLLECTOR:-}" =~ ^(1|on|yes|true)$ ]] && echo 1 || echo 0)"
 COL_DAYS="${MMBOX_COLLECTOR_DAYS:-7}"
@@ -123,6 +127,7 @@ Network=pasta:--map-host-loopback,${LOOPBACK_IP}
 Environment=MMBOX_REDIS_URL=redis://${LOOPBACK_IP}:${REDIS_PORT}/0
 Environment=MMBOX_REDIS_USER=mmbox-gateway
 Environment=MMBOX_OPERATORS=${OPERATORS}
+Environment=MMBOX_OPERATOR_ACCOUNTS=${OP_ACCOUNTS}
 Environment=MMBOX_COLLECTOR=${COL_ON}
 Environment=MMBOX_COLLECTOR_DAYS=${COL_DAYS}
 Secret=${SECRET},type=mount,target=/run/secrets/mmbox_redis_gateway,uid=10001,mode=0400

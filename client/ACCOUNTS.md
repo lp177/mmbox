@@ -89,3 +89,22 @@ on another computer, a device approved).
   device sent something; a revocation once a device sent something); two devices signing heads at once may fork (the
   daemon then keeps its chain): the service will hold the chain and order its links. A device sends ops only if the
   service lets it write to the daemon's box (today: operators of the service).
+
+## As built: step 2 (2026-11-08)
+
+- Service: `/v1/account/link` (a link appended only when it follows the chain's end exactly and holds: atomic, so no
+  fork; the first link makes the account), `/v1/account/chain`, `/v1/account/join` (a device's request, 15 min),
+  `/v1/account/joins` (for the account's active devices), `/v1/account/join/clear`. `MMBOX_OPERATOR_ACCOUNTS` (root
+  fingerprints): the active devices of these accounts are operators of the service (they write to any box, any box
+  writes to them, they read the table and the collector), beside `MMBOX_OPERATORS`; `/v1/health` names them.
+- The join code is computed from the new device's keys on both sides (`join_code`): a service relaying the request
+  cannot swap the keys without changing the code.
+- Console: every ~30 s, the chain in step with each service (what it lacks is sent link by link, what it has more is
+  taken when it holds and extends ours); the join requests to approve; Settings, Account: the account and its devices
+  (Revoke), the requests (type the code the new device shows, Approve or Decline, a notification when one arrives), or,
+  without an account, Join (the account's root fingerprint; the code to type on the approving device; the chain taken
+  once approved).
+- Daemon: each pinned chain refreshed from the services at its start and every 10 min (new devices, revocations).
+- Tested on the bench, the service with no operator key, only the account: A obeyed; B asks to join, A sees the same
+  code, a wrong code refused, the right one approved, B takes the chain and is obeyed; A revokes B: B's console is no
+  operator any more and the daemon learns the revocation from the service without any op.

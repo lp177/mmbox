@@ -699,3 +699,8 @@ dialog.att-viewer { width: min(1100px, calc(100vw - 32px)); }
 #session-dialog .row, #butler-launch .row, #view-settings .row { display: flex; gap: 10px; } #session-dialog .row .field, #butler-launch .row .field { flex: 1; }
 #session-out .dialog-body { width: min(1100px, 94vw); display: flex; flex-direction: column; gap: 10px; }
 #session-out .butler-out { max-height: 62vh; min-height: 300px; }
+.acct-body { display: flex; flex-direction: column; gap: 10px; }
+.acct-dev { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 10px; background: var(--s2); }
+.acct-dev .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.acct-join { display: flex; flex-direction: column; gap: 6px; padding: 10px; border-radius: 10px; border: 1px solid var(--warn, #fdd663); }
+.acct-code { font: 600 22px/1.2 ui-monospace, monospace; letter-spacing: .2em; }

@@ -1753,6 +1753,148 @@ class State:
             return {"ok": r.get("ok"), "out": r.get("out"), "err": r.get("err")}
         return {"ok": False, "err": f"unknown action {a}"}
 
+    # ---------------------------------------------------------------- the account: chain kept in step with the services
+    def account_sync(self) -> None:
+        """The account's chain against each service this console talks to: what the service lacks is sent (link by
+        link: it orders them), what it has more is taken when it holds and extends ours (never a fork); then the join
+        requests waiting for an approval. A new device waiting to join takes the chain once it is in it."""
+        A = account_lib()
+        chain, joining = account_chain(), self.console_state.get("joining")
+        fp = None
+        if chain:
+            fp = A.verify(chain, max_age=None)["fingerprint"]
+        elif joining:
+            fp = joining.get("account")
+        if not fp:
+            return
+        joins, errors = {}, []
+        for srv in self.snapshot.get("servers") or []:
+            if not srv.get("ok"):
+                continue
+            u = srv["url"]
+            r = call(u, self.op, "/account/chain", {"account": fp})
+            if r.get("_error") is not None:
+                continue  # an older service, or none of this account there
+            remote = r.get("chain") or []
+            if not chain:  # joining: in once a device approved it
+                try:
+                    st = A.verify(remote, fp, max_age=None)
+                except A.ChainError:
+                    continue
+                if self.op.id in st["devices"]:
+                    account_save(remote)
+                    chain = remote
+                    self.console_state.pop("joining", None)
+                    self.save_console_state()
+                    log(f"account: this console is now a device of {st['account']}")
+                continue
+            try:
+                if remote and A.extends(chain, remote) and len(remote) > len(chain):
+                    A.verify(remote, fp, max_age=None)
+                    account_save(remote)
+                    chain = remote
+                    log(f"account: chain taken from {u} ({len(remote)} links)")
+                elif A.extends(remote, chain):
+                    for link in chain[len(remote):]:
+                        rr = call(u, self.op, "/account/link", {"account": fp, "link": link})
+                        if rr.get("_error") is not None:
+                            errors.append(f"{u}: link {link['seq']}: {rr.get('_error')} {rr.get('error', '')}")
+                            break
+                else:
+                    errors.append(f"{u}: its chain forks from this console's")
+            except A.ChainError as e:
+                errors.append(f"{u}: {e}")
+            jr = call(u, self.op, "/account/joins", {"account": fp})
+            for j in jr.get("joins") or []:
+                if j.get("id") and j["id"] not in A.verify(chain, max_age=None)["devices"]:
+                    joins[j["id"]] = {**j, "code": A.join_code(j), "server": u}
+        self.account_joins = joins
+        if errors and errors != getattr(self, "_acct_errors", None):
+            log("account: " + "; ".join(errors))
+        self._acct_errors = errors
+
+    def account_operator(self, health: dict) -> bool:
+        """Whether this console is an operator of a service through its account (MMBOX_OPERATOR_ACCOUNTS there)."""
+        accts = health.get("operator_accounts") or []
+        chain = account_chain()
+        if not accts or not chain:
+            return False
+        try:
+            st = account_lib().verify(chain, max_age=None)
+        except Exception:  # noqa: BLE001 - no valid chain: no operator through it
+            return False
+        return st["fingerprint"] in accts and self.op.id in st["devices"]
+
+    def account_state(self) -> dict:
+        try:
+            A = account_lib()
+        except Exception:  # noqa: BLE001 - an older client: no accounts
+            return {"available": False}
+        chain = account_chain()
+        out = {"available": True, "this": self.op.id, "joining": self.console_state.get("joining"),
+               "joins": list(getattr(self, "account_joins", {}).values()), "errors": getattr(self, "_acct_errors", [])}
+        if self.console_state.get("joining"):
+            out["my_code"] = A.join_code(device_record(self.op))
+        if chain:
+            st = A.verify(chain, max_age=None)
+            out.update(account=st["account"], fingerprint=st["fingerprint"], length=st["length"], head_ts=st["head_ts"],
+                       devices=list(st["devices"].values()), revoked=sorted(st["revoked"]),
+                       root_here=KeyStore(console_home(), "root").where() is not None)
+        return out
+
+    def account_action(self, a: str, body: dict) -> dict:
+        A = account_lib()
+        chain = account_chain()
+        if a == "account_join":
+            fp = str(body.get("account") or "").strip().upper()
+            if chain:
+                return {"ok": False, "err": "this console is already a device of an account"}
+            if not re.fullmatch(r"[0-9A-F]{4}(-[0-9A-F]{4}){3}", fp):
+                return {"ok": False, "err": "the account's root fingerprint: XXXX-XXXX-XXXX-XXXX"}
+            sent = [s["url"] for s in self.snapshot.get("servers") or [] if s.get("ok")
+                    and call(s["url"], self.op, "/account/join", {"account": fp, "device": device_record(self.op)}).get("ok")]
+            if not sent:
+                return {"ok": False, "err": "no service of this computer knows that account"}
+            self.console_state["joining"] = {"account": fp, "at": time.time(), "servers": sent}
+            self.save_console_state()
+            return {"ok": True, "code": A.join_code(device_record(self.op)), "servers": sent}
+        if a == "account_join_cancel":
+            j = self.console_state.pop("joining", None) or {}
+            self.save_console_state()
+            for u in j.get("servers") or []:
+                call(u, self.op, "/account/join/clear", {"account": j.get("account"), "device": self.op.id})
+            return {"ok": True}
+        if not chain:
+            return {"ok": False, "err": "this console is no device of an account"}
+        st = A.verify(chain, max_age=None)
+        dev_id = str(body.get("device") or "")
+        if a in ("account_approve", "account_decline"):
+            j = getattr(self, "account_joins", {}).get(dev_id)
+            if not j:
+                return {"ok": False, "err": "no such request waiting"}
+            if a == "account_approve":
+                if str(body.get("code") or "") != j["code"]:
+                    return {"ok": False, "err": "the code differs from the one this request's keys give: not approved"}
+                chain.append(A.make_link(chain, "add", {k: j[k] for k in ("id", "sign_pub", "box_pub", "label", "host", "user")
+                                                        if k in j}, self.op.id, self.op.sign))
+                A.verify(chain, max_age=None)
+                account_save(chain)
+            call(j["server"], self.op, "/account/join/clear", {"account": st["fingerprint"], "device": dev_id})
+            self.account_joins.pop(dev_id, None)
+            threading.Thread(target=self.account_sync, daemon=True).start()
+            return {"ok": True}
+        if a == "account_revoke":
+            dev = st["devices"].get(dev_id)
+            if not dev:
+                return {"ok": False, "err": "no active device of that id"}
+            if dev_id == self.op.id:
+                return {"ok": False, "err": "revoke this console from another device of the account"}
+            chain.append(A.make_link(chain, "revoke", dev, self.op.id, self.op.sign))
+            account_save(chain)
+            threading.Thread(target=self.account_sync, daemon=True).start()
+            return {"ok": True}
+        return {"ok": False, "err": f"unknown action {a}"}
+
     def empty_boxes(self) -> dict:
         """The memory view's second button: every box of every service where this console is an operator deleted
         with what waits in it, for every computer (the operators' own box excepted); live sessions register again."""
@@ -2019,7 +2161,8 @@ class State:
                             "note": reg.get("note"), "deploy": reg.get("deploy"), "users": users.get(u, []),
                             "ok": bool(h.get("ok")), "ms": h.get("ms"), "error": h.get("error"),
                             "features": h.get("features") or [], "collector": h.get("collector"),
-                            "operator": self.op.id in (h.get("operators") or []), "box_ttl_s": h.get("box_ttl_s"),
+                            "operator": self.op.id in (h.get("operators") or []) or self.account_operator(h),
+                            "box_ttl_s": h.get("box_ttl_s"),
                             "col_level": M.col_level(u), "col_pinned": (col_conf.get(u) or {}).get("fingerprint"),
                             "paused": u in paused})
 
@@ -2804,6 +2947,8 @@ def act(state: State, body: dict) -> dict:
         return state.purge_box(str(body.get("id") or ""))
     if a in ("box_empty", "box_close", "box_delete"):  # a box's menu: what waits in it, closing, deleting
         return state.box_command(str(body.get("id") or ""), a[4:])
+    if a.startswith("account_"):  # the account: join, approve or decline a new device, revoke one
+        return state.account_action(a, body)
     if a.startswith(("butler_", "daemon_", "session_")):  # the daemon and its butler: chat, sessions, inventory, ops
         return state.butler_action(a, body)
     if a == "empty_boxes":  # the memory view: every box of every service where this console is an operator
@@ -3011,6 +3156,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"count": len(pend), "ids": [x["id"] for x in pend], "version": st.snapshot.get("version", 0),
                                    "latest": ({k: pend[-1].get(k) for k in ("id", "from", "label", "title", "subject")} if pend else None),
                                    "desktop": bool(st.desktop and st.desktop.ok), "held": len(st.held())})
+            if u.path == "/api/account":  # Settings: the account, its devices, the requests to approve
+                return self._json(st.account_state())
             if u.path == "/api/butler":  # the Butler tab: its state, inventory, started sessions, chat
                 return self._json(st.butler_state())
             if u.path == "/api/show":  # a second launch of the app: this window to the front
@@ -3182,6 +3329,8 @@ def main():
                 state.refresh()
                 if n % 8 == 0:
                     state.ensure_butler()  # runs with the console (Settings), one per computer
+                if n % 4 == 0 and (account_chain() or state.console_state.get("joining")):
+                    state.account_sync()  # the chain in step with the services, the requests to approve
                 if n % 400 == 0 and account_chain():
                     try:
                         if account_head_due(op):  # the daily head of the account's chain (client/ACCOUNTS.md)
@@ -3324,7 +3473,7 @@ def account_command(a) -> int:
     if a.account_join:
         if chain:
             raise SystemExit("this console is already a device of an account")
-        code = f"{secrets.randbelow(10 ** 6):06d}"
+        code = A.join_code(device_record(op))
         Path(a.account_join).write_text(json.dumps({"join": device_record(op), "code": code}, indent=1), encoding="utf-8")
         print(f"join request written to {a.account_join}; its code: {code} (the approving device checks it)")
         return 0
@@ -3335,7 +3484,7 @@ def account_command(a) -> int:
         dev = req.get("join") or {}
         print(f"approve {dev.get('label')} on {dev.get('host')} ({dev.get('id')})?")
         code = a.code or input("The code the new device shows: ").strip()
-        if code != req.get("code"):
+        if code != A.join_code(dev) or code != req.get("code"):
             raise SystemExit("the codes differ: not approved")
         chain.append(A.make_link(chain, "add", dev, op.id, op.sign))
         A.verify(chain, max_age=None)

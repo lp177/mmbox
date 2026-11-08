@@ -965,6 +965,40 @@ def account_check(sender: str, p: dict) -> str | None:
     return None
 
 
+CHAIN_REFRESH_S = 600
+
+
+def refresh_chains(b, force: bool = False) -> None:
+    """Each pinned account's chain from the services (every CHAIN_REFRESH_S): new devices and revocations reach this
+    daemon without waiting for an op; taken only when it holds and extends the cached chain."""
+    A = M.account_module()
+    pins = M.account_pins()
+    st = jload("state.json", {})
+    if not A or not pins or (not force and time.time() - float(st.get("chains_at") or 0) < CHAIN_REFRESH_S):
+        return
+    changed = False
+    for fp, pin in pins.items():
+        for gw in M.gateways_of(b):
+            r = gw.call(b, "/account/chain", {"account": fp}, soft=True) or {}
+            chain = r.get("chain")
+            if r.get("_error") is not None or not chain:
+                continue
+            try:
+                keep = A.newer(pin.get("chain"), chain, fp)
+            except A.ChainError as e:
+                log("error", f"account {fp}: the chain of {gw.url} does not hold: {e}")
+                continue
+            if keep is None:
+                log("error", f"account {fp}: the chain of {gw.url} forks from this computer's: kept ours")
+            elif len(keep) > len(pin.get("chain") or []):
+                pins[fp] = pin = {"chain": keep, "at": time.time()}
+                changed = True
+                log("daemon", f"account {fp}: chain now {len(keep)} link(s) (from {gw.url})")
+    if changed:
+        M.account_pins_save(pins)
+    jsave("state.json", {**jload("state.json", {}), "chains_at": time.time()})
+
+
 def do_op(op: dict) -> dict:
     """What the operator's console asks the daemon (signed with its operator key, nobody else): status, config,
     inventory, start, stop, input (a line typed into a hidden session), output (a hidden session's output)."""
@@ -1020,6 +1054,7 @@ def daemon(once: bool = False) -> int:
     M.listeners(b.local, register=True)
     log("daemon", f"butler {b.label} ({b.id}) runs, pid {os.getpid()}; takes what waited {AFTER_S / 60:g} min")
     inventory()
+    refresh_chains(b, force=True)
     while True:
         try:
             if (home() / "refresh").exists():
@@ -1035,6 +1070,7 @@ def daemon(once: bool = False) -> int:
             jsave("state.json", {**jload("state.json", {}), "claims": st["claims"], "fails": st.get("fails") or {},
                                  "last_start": st.get("last_start") or {}, "beat": time.time()})
             check_started()
+            refresh_chains(b)
             handle_own_box(b, st)
             q = home() / "chat.queue"
             if q.exists():

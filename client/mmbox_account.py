@@ -47,6 +47,13 @@ def account_id(root_sign_pub: bytes) -> str:
     return "a" + out
 
 
+def join_code(device: dict) -> str:
+    """The 6 digits a new device shows and its approver checks: from the device's own keys, so that a service relaying
+    the request cannot swap them unnoticed."""
+    h = hashlib.sha256(b"mmbox-join:" + b64d(device["sign_pub"]) + b64d(device["box_pub"])).hexdigest()
+    return f"{int(h[:12], 16) % 10 ** 6:06d}"
+
+
 def root_fingerprint(root_sign_pub: bytes) -> str:
     h = hashlib.sha256(b"mmbox-account-root:" + root_sign_pub).hexdigest().upper()
     return "-".join(h[i:i + 4] for i in range(0, 16, 4))

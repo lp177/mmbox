@@ -71,7 +71,7 @@ import base64, hashlib, json, os, re, time
 
 from aiohttp import web
 import redis.asyncio as aioredis
-from redis.exceptions import ResponseError as RedisError
+from redis.exceptions import ResponseError as RedisError, WatchError
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -116,6 +116,10 @@ ID_RE = re.compile(r"m[0-9a-z]{12}")
 ENTRY_RE = re.compile(r"\d{1,20}-\d{1,20}")
 INV_RE = re.compile(r"[0-9a-z]{4}")
 OPERATORS = [o for o in re.split(r"[,\s]+", os.environ.get("MMBOX_OPERATORS", "")) if ID_RE.fullmatch(o)]
+# accounts (client/ACCOUNTS.md) whose devices are operators of this service: their root fingerprints
+FP_RE = re.compile(r"^[0-9A-F]{4}(-[0-9A-F]{4}){3}$")
+OPERATOR_ACCOUNTS = [a for a in re.split(r"[,\s]+", os.environ.get("MMBOX_OPERATOR_ACCOUNTS", "")) if FP_RE.fullmatch(a)]
+JOIN_TTL_S = 900
 if OPERATORS:  # a box may ask the first operator's console a question, and the console answers it (no pairing)
     FEATURES.append("questions")
 FEATURES.append("stats")
@@ -319,7 +323,7 @@ async def usage(request: web.Request) -> web.Response:
     next call (its client answers "unknown identity" with its card and links); a message written to it meanwhile waits
     in its sender's queue. The collector notes who did it, how many boxes and entries went."""
     me, data = await signed_json(request)
-    if me not in OPERATORS:
+    if not await is_operator(request.app["redis"], me):
         raise _http(403, "the service's memory is for its operators only (MMBOX_OPERATORS)")
     r = request.app["redis"]
     emptied = None
@@ -483,7 +487,8 @@ async def health(request: web.Request) -> web.Response:
         await r.ping()
         out = {"redis": "up", "time": time.time(), "features": FEATURES, "chan_ttl_s": CHAN_TTL_S,
                "chan_max_ttl_s": CHAN_MAX_TTL_S, "box_ttl_s": BOX_TTL_S,
-               "operators": OPERATORS}  # ids only: a console signs as one of them, or as a box
+               "operators": OPERATORS,  # ids only: a console signs as one of them, or as a box
+               "operator_accounts": OPERATOR_ACCOUNTS}  # or as an active device of one of these accounts
         if OPERATORS:  # whom questions go to, and whose answers the clients accept: the first operator's key
             card = _loads(await r.get(f"mmbox:card:{OPERATORS[0]}")) or {}
             out["operator"] = {"id": OPERATORS[0], "fingerprint": card.get("fingerprint"),
@@ -568,12 +573,13 @@ async def send(request: web.Request) -> web.Response:
     if len(raw) > MAX_ENV:
         raise _http(413, "message too large")
     r = request.app["redis"]
-    if me in OPERATORS:  # the console's answer to a box's question: any box the service knows, still open
+    me_op = await is_operator(r, me)
+    if me_op:  # the console's answer to a box's question, an op to a daemon: any box the service knows, still open
         if not await r.exists(f"mmbox:card:{to}"):
             raise _http(404, "no such box on this service (removed, or expired)")
         if (_loads(await r.get(f"mmbox:box:{to}")) or {}).get("closed_ms"):
             raise _http(410, "this box closed: write to its machine box")
-    elif to not in OPERATORS and not await r.hexists(f"mmbox:links:{to}", me):
+    elif not await is_operator(r, to) and not await r.hexists(f"mmbox:links:{to}", me):
         await refused(r, me, to, env, data, "not_listed")
         raise _http(403, "the recipient does not list the sender among its peers (not paired, or its links are not synced)")
     box = f"mmbox:in:{to}"
@@ -952,6 +958,161 @@ def box_info(info) -> dict:
     return {k: v for k, v in out.items() if v not in (None, {}, "")}
 
 
+# ---------------------------------------------------------------- accounts (client/ACCOUNTS.md): the device chains
+# The service keeps each account's chain and appends a link only when it follows the last one exactly (no fork) and
+# holds (its signer: the root key or an active device); it holds no key of it and can write none.
+def root_fingerprint(root_pub: bytes) -> str:
+    h = hashlib.sha256(b"mmbox-account-root:" + root_pub).hexdigest().upper()
+    return "-".join(h[i:i + 4] for i in range(0, 16, 4))
+
+
+def link_hash(link: dict) -> str:
+    return hashlib.sha256(canon(link)).hexdigest()
+
+
+def link_next(state: dict, link: dict, fp: str) -> dict:
+    """The account's state once `link` is appended, or HTTP 409/400 when it does not follow or does not hold."""
+    if not isinstance(link, dict) or link.get("v") != 1 or not isinstance(link.get("sig"), str):
+        raise _http(400, "`link`: a signed link")
+    n = int(state.get("len") or 0)
+    if link.get("seq") != n or link.get("prev") != (state.get("last") or ""):
+        raise _http(409, f"the link does not follow the chain's end (length {n}): fetch it and sign again")
+    body = {k: v for k, v in link.items() if k != "sig"}
+    devices, revoked = dict(state.get("devices") or {}), set(state.get("revoked") or [])
+    if n == 0:
+        root = (link.get("root") or {}).get("sign_pub")
+        if not isinstance(root, str) or link.get("by") != "root":
+            raise _http(400, "the first link names the root key and is signed by it")
+        try:
+            if root_fingerprint(base64.b64decode(root)) != fp:
+                raise _http(400, "the root key does not match the account's fingerprint")
+        except (ValueError, TypeError):
+            raise _http(400, "the root key is malformed") from None
+        signer, root_pub = root, root
+    else:
+        if "root" in link:
+            raise _http(400, "only the first link names the root key")
+        root_pub, by = state["root"], link.get("by")
+        signer = root_pub if by == "root" else (devices.get(by) or {}).get("sign_pub") if by not in revoked else None
+        if not signer:
+            raise _http(403, f"signed by {by}: not the root key nor an active device of the account")
+    if not verify(signer, link["sig"], canon(body)):
+        raise _http(403, "the link's signature does not verify")
+    op, dev = link.get("op"), link.get("device") or {}
+    if op == "add":
+        if not ID_RE.fullmatch(str(dev.get("id") or "")) or not dev.get("sign_pub") or not dev.get("box_pub"):
+            raise _http(400, "an add names a device and its keys")
+        if dev["id"] in revoked:
+            raise _http(400, "a revoked device never comes back")
+        devices[dev["id"]] = {k: dev[k] for k in ("id", "sign_pub", "box_pub", "label", "host", "user") if k in dev}
+    elif op == "revoke":
+        if dev.get("id") not in devices:
+            raise _http(400, "revokes an unknown device")
+        revoked.add(dev["id"])
+    elif op != "head":
+        raise _http(400, f"unknown op {op}")
+    return {"len": n + 1, "last": link_hash(link), "root": root_pub, "devices": devices, "revoked": sorted(revoked),
+            "head_ts": link.get("ts")}
+
+
+async def account_state(r, fp: str) -> dict:
+    return _loads(await r.get(f"mmbox:acct:{fp}:state")) or {}
+
+
+async def is_operator(r, mid: str) -> bool:
+    """An operator of this service: a key of MMBOX_OPERATORS, or an active device of an account of
+    MMBOX_OPERATOR_ACCOUNTS (its chain kept here)."""
+    if mid in OPERATORS:
+        return True
+    for fp in OPERATOR_ACCOUNTS:
+        st = await account_state(r, fp)
+        if mid in (st.get("devices") or {}) and mid not in (st.get("revoked") or []):
+            return True
+    return False
+
+
+def need_fp(data: dict) -> str:
+    fp = str(data.get("account") or "")
+    if not FP_RE.fullmatch(fp):
+        raise _http(400, "`account`: a root fingerprint (XXXX-XXXX-XXXX-XXXX)")
+    return fp
+
+
+async def account_link(request: web.Request) -> web.Response:
+    """A link appended to an account's chain (the first one makes the account), checked and appended atomically."""
+    me, data = await signed_json(request)
+    fp, link = need_fp(data), data.get("link")
+    r = request.app["redis"]
+    for _ in range(5):
+        async with r.pipeline(transaction=True) as p:
+            try:
+                await p.watch(f"mmbox:acct:{fp}:state")
+                st = _loads(await p.get(f"mmbox:acct:{fp}:state")) or {}
+                new = link_next(st, link, fp)
+                p.multi()
+                p.rpush(f"mmbox:acct:{fp}:chain", json.dumps(link, ensure_ascii=False, separators=(",", ":")))
+                p.set(f"mmbox:acct:{fp}:state", json.dumps(new, ensure_ascii=False))
+                await p.execute()
+                await col(r, {"ev": "account", "account": fp, "op": link.get("op"), "seq": new["len"] - 1, "by": me,
+                              "device": (link.get("device") or {}).get("id")})
+                return ok({"length": new["len"], "devices": sorted(new["devices"]), "revoked": new["revoked"]})
+            except WatchError:
+                continue
+    raise _http(409, "the chain changed meanwhile: fetch it and sign again")
+
+
+async def account_chain(request: web.Request) -> web.Response:
+    """An account's chain (from `since`): its devices' public keys, labels; checked again by whoever reads it."""
+    _me, data = await signed_json(request)
+    fp, since = need_fp(data), max(0, int(data.get("since") or 0))
+    r = request.app["redis"]
+    raw = await r.lrange(f"mmbox:acct:{fp}:chain", since, -1)
+    return ok({"account": fp, "since": since, "chain": [json.loads(x) for x in raw]})
+
+
+async def account_join(request: web.Request) -> web.Response:
+    """A device asks to join an account: kept JOIN_TTL_S for the account's devices to approve (or decline). The code
+    the user compares is computed from the device's keys on both sides: the service cannot swap them unnoticed."""
+    me, data = await signed_json(request)
+    fp, dev = need_fp(data), data.get("device")
+    if not isinstance(dev, dict) or dev.get("id") != me or not dev.get("sign_pub") or not dev.get("box_pub"):
+        raise _http(400, "`device`: the signer's own id and keys")
+    r = request.app["redis"]
+    if not await r.exists(f"mmbox:acct:{fp}:state"):
+        raise _http(404, "no such account on this service")
+    rec = {k: str(dev[k])[:200] for k in ("id", "sign_pub", "box_pub", "label", "host", "user") if dev.get(k)}
+    await r.set(f"mmbox:acct:{fp}:join:{me}", json.dumps({**rec, "at": int(time.time())}), ex=JOIN_TTL_S)
+    return ok({"waiting_s": JOIN_TTL_S})
+
+
+async def account_joins(request: web.Request) -> web.Response:
+    """The pending join requests of an account, for its active devices only."""
+    me, data = await signed_json(request)
+    fp = need_fp(data)
+    r = request.app["redis"]
+    st = await account_state(r, fp)
+    if me not in (st.get("devices") or {}) or me in (st.get("revoked") or []):
+        raise _http(403, "the join requests are for the account's devices")
+    out = []
+    async for k in r.scan_iter(f"mmbox:acct:{fp}:join:*"):
+        if (v := _loads(await r.get(k))) is not None:
+            out.append(v)
+    return ok({"joins": out})
+
+
+async def account_join_clear(request: web.Request) -> web.Response:
+    """A join request handled (approved: its add link is in the chain; or declined), by a device of the account or
+    by the requesting device itself."""
+    me, data = await signed_json(request)
+    fp, dev = need_fp(data), need(data, "device", ID_RE)
+    r = request.app["redis"]
+    st = await account_state(r, fp)
+    if me != dev and (me not in (st.get("devices") or {}) or me in (st.get("revoked") or [])):
+        raise _http(403, "for the account's devices, or the requesting device")
+    await r.delete(f"mmbox:acct:{fp}:join:{dev}")
+    return ok({})
+
+
 async def box_open(request: web.Request) -> web.Response:
     """A box says what it is (role, its machine box, its project) and that it is open: in the table of active boxes
     at once, without any message to anyone. Called again by a box that reopens."""
@@ -1025,7 +1186,7 @@ async def boxes(request: web.Request) -> web.Response:
     me, _ = await signed_json(request)
     r = request.app["redis"]
     seen = await r.hgetall("mmbox:seen")
-    if me not in OPERATORS:
+    if not await is_operator(request.app["redis"], me):
         allowed = {me} | set(await r.hgetall(f"mmbox:links:{me}"))
     else:
         allowed = None
@@ -1055,7 +1216,7 @@ async def boxes(request: web.Request) -> web.Response:
 async def col_read(request: web.Request) -> web.Response:
     """The collector's journal, for an operator: after `since` (exclusive), or the last `tail` events."""
     me, data = await signed_json(request)
-    if me not in OPERATORS:
+    if not await is_operator(request.app["redis"], me):
         raise _http(403, "the collector is read by the service's operators only (MMBOX_OPERATORS)")
     if not COLLECTOR:
         raise _http(404, "no collector on this service (MMBOX_COLLECTOR)")
@@ -1080,7 +1241,7 @@ async def col_config(request: web.Request) -> web.Response:
     """The collector's retention, for an operator: read it with its figures, change keep_days, hold every entry 48 h
     more (`hold_hours`), or purge it all (`purge`). `stats` counts what goes within `soon_s` (e.g. 30 % of keep)."""
     me, data = await signed_json(request)
-    if me not in OPERATORS:
+    if not await is_operator(request.app["redis"], me):
         raise _http(403, "the collector is set by the service's operators only (MMBOX_OPERATORS)")
     if not COLLECTOR:
         raise _http(404, "no collector on this service (MMBOX_COLLECTOR)")
@@ -1205,7 +1366,9 @@ def make_app() -> web.Application:
                      ("/v1/chan/post", chan_post), ("/v1/chan/read", chan_read), ("/v1/box/open", box_open),
                      ("/v1/box/close", box_close), ("/v1/boxes", boxes), ("/v1/col/read", col_read),
                      ("/v1/box/activity", box_activity), ("/v1/col/config", col_config), ("/v1/stats", stats),
-                     ("/v1/usage", usage)):
+                     ("/v1/usage", usage), ("/v1/account/link", account_link), ("/v1/account/chain", account_chain),
+                     ("/v1/account/join", account_join), ("/v1/account/joins", account_joins),
+                     ("/v1/account/join/clear", account_join_clear)):
         app.router.add_post(path, fn)
     return app
 
