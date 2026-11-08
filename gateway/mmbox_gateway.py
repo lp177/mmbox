@@ -915,6 +915,24 @@ def title_of(v) -> str | None:
 BOX_ROLES = ("machine", "session", "project", "butler")  # a project box and the butler are children of a machine box
 
 
+def inventory_of(v) -> dict | None:
+    """What a butler's box says its computer runs (its agents, their versions and models), cut to size."""
+    if not isinstance(v, dict):
+        return None
+    agents = []
+    for a in (v.get("agents") if isinstance(v.get("agents"), list) else [])[:12]:
+        if not isinstance(a, dict) or not _s(a.get("agent"), 40):
+            continue
+        agents.append({"agent": _s(a.get("agent"), 40), "provider": _s(a.get("provider"), 40),
+                       "version": _s(a.get("version"), 80), "available": bool(a.get("available")),
+                       "logged_in": a.get("logged_in") if isinstance(a.get("logged_in"), bool) else None,
+                       "can_start": bool(a.get("can_start")), "models_source": _s(a.get("models_source"), 80),
+                       "models": [m[:80] for m in (a.get("models") if isinstance(a.get("models"), list) else [])[:40]
+                                  if isinstance(m, str) and m]})
+    at = v.get("at")
+    return {"at": float(at) if isinstance(at, (int, float)) else None, "tmux": bool(v.get("tmux")), "agents": agents}
+
+
 def box_info(info) -> dict:
     """What a box may declare of itself, cut to size: nothing here is trusted beyond being said by the box's key."""
     if not isinstance(info, dict):
@@ -929,7 +947,8 @@ def box_info(info) -> dict:
            "provider": _s(info.get("provider"), 40), "model": _s(info.get("model"), 80),
            "host": {k: _s(host.get(k), 120) for k in ("hostname", "os", "machine_hash") if _s(host.get(k), 120)},
            "client": {"v": _s(client.get("v"), 20), "caps": [str(c)[:20] for c in (client.get("caps") or [])[:20]
-                                                             if isinstance(c, str)]}}
+                                                             if isinstance(c, str)]},
+           "inventory": inventory_of(info.get("inventory")) if info.get("role") == "butler" else None}
     return {k: v for k, v in out.items() if v not in (None, {}, "")}
 
 
@@ -958,7 +977,8 @@ async def box_open(request: web.Request) -> web.Response:
         p.set(f"mmbox:box:{me}", json.dumps(rec, ensure_ascii=False), ex=IDLE_TTL)
         p.hset("mmbox:seen", me, now_ms)
         await p.execute()
-    if old.get("closed_ms") or not old or {k: old.get(k) for k in info} != info:
+    if old.get("closed_ms") or not old or {k: old.get(k) for k in info if k != "inventory"} != \
+            {k: v for k, v in info.items() if k != "inventory"}:  # a butler's new inventory is no opening
         await col(r, {"ev": "open", "box": me, "info": rec})
     return ok({"box": rec, "ttl_s": BOX_TTL_S})
 

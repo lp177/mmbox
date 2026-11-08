@@ -223,5 +223,17 @@ box for a session the operator starts.
 - **Console**: the Butler tab (state, run it with the console: on by default; chat; new session with folder, agent,
   model, title, first task; the sessions it started, with "End the session"; the inventory; the live output, filtered,
   paused); this computer's menu has "Refresh agents and models".
+- **Every computer's inventory**: the butler declares a compact inventory with its box (`inventory` in its
+  declaration: agents, versions, logged in, models, the probe's time), kept by the services' table of active boxes
+  (a new inventory is no "open" event for the collector). An operator's console shows every butler's; a refresh of
+  another computer's is asked to its butler through this computer's machine box (`{"op": "inventory", "refresh":
+  true, "quiet": true}`: done, no answer, the table shows it).
+- **Console, from the explorer**: on each computer its butler comes first, highlighted; a computer without one shows
+  "Start a butler…", which opens its agent and model with Cancel and Launch (this computer: run with the console;
+  another: a task to its machine box, which a session there carries out). "New session…" above the list, when a
+  computer, a project or a box is selected, opens the computer, the project (or a folder here), the agent and model
+  (the Settings' defaults), title and first task; on another computer its butler starts it (`{"op": "start",
+  "project": …, "quiet": true}`). Settings: the butler's agent and model (butler.json), the sessions' default agent
+  and model, the butler with the console.
 - **Tests**: `MMBOX_BUTLER_CLI_<AGENT>` replaces an agent's CLI (a command line), so that a bench runs without real
   agents.

@@ -137,6 +137,7 @@
         <section id="held-banner" class="held-banner" aria-labelledby="held-title" hidden></section>
         <div class="list-head">
           <p id="list-count" class="dim" role="status" aria-live="polite"></p>
+          <button class="btn small ripple" type="button" id="new-session-btn" hidden title="Start a session on this computer or project (its butler starts it)">New session…</button>
           <p id="scope" class="scope"></p>
         </div>
         <div id="list" class="list" role="listbox" aria-label="Messages" tabindex="0"></div>
@@ -298,6 +299,11 @@
             </table>
           </div>
         </section>
+        <section class="card butler-all-card" aria-labelledby="butler-all-title">
+          <h3 id="butler-all-title">Butlers of every computer</h3>
+          <p class="dim">What each computer's butler declares with its box, on the services where this console is an operator: its agents, their versions and models. Refresh asks it through this computer's machine box (it acts when that box has the Execute right there).</p>
+          <div id="butler-all" class="butler-all"></div>
+        </section>
         <section class="card butler-out-card" aria-labelledby="butler-out-title">
           <h3 id="butler-out-title">Live output</h3>
           <div class="row">
@@ -312,6 +318,21 @@
     <!-- Settings -->
     <section id="view-settings" class="view" role="tabpanel" aria-labelledby="tab-settings" hidden>
       <div class="cards">
+        <section class="card" aria-labelledby="set-butler">
+          <h3 id="set-butler">Butler and new sessions</h3>
+          <label class="switch-row"><input type="checkbox" role="switch" id="sb-run" class="switch"> <span>Run this computer's butler with the console</span></label>
+          <p class="dim">What the butler of this computer thinks with (its own agent turns: today Claude Code only).</p>
+          <div class="row">
+            <div class="field"><select id="sb-agent"></select><label for="sb-agent">Butler's agent</label></div>
+            <div class="field"><input id="sb-model" list="sb-models" placeholder=" " autocomplete="off"><datalist id="sb-models"></datalist><label for="sb-model">Butler's model</label></div>
+          </div>
+          <p class="dim">What a new session runs on by default (the New session dialog starts from these; each computer offers what it has).</p>
+          <div class="row">
+            <div class="field"><select id="ss-agent"></select><label for="ss-agent">Sessions' agent</label></div>
+            <div class="field"><input id="ss-model" list="ss-models" placeholder=" " autocomplete="off"><datalist id="ss-models"></datalist><label for="ss-model">Sessions' model</label></div>
+          </div>
+          <p id="sb-out" class="dim" role="status"></p>
+        </section>
         <section class="card" aria-labelledby="set-notif">
           <h3 id="set-notif">Alerts of this console</h3>
           <label class="switch-row"><input type="checkbox" role="switch" id="n-desktop" class="switch"> <span>Desktop notifications</span></label>
@@ -553,6 +574,43 @@
   </dialog>
 
   <!-- A box: who it is, what it does -->
+  <!-- Start a computer's butler: its agent and model, then Launch -->
+  <dialog id="butler-launch" aria-labelledby="bl-title" closedby="any">
+    <form method="dialog" class="dialog-body" id="bl-form">
+      <h2 id="bl-title">Start the butler</h2>
+      <p id="bl-text" class="dim"></p>
+      <div class="row">
+        <div class="field"><select id="bl-agent"></select><label for="bl-agent">Agent</label></div>
+        <div class="field"><input id="bl-model" list="bl-models" placeholder=" " autocomplete="off"><datalist id="bl-models"></datalist><label for="bl-model">Model</label></div>
+      </div>
+      <div class="actions">
+        <button class="btn ripple" value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button class="btn filled ripple" value="launch" type="submit" id="bl-go" autofocus>Launch</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Start a session: computer, project or folder, agent, model, title, first task -->
+  <dialog id="session-dialog" aria-labelledby="sd-title" closedby="any">
+    <form method="dialog" class="dialog-body" id="sd-form">
+      <h2 id="sd-title">New session</h2>
+      <div class="field"><select id="sd-machine"></select><label for="sd-machine">Computer</label></div>
+      <div class="field"><select id="sd-project"></select><label for="sd-project">Project</label></div>
+      <div class="field" id="sd-path-field"><input id="sd-path" placeholder=" " autocomplete="off"><label for="sd-path">Or a folder of this computer (under a root of butler.json)</label></div>
+      <div class="row">
+        <div class="field"><select id="sd-agent"></select><label for="sd-agent">Agent</label></div>
+        <div class="field"><input id="sd-model" list="sd-models" placeholder=" " autocomplete="off"><datalist id="sd-models"></datalist><label for="sd-model">Model</label></div>
+      </div>
+      <div class="field"><input id="sd-title-in" maxlength="60" placeholder=" "><label for="sd-title-in">Title (three words at most)</label></div>
+      <div class="field"><textarea id="sd-task" rows="3" placeholder=" "></textarea><label for="sd-task">First task (optional)</label></div>
+      <p id="sd-note" class="dim" role="status"></p>
+      <div class="actions">
+        <button class="btn ripple" value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button class="btn filled ripple" value="start" type="submit" id="sd-go">Start the session</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="box-dialog" aria-labelledby="box-title" closedby="any">
     <form method="dialog" class="dialog-body">
       <h2 id="box-title">Box</h2>

@@ -239,14 +239,14 @@ function groupKey(m) {
 }
 
 // ---------------------------------------------------------------- rendering: the tree
-function treeItem({ id, type, key, icon, name, sub, badge, held, dot, children, level, extra }) {
+function treeItem({ id, type, key, icon, name, sub, badge, held, dot, children, level, extra, cls }) {
   const hasKids = children && children.length;
   const r = rightsOf({ type, key });
   const li = h("li", { role: "treeitem", id: "t-" + id, "aria-level": level, "aria-selected": String(S.node.type === type && S.node.key === key),
     "aria-expanded": hasKids ? String(S.expanded.has(id)) : null, tabindex: "-1", dataset: { type, key: key ?? "", nid: id },
     "aria-keyshortcuts": r ? "Shift+F10" : null, "aria-description": r ? (r.noRights ? "menu: Shift+F10" : `handling: ${RIGHTS_TXT[r.rights] || "as the workstations say"} (menu: Shift+F10)`) : null });
   const showChip = r && r.rights && (type === "machine" || r.source === "own" || r.network || r.otherProject);
-  const node = h("div", { class: "node ripple" + (held ? " held" : "") },
+  const node = h("div", { class: "node ripple" + (held ? " held" : "") + (cls ? " " + cls : "") },
     h("span", { class: "twist" }, hasKids ? svg(ICON.chevron) : null),
     dot ? h("span", { class: "dot " + dot, title: { listening: "listening", active: "active", closed: "closed", paused: "receiving stopped" }[dot] || "" }) : null,
     svg(ICON[icon] || ICON.box),
@@ -280,18 +280,23 @@ function renderTree() {
     if (!machines.has(mk)) machines.set(mk, { box: null, projects: new Map() });
     const M = machines.get(mk);
     if (b.role === "machine") M.box = b;
+    else if (b.role === "butler") M.butler = b;  // first of its machine, highlighted
     else { const wp = b.work || ""; if (!M.projects.has(wp)) M.projects.set(wp, []); M.projects.get(wp).push(b); }  // a project box: first of its folder
   }
   const dotOf = (b) => (b.closed_at || b.retired_at ? "closed" : b.listening || b.listening_here ? "listening" : b.active ? "active" : "");
   const sum = (ids) => ids.reduce((n, id) => n + (unread.get(id) || 0), 0);
   const match = (b) => !q || [b.title, b.label, b.id, b.alias, b.work, b.hostname, b.profile, b.activity, b.provider, b.model].join(" ").toLowerCase().includes(q);
-  const boxItem = (b, level, pre = "b") => treeItem({ id: pre + b.id, type: "box", key: b.id, icon: b.role === "machine" ? "mbox" : isProjectBox(b) ? "pbox" : "box", level,
-    name: isProjectBox(b) ? (pre === "pj" ? b.work || b.label : "Project box") : b.title || b.label || b.alias || b.id,
+  const boxItem = (b, level, pre = "b") => treeItem({ id: pre + b.id, type: "box", key: b.id, icon: b.role === "machine" ? "mbox" : isProjectBox(b) ? "pbox" : b.role === "butler" ? "model" : "box", level,
+    cls: b.role === "butler" ? "butler" : null,
+    name: b.role === "butler" ? "Butler" : isProjectBox(b) ? (pre === "pj" ? b.work || b.label : "Project box") : b.title || b.label || b.alias || b.id,
     sub: isProjectBox(b) ? (pre === "pj" ? machineName(machineKey(b)) : "waits for a session of the project")
       : [b.title ? (b.label || b.id) : b.local ? (b.profile === "default" ? "here" : b.profile) : null, b.role !== "machine" ? b.model : null].filter(Boolean).join(" · ") || null,
     badge: unread.get(b.id), held: heldTo.get(b.id), dot: dotOf(b) });
   const mItems = [...machines.entries()].sort((a, b) => machineName(a[0]).localeCompare(machineName(b[0]))).map(([mk, M]) => {
     const kids = [];
+    if (M.butler) kids.push(boxItem(M.butler, 3));
+    else if (M.box && !q) kids.push(treeItem({ id: "bs" + mk, type: "butler-start", key: mk, icon: "model", level: 3, cls: "butler-start",
+      name: "Start a butler…", sub: "none runs on this computer" }));
     if (M.box && match(M.box)) kids.push(boxItem(M.box, 3));
     for (const [wp, bs] of [...M.projects.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
       const shown = bs.filter(match).sort((a, b) => isProjectBox(b) - isProjectBox(a) || (a.label || "").localeCompare(b.label || ""));
@@ -301,7 +306,7 @@ function renderTree() {
         sub: `${shown.filter((b) => !isProjectBox(b)).length}`, badge: sum(bs.map((b) => b.id)) || null, held: heldSum(bs.map((b) => b.id)), children: shown.map((b) => boxItem(b, 4)) }));
     }
     if (!kids.length && q) return null;
-    const all = [M.box, ...[...M.projects.values()].flat()].filter(Boolean);
+    const all = [M.box, M.butler, ...[...M.projects.values()].flat()].filter(Boolean);
     const live = all.some((b) => b.listening || b.listening_here);
     return treeItem({ id: "m" + mk, type: "machine", key: mk, icon: "machine", level: 2, name: machineName(mk),
       sub: M.box && M.box.label && M.box.label !== machineName(mk) ? M.box.label : null, badge: sum(all.map((b) => b.id)) || null, held: heldSum(all.map((b) => b.id)),
@@ -310,7 +315,7 @@ function renderTree() {
   // Models: provider, then model, then the session boxes running it (machine boxes and the console run no model)
   const providers = new Map();
   for (const b of S.boxes.values()) {
-    if (b.role === "machine" || b.role === "operator" || isProjectBox(b) || (F.treeActive && !isActive(b)) || !match(b)) continue;
+    if (b.role === "machine" || b.role === "operator" || b.role === "butler" || isProjectBox(b) || (F.treeActive && !isActive(b)) || !match(b)) continue;
     const p = providerOf(b);
     if (!providers.has(p)) providers.set(p, new Map());
     const ms = providers.get(p);
@@ -355,6 +360,7 @@ function selectNode(li) {
   const type = li.dataset.type;
   if (type === "group") { toggle(li); return; }
   if (type === "held") { showHeld(); return; }
+  if (type === "butler-start") { openButlerLaunch(li.dataset.key); return; }
   S.node = { type, key: li.dataset.key || null };
   S.limit = 300;
   closeReader(false);
@@ -429,7 +435,9 @@ function rightsOf(node) {
           following: !op.computer, title: "The sessions of other projects on this computer" } : null } : null;
     }
     const b = S.boxes.get(node.key);
-    return b?.rights ? { target: b.id, rights: b.rights.rights, source: b.rights.source, title: `Messages from ${machineName(node.key)} and its sessions` + networkNote(b) } : null;
+    const butler = [...S.boxes.values()].find((x) => x.role === "butler" && !x.local && machineKey(x) === node.key);
+    return b?.rights ? { target: b.id, rights: b.rights.rights, source: b.rights.source, butler: !!butler, butlerBox: butler?.id,
+      title: `Messages from ${machineName(node.key)} and its sessions` + networkNote(b) } : null;
   }
   if (node.type === "server") {
     const net = snap.service_rights?.[node.key];
@@ -652,9 +660,9 @@ const BOX_ACT = {
     "Delete", "box_delete"],
 };
 RM.el.addEventListener("click", async (e) => {
-  if (e.target.closest("#rights-butler")) {  // this computer's menu: the butler probes its agents and models now
+  if (e.target.closest("#rights-butler")) {  // a computer's menu: its butler probes its agents and models now
     RM.el.hidePopover();
-    const r = await action({ action: "butler_refresh" });
+    const r = await action(RM.r?.butlerBox ? { action: "butler_refresh", box: RM.r.butlerBox } : { action: "butler_refresh" });
     toast(r.ok ? (r.out || "Probed") : "Refresh failed: " + (r.err || "?"));
     return;
   }
@@ -959,6 +967,7 @@ function renderList() {
   const span = { 3600: " over 1 hour", 86400: " over 24 hours", 604800: " over 7 days" }[F.period] || "";
   const waitingN = rows.filter((m) => !m.broadcast && WAITING_STATES.includes(m.state)).length;
   $("#list-count").textContent = `${rows.length} message(s)${span} · ${waitingN} waiting` + (rows.length > S.limit ? ` · ${S.limit} shown` : "");
+  $("#new-session-btn").hidden = !["machine", "project", "box", "projects"].includes(S.node.type);
   $("#list-count").title = "The history of the boxes of this computer and of the collectors, with the filters above; \"waiting\": still in a box (queued, sent, unread or taken). The Memory view purges what no longer waits.";
   $("#scope").textContent = nodeLabel(S.node);
   const frag = document.createDocumentFragment();
@@ -1570,6 +1579,7 @@ function showTab(name) {
     $("#" + t.getAttribute("aria-controls")).hidden = !on;
   }
   butlerTab(name === "butler");
+  if (name === "settings" && token) loadButlerSettings();
   localStorage.setItem("mmbox-console-tab", name);
 }
 $(".tabs").addEventListener("click", (e) => { const t = e.target.closest(".tab"); if (t) showTab(t.id.slice(4)); });
@@ -2281,6 +2291,31 @@ async function butlerLoad() {
   renderButlerInventory(d.inventory || {});
   renderButlerForm(d);
   renderButlerStarted(d.started || {});
+  renderButlerAll();
+}
+// every computer's butler, from the boxes the services' tables and this computer know (role butler, its inventory)
+function renderButlerAll() {
+  const bs = [...S.boxes.values()].filter((b) => b.role === "butler")
+    .sort((a, b) => (!a.local) - (!b.local) || machineName(machineKey(a)).localeCompare(machineName(machineKey(b))));
+  $("#butler-all").replaceChildren(...(bs.length ? bs.map((b) => {
+    const inv = b.inventory || {}, ag = (inv.agents || []).filter((a) => a.available);
+    const live = b.local ? !!BT.data?.running : b.listening || b.active;
+    return h("article", { class: "butler-one" },
+      h("header", {}, h("span", { class: "dot " + (live ? "listening" : b.closed_at ? "closed" : ""), title: live ? "running" : "not running" }),
+        h("strong", {}, machineName(machineKey(b))), b.local ? h("span", { class: "chip info" }, "this computer") : null,
+        h("button", { class: "btn small text ripple", type: "button", onclick: (e) => butlerRefreshOne(e.currentTarget, b) }, "Refresh")),
+      h("div", { class: "dim" }, inv.at ? `probed ${fmtFull.format(new Date(inv.at * 1000))}` + (inv.tmux === false ? " · no tmux" : "") : "no inventory declared yet (an older client, or never probed)"),
+      ag.length ? h("ul", {}, ...ag.map((a) => h("li", {}, h("strong", {}, a.agent), ` ${a.version || ""}`,
+        a.logged_in === false ? h("span", { class: "chip stopped" }, "not logged in") : null,
+        h("div", { class: "dim" }, (a.models || []).join(", ") || "models unknown")))) : null);
+  }) : [h("p", { class: "dim" }, "No butler known yet: a computer has one once `mmbox.py butler run` ran there (its console runs it).")]));
+}
+async function butlerRefreshOne(btn, b) {
+  btn.classList.add("loading"); btn.setAttribute("aria-busy", "true");
+  const r = await action(b.local ? { action: "butler_refresh" } : { action: "butler_refresh", box: b.id });
+  btn.classList.remove("loading"); btn.removeAttribute("aria-busy");
+  toast(r.ok ? (r.out || "Probed") : "Refresh failed: " + (r.err || "?"));
+  setTimeout(() => { poll(true); butlerLoad(); }, 4000);
 }
 function renderButlerChat(chat) {
   const log = $("#butler-chat-log"), stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
@@ -2411,6 +2446,122 @@ $("#butler-new").addEventListener("submit", async (e) => {
   $("#bn-out").textContent = r.ok ? `Started: box ${r.profile} (${r.box}), tmux ${r.tmux}. It listens within a minute or so (see below).` : `Not started: ${r.err || "?"}`;
   if (r.ok) { $("#bn-task").value = ""; $("#bn-title").value = ""; }
   butlerLoad();
+});
+
+// ---------------------------------------------------------------- a computer's butler, and a new session from the explorer
+// What the console knows of a computer (machine key): its machine box, its butler and its inventory, its projects.
+function machineInfo(mk) {
+  const bs = [...S.boxes.values()].filter((b) => machineKey(b) === mk);
+  const mbox = bs.find((b) => b.role === "machine"), butler = bs.find((b) => b.role === "butler");
+  const local = !!(mbox?.local || butler?.local);
+  const inv = (local ? BT.data?.inventory : null) || butler?.inventory || {};
+  const projects = new Set(bs.filter((b) => b.work && b.role !== "machine" && b.role !== "butler").map((b) => b.work.toLowerCase()));
+  if (local) Object.keys(BT.data?.folders || {}).forEach((k) => projects.add(k));
+  return { mk, mbox, butler, local, inv, projects: [...projects].sort() };
+}
+const startable = (inv) => (inv.agents || []).filter((a) => a.available && a.can_start);
+function fillAgentModel(agentSel, modelIn, list, agents, want = {}) {
+  agentSel.replaceChildren(...(agents.length ? agents.map((a) => h("option", { value: a.agent }, a.agent + (a.logged_in === false ? " (not logged in)" : "")))
+    : [h("option", { value: "" }, "no agent known (inventory not declared)")]));
+  if (want.agent && agents.some((a) => a.agent === want.agent)) agentSel.value = want.agent;
+  const pick = () => {
+    const a = agents.find((x) => x.agent === agentSel.value);
+    list.replaceChildren(...(a?.models || []).map((m) => h("option", { value: m })));
+    modelIn.value = (want.model && agentSel.value === want.agent) ? want.model : (a?.models || [])[0] || "";
+  };
+  agentSel.onchange = () => { want = {}; pick(); };
+  pick();
+}
+async function ensureButlerData() { if (!BT.data) { try { BT.data = await api("/api/butler"); } catch { /* the dialog says what it lacks */ } } }
+async function openButlerLaunch(mk) {
+  await ensureButlerData();
+  const info = machineInfo(mk), set = BT.data?.settings || {};
+  const inv = info.local ? (BT.data?.inventory || {}) : info.inv;
+  $("#bl-title").textContent = `Start the butler of ${machineName(mk)}`;
+  $("#bl-text").textContent = info.local
+    ? "It runs with this console (Settings), takes what no session took for 5 min, starts sessions and keeps the list of this computer's agents and models. Its own thinking uses the agent and model below."
+    : "This console cannot start a program on another computer: it asks that computer's machine box, and a session there starts the butler (as a systemd user service on Linux). It takes effect once a session of that computer handles the request.";
+  fillAgentModel($("#bl-agent"), $("#bl-model"), $("#bl-models"), (inv.agents || []).filter((a) => a.available && a.agent === "claude-code").length
+    ? (inv.agents || []).filter((a) => a.available && a.agent === "claude-code") : [{ agent: "claude-code", models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"], available: true }],
+    { agent: set.butler_agent || "claude-code", model: set.butler_model });
+  const dlg = $("#butler-launch");
+  dlg.returnValue = "";
+  dlg.addEventListener("close", async () => {
+    if (dlg.returnValue !== "launch") return;
+    const r = await action({ action: "butler_launch", machine: info.local ? "" : info.mbox?.id, agent: $("#bl-agent").value, model: $("#bl-model").value.trim() });
+    toast(r.ok ? (r.out || "The butler starts") : "Not started: " + (r.err || "?"));
+    setTimeout(() => { poll(true); butlerLoad(); }, 3000);
+  }, { once: true });
+  dlg.showModal();
+}
+async function openSessionDialog(pre = {}) {
+  await ensureButlerData();
+  const machines = [...new Set([...S.boxes.values()].filter((b) => b.role === "machine").map(machineKey))]
+    .map(machineInfo).sort((a, b) => b.local - a.local || machineName(a.mk).localeCompare(machineName(b.mk)));
+  const ms = $("#sd-machine");
+  ms.replaceChildren(...machines.map((m) => h("option", { value: m.mk, disabled: !m.local && !m.butler },
+    machineName(m.mk) + (m.local ? " (this computer)" : m.butler ? "" : " (no butler: start one first)"))));
+  ms.value = machines.some((m) => m.mk === pre.mk && (m.local || m.butler)) ? pre.mk : (machines.find((m) => m.local) || machines[0])?.mk || "";
+  let wantProject = (pre.project || "").toLowerCase();
+  const fill = () => {
+    const info = machineInfo(ms.value), set = BT.data?.settings || {};
+    const ps = $("#sd-project");
+    ps.replaceChildren(h("option", { value: "" }, info.local ? "— a folder below —" : "— choose —"), ...info.projects.map((p) => h("option", { value: p }, p)));
+    if (wantProject && info.projects.includes(wantProject)) ps.value = wantProject;
+    $("#sd-path-field").hidden = !info.local;
+    fillAgentModel($("#sd-agent"), $("#sd-model"), $("#sd-models"), startable(info.local ? (BT.data?.inventory || {}) : info.inv),
+      { agent: set.session_agent, model: set.session_model });
+    $("#sd-note").textContent = info.local ? "Started here by the butler's command: its box first, then the agent in a tmux session, in its no-prompt mode."
+      : `Asked to the butler of ${machineName(info.mk)} (it acts when this computer's machine box has the Execute right there); the new box shows in the explorer once it listens.`;
+    $("#sd-go").disabled = !$("#sd-agent").value;
+  };
+  ms.onchange = () => { wantProject = $("#sd-project").value; fill(); };
+  fill();
+  $("#sd-path").value = ""; $("#sd-title-in").value = ""; $("#sd-task").value = "";
+  const dlg = $("#session-dialog");
+  dlg.returnValue = "";
+  dlg.addEventListener("close", async () => {
+    if (dlg.returnValue !== "start") return;
+    const info = machineInfo(ms.value);
+    const body = { action: "butler_start", project: $("#sd-project").value, path: info.local ? $("#sd-path").value.trim() : "",
+      agent: $("#sd-agent").value, model: $("#sd-model").value.trim(), title: $("#sd-title-in").value.trim(), task: $("#sd-task").value.trim(),
+      ...(info.local ? {} : { butler: info.butler?.id }) };
+    if (!body.project && !body.path) { toast("Choose a project, or write a folder"); return; }
+    const r = await action(body);
+    toast(r.ok ? (r.out || `Started: box ${r.profile}, tmux ${r.tmux}`) : "Not started: " + (r.err || "?"));
+    setTimeout(() => { poll(true); butlerLoad(); }, 3000);
+  }, { once: true });
+  dlg.showModal();
+}
+$("#new-session-btn").addEventListener("click", () => {
+  const n = S.node;
+  if (n.type === "machine") return openSessionDialog({ mk: n.key });
+  if (n.type === "project") { const [mk, wp] = n.key.split("\u0000"); return openSessionDialog({ mk, project: wp }); }
+  if (n.type === "box") { const b = boxOf(n.key); return openSessionDialog({ mk: machineKey(b), project: b.work }); }
+  return openSessionDialog({});
+});
+// Settings: the butler's agent and model, a new session's defaults, the butler with the console
+async function loadButlerSettings() {
+  await ensureButlerData();
+  const d = BT.data || {}, set = d.settings || {}, inv = d.inventory || {};
+  $("#sb-run").checked = !!d.run_with_console;
+  fillAgentModel($("#sb-agent"), $("#sb-model"), $("#sb-models"), (inv.agents || []).filter((a) => a.available && a.agent === "claude-code"),
+    { agent: set.butler_agent || "claude-code", model: set.butler_model });
+  fillAgentModel($("#ss-agent"), $("#ss-model"), $("#ss-models"), startable(inv), { agent: set.session_agent, model: set.session_model });
+  const save = async (what) => {
+    const r = await action({ action: "butler_settings", butler_agent: $("#sb-agent").value, butler_model: $("#sb-model").value.trim(),
+      session_agent: $("#ss-agent").value, session_model: $("#ss-model").value.trim() });
+    $("#sb-out").textContent = r.ok ? `${what} saved` : "Not saved: " + (r.err || "?");
+    BT.data = null; await ensureButlerData();
+  };
+  if (BT.settingsBound) { BT.save = save; return; }
+  BT.settingsBound = true; BT.save = save;
+  for (const [el, what] of [["#sb-agent", "The butler's agent"], ["#sb-model", "The butler's model"], ["#ss-agent", "The sessions' agent"], ["#ss-model", "The sessions' model"]])
+    $(el).addEventListener("change", () => BT.save(what));
+}
+$("#sb-run").addEventListener("change", async (e) => {
+  const r = await action({ action: "butler_run", on: e.target.checked });
+  $("#sb-out").textContent = r.ok ? (e.target.checked ? "The butler runs with the console" : "The butler is stopped") : "Failed: " + (r.err || "?");
 });
 
 showTab(DEEP.get("tab") || localStorage.getItem("mmbox-console-tab") || "messages");

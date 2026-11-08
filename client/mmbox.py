@@ -1252,7 +1252,9 @@ def box_declaration(me: "Me") -> dict:
             "title": me.conf.get("title"), "activity": me.conf.get("activity"),
             "provider": me.conf.get("provider"), "model": me.conf.get("model"),
             "host": {"hostname": socket.gethostname(), "os": platform.system().lower(), "machine_hash": machine_hash()},
-            "client": {"v": str(VERSION), "caps": CAPS}}
+            "client": {"v": str(VERSION), "caps": CAPS},
+            # the butler's box also says which agents and models its computer runs (mmbox_butler.py, every 6 h)
+            **({"inventory": me.conf["inventory"]} if me.role == "butler" and isinstance(me.conf.get("inventory"), dict) else {})}
 
 
 ACTIVITY_MAX = 600  # two or three sentences

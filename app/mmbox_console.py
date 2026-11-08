@@ -1453,7 +1453,18 @@ class State:
     def butler_state(self) -> dict:
         if not B:
             return {"available": False, "why": "the client has no butler yet (mmbox_butler.py): update it (mmbox-update)"}
-        return {"available": True, "run_with_console": self.butler_on(), **B.status(), "chat": B.chat_history(200)}
+        c = B.config()
+        return {"available": True, "run_with_console": self.butler_on(), **B.status(), "chat": B.chat_history(200),
+                "settings": {"butler_agent": c.get("agent"), "butler_model": c.get("model"),
+                             "session_agent": self.console_state.get("session_agent"),
+                             "session_model": self.console_state.get("session_model")}}
+
+    @staticmethod
+    def _remote(kind: str, target: str, subject: str, body: str) -> dict:
+        """A message from this computer's machine box to another computer (its butler, or its machine box)."""
+        r = run_client(["--profile", M.MACHINE_PROFILE, "send", target, "--kind", kind, "--subject", subject,
+                        "--body", body] + (["--for", "machine"] if kind == "task" else []), timeout=60)
+        return {"ok": r.get("ok"), "err": None if r.get("ok") else (r.get("err") or r.get("out") or "")[-600:]}
 
     @staticmethod
     def butler_log(since: int) -> dict:
@@ -1489,8 +1500,39 @@ class State:
                 f.write(text + "\x1e")
             self.ensure_butler()
             return {"ok": True, "running": B.status().get("running")}
+        if a == "butler_settings":  # Settings: what the butler thinks with, what a new session runs on by default
+            c = B.jload("butler.json", {})
+            for k, ck in (("butler_agent", "agent"), ("butler_model", "model")):
+                if k in body:
+                    v = str(body.get(k) or "").strip()[:80]
+                    c.pop(ck, None) if not v else c.__setitem__(ck, v)
+            B.jsave("butler.json", c)
+            for k in ("session_agent", "session_model"):
+                if k in body:
+                    self.console_state[k] = str(body.get(k) or "").strip()[:80] or None
+            self.save_console_state()
+            return {"ok": True}
+        if a == "butler_launch":  # a computer without a butler: this one runs it, another is asked through its machine box
+            mk_local = M.machine_me()
+            target = str(body.get("machine") or "")
+            agent, model = str(body.get("agent") or "").strip(), str(body.get("model") or "").strip()
+            if not target or (mk_local and target == mk_local.id):
+                self.butler_action("butler_settings", {"butler_agent": agent, "butler_model": model})
+                return self.butler_action("butler_run", {"on": True})
+            text = ("lp177's console asks this computer to run its mmbox butler (client/BUTLER.md), one per computer:\n\n"
+                    + (f"1. Set its agent and model in ~/.local/share/mmbox/butler/butler.json: {json.dumps({'agent': agent, 'model': model})}\n" if agent or model else "")
+                    + "2. Run it for good: `python3 <mmbox client>/mmbox.py butler install --systemd`, then "
+                      "`systemctl --user enable --now mmbox-butler.service` (Linux); elsewhere start `mmbox.py butler run` "
+                      "as a lasting background process (its console runs it too).\n"
+                    + "3. Answer with `mmbox.py butler status` (running, its box id).")
+            r = self._remote("task", target, "Start the mmbox butler of this computer", text)
+            return {**r, "out": "asked its machine box: a session there starts it, its box then shows in the explorer" if r["ok"] else None}
+        if a == "butler_start" and body.get("butler") and not any((y := M.load_me(n)) and y.id == body["butler"] for n in M.local_profiles()):
+            op = {"op": "start", "quiet": True, **{k: body[k] for k in ("path", "project", "agent", "model", "title", "task") if body.get(k)}}
+            r = self._remote("request", str(body["butler"]), "butler: start a session", json.dumps(op, ensure_ascii=False))
+            return {**r, "out": "asked its butler: the new session's box shows in the explorer once it listens" if r["ok"] else None}
         if a == "butler_start":
-            args = ["butler", "start", "--path", str(body.get("path") or "")]
+            args = ["butler", "start", "--path", str(body.get("path") or "")] + (["--project", str(body["project"])] if body.get("project") else [])
             for k in ("agent", "model", "title", "task"):
                 if body.get(k):
                     args += [f"--{k}", str(body[k])]
@@ -1500,6 +1542,14 @@ class State:
             except (ValueError, IndexError):
                 return {"ok": False, "err": (r.get("err") or r.get("out") or "no answer")[-1500:]}
             return {"ok": "error" not in res, **res, "err": res.get("error")}
+        if a == "butler_refresh" and body.get("box") and not any((y := M.load_me(n)) and y.id == body["box"] for n in M.local_profiles()):
+            # another computer's butler: asked through this computer's machine box (it acts if that box has `execute`
+            # rights there); its new inventory comes back in the services' table, not as a message (`quiet`)
+            r = run_client(["--profile", M.MACHINE_PROFILE, "send", str(body["box"]), "--kind", "request",
+                            "--subject", "butler: inventory", "--body", json.dumps({"op": "inventory", "refresh": True, "quiet": True})],
+                           timeout=60)
+            return {"ok": r.get("ok"), "out": "asked; its table entry shows the new inventory within a round or two" if r.get("ok") else None,
+                    "err": None if r.get("ok") else (r.get("err") or r.get("out") or "")[-600:]}
         if a == "butler_refresh":
             if B.status().get("running"):
                 (B.home() / "refresh").touch()
@@ -2005,6 +2055,8 @@ class State:
                         provider=bx.get("provider"), model=bx.get("model"), model_ms=bx.get("opened_ms"))
                 if bx.get("title"):  # fixed while the box is open: the service's word
                     b["title"] = bx["title"]
+                if isinstance(bx.get("inventory"), dict) and (bx["inventory"].get("at") or 0) >= ((b.get("inventory") or {}).get("at") or 0):
+                    b["inventory"] = bx["inventory"]  # a butler's: the agents and models of its computer
                 if bx.get("activity"):
                     box(bx["id"], at_ms=bx.get("activity_ms") or bx.get("last_ms"), activity=bx["activity"])
                 b["active"] = True
@@ -2024,7 +2076,9 @@ class State:
                     at_ms=_ms(y.conf.get("activity_at")), provider=y.conf.get("provider"), model=y.conf.get("model"),
                     model_ms=LOCAL_WINS_MS)  # this computer's own configuration says what it runs on now
             b["local"] = True
-            b["role"] = y.role  # this computer's own configuration: what the box is, whatever an older service said
+            b["role"] = y.role
+            if y.role == "butler" and isinstance(y.conf.get("inventory"), dict):
+                b["inventory"] = y.conf["inventory"]  # this computer's own configuration: what the box is, whatever an older service said
             b["closed_at"] = y.closed_at
             b["listening_here"] = bool(ss["listening"])
             if y.closed_at:

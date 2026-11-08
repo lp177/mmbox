@@ -684,3 +684,16 @@ dialog.att-viewer { width: min(1100px, calc(100vw - 32px)); }
 .butler-out .ln.tool .x { color: var(--warn, #fdd663); }
 .butler-out:focus-visible { outline: 2px solid var(--focus); }
 @media (max-width: 720px) { .butler-grid { grid-template-columns: 1fr; padding: 10px; } .butler-out .ln { grid-template-columns: 60px 1fr; } .butler-out .ln .s { display: none; } }
+.butler-all-card { grid-column: 1 / -1; }
+.butler-all { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.butler-one { background: var(--s2); border-radius: 12px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.butler-one header { display: flex; align-items: center; gap: 8px; }
+.butler-one header strong { flex: 1; }
+.butler-one ul { margin: 0; padding-left: 18px; }
+.butler-one li { overflow-wrap: anywhere; }
+.node.butler { background: rgb(138 180 248 / .10); box-shadow: inset 3px 0 0 var(--primary); }
+.node.butler .name { font-weight: 600; }
+.node.butler-start { color: var(--primary); }
+.list-head { display: flex; align-items: center; gap: 8px; } .list-head #list-count { flex: 1; }
+#session-dialog .dialog-body, #butler-launch .dialog-body { display: flex; flex-direction: column; gap: 10px; min-width: min(560px, 92vw); }
+#session-dialog .row, #butler-launch .row, #view-settings .row { display: flex; gap: 10px; } #session-dialog .row .field, #butler-launch .row .field { flex: 1; }

@@ -165,9 +165,26 @@ def probe() -> dict:
     inv = {"at": time.time(), "host": os.uname().nodename if hasattr(os, "uname") else "", "agents": out,
            "tmux": bool(shutil.which("tmux"))}
     jsave("inventory.json", inv)
+    publish(inv)
     log("daemon", "inventory: " + ", ".join(f"{r['agent']} {r.get('version') or ''} ({len(r.get('models') or [])} model(s))"
                                             for r in out if r["available"]) + ("" if inv["tmux"] else "; no tmux: no session start"))
     return inv
+
+
+def publish(inv: dict) -> None:
+    """The inventory declared with the butler's box: every service's table of active boxes (and so every operator's
+    console) shows it, without a message to anyone."""
+    b = butler_me(create=False)
+    if not b:
+        return
+    keep = ("agent", "provider", "version", "available", "logged_in", "can_start", "models", "models_source")
+    compact = {"at": inv.get("at"), "tmux": inv.get("tmux"),
+               "agents": [{k: a.get(k) for k in keep if a.get(k) is not None} for a in inv.get("agents") or []]}
+    b.local.update("config.json", lambda c: c.__setitem__("inventory", compact))
+    try:
+        M.gw_sync(M.load_me(BUTLER_PROFILE), force=True)
+    except SystemExit:
+        log("error", "inventory not declared to the services (one unreachable?): next probe")
 
 
 def read(p: Path) -> str:
@@ -305,9 +322,14 @@ def tmux_tail(sess: str, lines: int = 40) -> str:
 
 
 def start_session(path: str, agent: str | None = None, model: str | None = None, title: str | None = None,
-                  task: str | None = None, why: str | None = None) -> dict:
-    """A new session in a folder: its box made first (its id known at once), then the agent started in tmux with a
-    first prompt that makes it listen. {box, profile, tmux, state: starting} or {error}."""
+                  task: str | None = None, why: str | None = None, project: str | None = None) -> dict:
+    """A new session in a folder (or the folder of a project this computer knows): its box made first (its id known
+    at once), then the agent started in tmux with a first prompt that makes it listen. {box, profile, tmux, state}"""
+    if not path and project:
+        path = project_folders().get(M.project_key(project) or "") or ""
+        if not path:
+            raise ValueError(f"project {project}: no folder known on this computer (start one session there first, or set "
+                             f"projects.{M.project_key(project)}.path in butler.json)")
     folder = allowed_path(path)
     inv = inventory()
     if not agent:
@@ -670,8 +692,9 @@ def handle_own_box(b, st) -> None:
             continue
         if op:
             reply = do_op(op)
-            M.send_payload(b, it["peer_id"], M.peers_load(b.local)[it["peer_id"]], b.conf.get("project") or "",
-                           f"Re: {p.get('subject', '')}", json.dumps(reply, ensure_ascii=False), "reply", it["id"], False)
+            if not op.get("quiet"):  # `quiet`: no answer (a console asking for a refresh reads the table instead)
+                M.send_payload(b, it["peer_id"], M.peers_load(b.local)[it["peer_id"]], b.conf.get("project") or "",
+                               f"Re: {p.get('subject', '')}", json.dumps(reply, ensure_ascii=False), "reply", it["id"], False)
             log("daemon", f"request {op.get('op')} from {it['peer']}: {json.dumps(reply)[:300]}")
             continue
         buf = io.StringIO()
@@ -690,9 +713,10 @@ def do_op(op: dict) -> dict:
         o = op.get("op")
         if o == "start":
             return start_session(str(op.get("path") or ""), op.get("agent"), op.get("model"), op.get("title"), op.get("task"),
-                                 why=op.get("why") or "asked")
+                                 why=op.get("why") or "asked", project=op.get("project"))
         if o == "inventory":
-            return inventory(refresh=bool(op.get("refresh")))
+            inv = inventory(refresh=bool(op.get("refresh")))
+            return {"at": inv.get("at"), "agents": len(inv.get("agents") or [])} if op.get("quiet") else inv
         if o == "list":
             return {"started": (jload("state.json", {}).get("started") or {})}
         if o == "stop":
@@ -802,7 +826,8 @@ def main(module, argv: list[str]) -> int:
     x = sp.add_parser("inventory", help="the agents and models of this computer (JSON)")
     x.add_argument("--refresh", action="store_true", help="probe now (else the last one, at most 6 h old)")
     x = sp.add_parser("start", help="start a session in a folder (its box first, then the agent in tmux)")
-    x.add_argument("--path", required=True)
+    x.add_argument("--path", default="")
+    x.add_argument("--project", help="instead of --path: a project whose folder this computer knows")
     x.add_argument("--agent")
     x.add_argument("--model")
     x.add_argument("--title")
@@ -824,7 +849,8 @@ def main(module, argv: list[str]) -> int:
         print(json.dumps(inventory(a.refresh), ensure_ascii=False, indent=1))
     elif a.cmd == "start":
         try:
-            print(json.dumps(start_session(a.path, a.agent, a.model, a.title, a.task, why="asked"), ensure_ascii=False))
+            print(json.dumps(start_session(a.path, a.agent, a.model, a.title, a.task, why="asked", project=a.project),
+                             ensure_ascii=False))
         except (ValueError, RuntimeError) as e:
             print(json.dumps({"error": str(e)}))
             return 1
