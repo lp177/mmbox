@@ -2,7 +2,7 @@
 # Deploy the mmbox service on a host of one's own as Quadlet units (deploy/host/redis.sh, deploy/host/gateway.sh),
 # with the values of a site folder: who you are and where you deploy never live in this repository.
 #
-#   deploy/site-deploy.sh [--site DIR] [--print] redis|gateway|authentik
+#   deploy/site-deploy.sh [--site DIR] [--print] redis|gateway
 #
 # The site folder (site.example/README.md): --site, else $MMBOX_SITE_DIR, else ./site at the root of this repository
 # (ignored by git; a folder of your own or a link to your infrastructure's repository). It holds:
@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
         --site=*) SITE="${1#--site=}"; shift ;;
         --print) PRINT=1; shift ;;
         -h|--help) usage ;;
-        redis|gateway|authentik) WHAT="$1"; shift ;;
+        redis|gateway) WHAT="$1"; shift ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done
@@ -45,11 +45,6 @@ bundle() {
         [[ "$name" == MMBOX_SITE_DIR ]] && continue
         printf 'export %s=%q\n' "$name" "${!name}"
     done < <(compgen -e | grep '^MMBOX_' || true)
-    if [[ -f "${ROOT}/deploy/host/${WHAT}-config.py" ]]; then  # its configuration step, run on the host by the script
-        printf "\n# ---- deploy/host/%s-config.py\nread -r -d '' MMBOX_CONFIG_PY <<'MMBOX_CONFIG_PY_EOF' || true\n" "$WHAT"
-        cat "${ROOT}/deploy/host/${WHAT}-config.py"
-        printf 'MMBOX_CONFIG_PY_EOF\n'
-    fi
     printf '\n# ---- deploy/host/%s.sh\n' "$WHAT"; cat "${ROOT}/deploy/host/${WHAT}.sh"
 }
 
