@@ -225,13 +225,21 @@ def pin_hosts() -> dict:
         if "=" in part:
             h, ip = part.split("=", 1)
             pins[h.strip().lower()] = ip.strip()
-    if pins and not getattr(socket, "_mmbox_pinned", False):
-        orig = socket.getaddrinfo
+    for h in list(_UNPINNED):  # dropped during this command (`server use` of a service without an address)
+        pins.pop(h, None)
+    _PINS.clear()  # one table, read by one wrapper: called again, the new pins replace the old ones (never stacked)
+    _PINS.update(pins)
+    if not hasattr(socket, "_mmbox_orig"):
+        socket._mmbox_orig = socket.getaddrinfo
 
         def getaddrinfo(host, *a, **k):
-            return orig(pins.get(str(host).lower(), host) if isinstance(host, str) else host, *a, **k)
+            return socket._mmbox_orig(_PINS.get(str(host).lower(), host) if isinstance(host, str) else host, *a, **k)
         socket.getaddrinfo, socket._mmbox_pinned = getaddrinfo, True
     return pins
+
+
+_PINS: dict = {}
+_UNPINNED: set = set()
 
 
 def home_dir(profile: str) -> Path:
@@ -4651,8 +4659,12 @@ def cmd_server(a, local: Local):
     ml = Local(MACHINE_PROFILE)
     if v.get("address"):  # for the check first; kept in the machine box's config only once the service answers
         os.environ["MMBOX_RESOLVE"] = ",".join(filter(None, [os.environ.get("MMBOX_RESOLVE"), f"{host}={v['address']}"]))
-        socket._mmbox_pinned = False
-        pin_hosts()
+        _UNPINNED.discard(host)
+    else:  # no address any more (`server edit --no-address`): checked through the resolver, not the old pin
+        _UNPINNED.add(host)
+        os.environ["MMBOX_RESOLVE"] = ",".join(p for p in os.environ.get("MMBOX_RESOLVE", "").split(",")
+                                               if p and p.split("=", 1)[0].strip().lower() != host)
+    pin_hosts()
     h = Gateway(url).health()
     if not h.get("ok"):
         die(f"{url} does not answer: {h.get('error')} (VPN? address?): nothing changed")
