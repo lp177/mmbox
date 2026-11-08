@@ -1,4 +1,5 @@
-"""The butler of a computer (client/BUTLER.md): one per computer, the only one that takes any project's messages.
+"""The daemon of a computer and its butler (client/BUTLER.md): one per computer, the only one that takes any
+project's messages; run by the desktop console, or alone as a service (systemd, launchd, a Windows logon task).
 
 `mmbox.py butler run` watches the project boxes and the machine box. A message nobody took for BUTLER_AFTER_S
 (5 min) is acted on: a session of its project is resumed or started (in a detached tmux session, the agent in its
@@ -7,12 +8,19 @@ or leave it waiting). It keeps the inventory of the agents and models this compu
 asked), starts sessions on request (its box, the console), and talks with the operator (the console's Butler tab).
 Everything it does, and every agent turn's stream, goes to its log, read live by the console.
 
-Needs the full client (a clone: mmbox.py beside this file), Python 3.10+, tmux to start sessions.
+Sessions are started hidden: a runner process per session (`daemon session-run`, detached, no window on any OS)
+keeps the agent's input open (Claude Code in stream-JSON mode: it stays alive, listens, wakes on its background
+commands) and writes its output to a file the console shows live; the operator can type into it from there.
+Other agents: a detached tmux session (Linux, macOS). What the daemon does on request is only what the operator's
+console asks, signed with its operator key (`op` messages to the butler's box).
+
+Needs the full client (a clone: mmbox.py beside this file), Python 3.10+.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
+import socket
 import os
 import re
 import secrets
@@ -35,6 +43,9 @@ FAILS_MAX = 3  # a project whose start failed this many times in a row waits for
 TURN_TIMEOUT_S = 900.0
 LOG_MAX = 5_000_000  # bytes, then butler.log.1 (kept 7 days by its date)
 CHAT_KEEP = 400
+NOWIN = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: never a console window on Windows
+DETACHED = 0x00000008 | 0x00000200 if os.name == "nt" else 0  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+HOST = socket.gethostname()
 
 # What each agent CLI is, how to find it, how to start or resume it in its no-prompt mode. Models: a known list when
 # the CLI has no command listing them (marked so in the inventory).
@@ -50,9 +61,12 @@ AGENTS = {
 
 # ---------------------------------------------------------------- files
 def home() -> Path:
-    base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "mmbox" / "butler"
-    if os.environ.get("MMBOX_HOME"):  # a bench, or a second computer on this one: its own butler folder
-        base = Path(os.environ["MMBOX_HOME"]) / ".butler"
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "mmbox" / "daemon"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "mmbox" / "daemon"
+    if os.environ.get("MMBOX_HOME"):  # a bench, or a second computer on this one: its own daemon folder
+        base = Path(os.environ["MMBOX_HOME"]) / ".daemon"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -124,7 +138,7 @@ def argv0(path: str) -> list[str]:
 
 def run(cmd: list[str], timeout: float = 20) -> tuple[int, str]:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, creationflags=NOWIN)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except (OSError, subprocess.SubprocessError) as e:
         return -1, str(e)
@@ -162,7 +176,7 @@ def probe() -> dict:
             rec["logged_in"] = (Path.home() / ".gemini" / "oauth_creds.json").is_file() or bool(os.environ.get("GEMINI_API_KEY"))
         rec.update(models=models, models_source=source, can_start=name in ("claude-code", "codex", "gemini"))
         out.append(rec)
-    inv = {"at": time.time(), "host": os.uname().nodename if hasattr(os, "uname") else "", "agents": out,
+    inv = {"at": time.time(), "host": HOST, "agents": out,
            "tmux": bool(shutil.which("tmux"))}
     jsave("inventory.json", inv)
     publish(inv)
@@ -294,13 +308,199 @@ def agent_command(agent: str, path: str, model: str | None, prompt: str, resume:
 
 def first_prompt(name: str, box_id: str, title: str | None, task: str | None, resumed: bool = False,
                  why: str | None = None) -> str:
-    host = os.uname().nodename if hasattr(os, "uname") else "this computer"
-    head = (f"The mmbox butler of {host} {'resumed' if resumed else 'started'} this session"
+    head = (f"The mmbox butler of {HOST} {'resumed' if resumed else 'started'} this session"
             + (f" because {why}" if why else "") + ". ")
     return (head + f"First start the encrypted mailbox for it with the skill memories-mailbox-start: session name "
             f"`{name}` (its box exists already, {box_id})" + (f", title \"{title}\"" if title else "")
             + ", then keep its listener running as that skill says, and handle what it hands over (its project's box "
             "included). " + (f"Then: {task}" if task else "Then wait for messages; do nothing else on your own."))
+
+
+# ---------------------------------------------------------------- hidden sessions: one runner per session
+def session_dir(name: str) -> Path:
+    d = home() / "sessions" / re.sub(r"[^A-Za-z0-9_.-]+", "-", name)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def headless_command(agent: str, path: str, model: str | None, resume: str | None = None) -> list[str]:
+    """The agent with its input and output as JSON lines: alive while its input is open (Claude Code)."""
+    if agent != "claude-code":
+        raise ValueError(f"{agent} has no hidden mode yet")
+    mode = (config().get("permission_mode") or {}).get(agent) or "bypassPermissions"
+    return argv0(path) + ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                          "--permission-mode", mode] + (["--model", model] if model else []) + (["--resume", resume] if resume else [])
+
+
+def user_line(text: str) -> str:
+    return json.dumps({"type": "user", "message": {"role": "user", "content": text}}, ensure_ascii=False)
+
+
+def spawn_runner(name: str, cwd: str, cmd: list[str], prompt: str) -> str:
+    """The session's runner, detached from the daemon (it outlives a restart) and without any window."""
+    d = session_dir(name)
+    for f in ("stop", "in.jsonl"):
+        (d / f).unlink(missing_ok=True)
+    (d / "in.jsonl").write_text(user_line(prompt) + "\n", encoding="utf-8")
+    jsave_path(d / "meta.json", {"name": name, "cmd": cmd, "cwd": cwd, "created": time.time(), "state": "starting"})
+    py = sys.executable
+    if os.name == "nt" and Path(py).with_name("pythonw.exe").is_file():
+        py = str(Path(py).with_name("pythonw.exe"))
+    client = str(Path(M.__file__).resolve())
+    err = open(d / "runner.err", "a", encoding="utf-8")
+    kw = {"creationflags": DETACHED | NOWIN} if os.name == "nt" else {"start_new_session": True}
+    subprocess.Popen([py, client, "daemon", "session-run", name], cwd=cwd, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=err, env=clean_env(), **kw)
+    return f"hidden:{name}"
+
+
+def clean_env() -> dict:
+    """The environment of what the daemon starts: not that of an agent session the daemon may have been started from."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE_CODE_", "CLAUDECODE", "MMBOX_SESSION"))}
+    env["MMBOX_STARTED_BY"] = "butler"
+    return env
+
+
+def jsave_path(p: Path, value) -> None:
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def jload_path_any(p: Path, default):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def session_run(name: str) -> int:
+    """`daemon session-run <name>`: the agent of one session, its input fed from in.jsonl (the first prompt, then what
+    the operator types), its output appended to out.jsonl; ends with it, or when `stop` appears."""
+    d = session_dir(name)
+    meta = jload_path_any(d / "meta.json", {})
+    if not meta.get("cmd"):
+        return 2
+    out = open(d / "out.jsonl", "a", encoding="utf-8")
+    lock = threading.Lock()
+
+    def write(rec):
+        with lock:
+            out.write(json.dumps({"t": time.time(), **rec}, ensure_ascii=False) + "\n")
+            out.flush()
+    try:
+        p = subprocess.Popen(meta["cmd"], cwd=meta.get("cwd") or None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                             env=clean_env(), creationflags=NOWIN)
+    except OSError as e:
+        write({"src": "error", "text": f"could not start the agent: {e}"})
+        meta.update(state="ended", error=str(e), ended=time.time())
+        jsave_path(d / "meta.json", meta)
+        return 1
+    meta.update(state="running", runner_pid=os.getpid(), agent_pid=p.pid, started=time.time())
+    jsave_path(d / "meta.json", meta)
+    write({"src": "daemon", "text": f"agent started (pid {p.pid}) in {meta.get('cwd')}"})
+
+    def reader():
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                write({"src": "agent", "event": json.loads(line)})
+            except ValueError:
+                write({"src": "agent", "text": line[:4000]})
+    threading.Thread(target=reader, daemon=True).start()
+    pos = 0
+    while p.poll() is None:
+        if (d / "stop").exists():
+            write({"src": "daemon", "text": "stopped on request"})
+            p.terminate()
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+            break
+        try:
+            with open(d / "in.jsonl", "r", encoding="utf-8") as f:
+                f.seek(pos)
+                chunk = f.read()
+                pos = f.tell()
+            for ln in chunk.splitlines():
+                if ln.strip():
+                    p.stdin.write(ln + "\n")
+                    p.stdin.flush()
+        except (OSError, BrokenPipeError):
+            pass
+        time.sleep(1)
+    code = p.wait()
+    time.sleep(0.5)
+    write({"src": "daemon", "text": f"agent ended (exit {code})"})
+    meta.update(state="ended", code=code, ended=time.time())
+    jsave_path(d / "meta.json", meta)
+    return 0
+
+
+def session_input(name: str, text: str) -> dict:
+    """What the operator types into a hidden session: its next user message."""
+    d = session_dir(name)
+    if jload_path_any(d / "meta.json", {}).get("state") != "running":
+        return {"error": f"{name} is not running"}
+    with open(d / "in.jsonl", "a", encoding="utf-8") as f:
+        f.write(user_line(text) + "\n")
+    with open(d / "out.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": time.time(), "src": "operator", "text": text}, ensure_ascii=False) + "\n")
+    return {"ok": True}
+
+
+def session_output(name: str, since: int = 0, cap: int = 400_000) -> dict:
+    """A hidden session's output from byte `since`: {lines, next, meta}."""
+    d = session_dir(name)
+    p, lines = d / "out.jsonl", []
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return {"lines": [], "next": 0, "meta": jload_path_any(d / "meta.json", {})}
+    since = since if 0 <= since <= size else 0
+    with open(p, "rb") as f:
+        f.seek(max(since, size - cap))
+        for ln in f.read(cap).decode("utf-8", "replace").splitlines():
+            try:
+                lines.append(json.loads(ln))
+            except ValueError:
+                pass
+    return {"lines": lines, "next": size, "reset": since == 0, "meta": jload_path_any(d / "meta.json", {})}
+
+
+def session_tail(name: str, n: int = 12) -> str:
+    out = []
+    for l in session_output(name, 0, 60_000)["lines"][-60:]:
+        e = l.get("event") or {}
+        if l.get("text"):
+            out.append(l["text"])
+        elif e.get("type") == "result":
+            out.append("result: " + str(e.get("result") or "")[:300])
+        elif e.get("type") == "assistant":
+            out += [c.get("text", "")[:300] for c in (e.get("message") or {}).get("content") or [] if c.get("type") == "text"]
+    return "\n".join(out[-n:])
+
+
+def stop_session(s: dict) -> dict:
+    t = str(s.get("tmux") or "")
+    if t.startswith("hidden:"):
+        (session_dir(t[7:]) / "stop").touch()
+        return {"stopped": t}
+    run(["tmux", "kill-session", "-t", t], 10)
+    return {"stopped": t}
+
+
+def launch(name: str, cwd: str, agent: str, rec: dict, model: str | None, prompt: str, resume: str | None = None) -> str:
+    """Hidden when the agent has a hidden mode (Claude Code), else tmux (not on Windows)."""
+    if agent == "claude-code" and (config().get("launcher") or "hidden") != "tmux":
+        return spawn_runner(name, cwd, headless_command(agent, rec["path"], model, resume), prompt)
+    if os.name == "nt":
+        raise RuntimeError(f"{agent} has no hidden mode yet, and tmux does not exist on Windows")
+    return tmux_start(name, cwd, agent_command(agent, rec["path"], model, prompt, resume))
 
 
 def tmux_start(name: str, cwd: str, cmd: list[str]) -> str:
@@ -352,14 +552,13 @@ def start_session(path: str, agent: str | None = None, model: str | None = None,
                                                    **({"title": M.title_words(title)} if title else {}),
                                                    **({"model": model} if model else {}), provider=rec["provider"]))
     me = M.load_me(name)
-    cmd = agent_command(agent, rec["path"], model, first_prompt(name, me.id, title, task, why=why))
-    sess = tmux_start(name, str(folder), cmd)
+    sess = launch(name, str(folder), agent, rec, model, first_prompt(name, me.id, title, task, why=why))
     st = jload("state.json", {})
     st.setdefault("started", {})[name] = {"box": me.id, "profile": name, "tmux": sess, "agent": agent, "model": model,
                                           "path": str(folder), "project": key, "at": time.time(), "state": "starting",
                                           "why": why}
     jsave("state.json", st)
-    log("daemon", f"started {agent}{' ' + model if model else ''} in {folder} as box {name} ({me.id}), tmux {sess}"
+    log("daemon", f"started {agent}{' ' + model if model else ''} in {folder} as box {name} ({me.id}), {sess}"
         + (f": {why}" if why else ""))
     return {"box": me.id, "profile": name, "tmux": sess, "state": "starting", "agent": agent, "model": model,
             "path": str(folder)}
@@ -372,15 +571,14 @@ def resume_session(y, why: str) -> dict:
     if not rec or not rec.get("can_start") or not y.session_id:
         raise ValueError(f"{y.label} cannot be resumed (agent {y.agent}, session id {y.session_id or 'unknown'})")
     cwd = y.conf.get("work_dir") or str(Path.home())
-    cmd = agent_command(str(y.agent), rec["path"], y.conf.get("model"),
-                        first_prompt(y.local.profile, y.id, None, None, resumed=True, why=why), resume=y.session_id)
-    sess = tmux_start(y.local.profile + "-r" + secrets.token_hex(1), cwd, cmd)
+    sess = launch(y.local.profile, cwd, str(y.agent), rec, y.conf.get("model"),
+                  first_prompt(y.local.profile, y.id, None, None, resumed=True, why=why), resume=y.session_id)
     st = jload("state.json", {})
     st.setdefault("started", {})[y.local.profile] = {"box": y.id, "profile": y.local.profile, "tmux": sess, "agent": y.agent,
                                                      "path": cwd, "project": M.session_key(y), "at": time.time(),
                                                      "state": "starting", "resumed": True, "why": why}
     jsave("state.json", st)
-    log("daemon", f"resumed {y.label} ({y.agent} session {y.session_id}) in tmux {sess}: {why}")
+    log("daemon", f"resumed {y.label} ({y.agent} session {y.session_id}), {sess}: {why}")
     return {"box": y.id, "profile": y.local.profile, "tmux": sess, "state": "starting", "resumed": True}
 
 
@@ -396,7 +594,8 @@ def check_started() -> None:
             s["state"], changed = "listening", True
             log("daemon", f"{name} listens: started and ready")
         elif time.time() - s["at"] > START_WAIT_S:
-            s["state"], s["error"], changed = "failed", (tmux_tail(s["tmux"], 15).strip()[-800:] or "its tmux session ended"), True
+            tail = session_tail(s["tmux"][7:]) if str(s.get("tmux")).startswith("hidden:") else tmux_tail(s["tmux"], 15)
+            s["state"], s["error"], changed = "failed", (tail.strip()[-800:] or "its session ended"), True
             proj = s.get("project")
             if proj:
                 f = st.setdefault("fails", {})
@@ -427,7 +626,7 @@ def agent_turn(prompt: str, purpose: str, resume: str | None = None, session_id:
         log("error", f"{purpose}: no agent to think with (Claude Code needed)")
         return {"ok": False, "text": "no agent available for the butler (Claude Code needed)"}
     client = M.__file__ if getattr(M, "__file__", None) else "mmbox.py"
-    system = (f"You are the mmbox butler of this computer ({os.uname().nodename}). The mmbox client is `python3 {client}`; "
+    system = (f"You are the mmbox butler of this computer ({HOST}). The mmbox client is `python3 {client}`; "
               f"your box is the profile `{BUTLER_PROFILE}` (`--profile {BUTLER_PROFILE}`). You may start sessions with "
               f"`python3 {client} butler start --path <folder> [--agent A --model M --title T --task …]`, list them with "
               f"`butler status`, and answer peers with `send … --profile {BUTLER_PROFILE}`. Act only within the rights "
@@ -444,7 +643,7 @@ def agent_turn(prompt: str, purpose: str, resume: str | None = None, session_id:
     with _TURN_LOCK:
         try:
             p = subprocess.Popen(cmd, cwd=str(home()), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                 stdin=subprocess.DEVNULL, env=env)
+                                 encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, env=env, creationflags=NOWIN)
             t0 = time.time()
             for line in p.stdout:
                 line = line.strip()
@@ -678,24 +877,22 @@ def handle_own_box(b, st) -> None:
         return
     for it in items:
         p = it.get("payload") or {}
-        op = None
-        try:
-            body = json.loads(p.get("body") or "")
-            op = body if isinstance(body, dict) and body.get("op") else None
-        except ValueError:
-            pass
+        if it["status"] == "op":  # the operator's console (its pinned key: the client checked it), and nobody else
+            reply = do_op(p.get("op") if isinstance(p.get("op"), dict) else {})
+            via = it.get("via")
+            opeer = M.operator_peer(via, it["peer_id"]) if via else None
+            if opeer:
+                opeer = {**opeer, "gateway": via, "gateways": [via]}
+                M.send_payload(b, it["peer_id"], opeer, b.conf.get("project") or "", f"Re: {p.get('subject', 'op')}",
+                               json.dumps(reply, ensure_ascii=False)[:200_000], "op_result", it["id"], False,
+                               extra={"op_result": reply})
+            log("daemon", f"operator op {(p.get('op') or {}).get('op')}: {json.dumps(reply, ensure_ascii=False)[:300]}")
+            continue
         rights = it.get("orig_rights") or it["status"]
         if rights != "execute":  # never acted on by the butler's agent (it acts without asking): the operator decides
             if rights != "archived":
                 ask_operator(f"{it['peer']} wrote to me (rights {rights}): \"{p.get('subject', '')}\" ({it['id']}). I did "
                              f"nothing: tell me whether to act on it.\n\n{str(p.get('body') or '')[:1500]}")
-            continue
-        if op:
-            reply = do_op(op)
-            if not op.get("quiet"):  # `quiet`: no answer (a console asking for a refresh reads the table instead)
-                M.send_payload(b, it["peer_id"], M.peers_load(b.local)[it["peer_id"]], b.conf.get("project") or "",
-                               f"Re: {p.get('subject', '')}", json.dumps(reply, ensure_ascii=False), "reply", it["id"], False)
-            log("daemon", f"request {op.get('op')} from {it['peer']}: {json.dumps(reply)[:300]}")
             continue
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -708,41 +905,56 @@ def handle_own_box(b, st) -> None:
 
 
 def do_op(op: dict) -> dict:
-    """A request to the butler, from a peer with execute rights or the console: start, stop, list, inventory."""
+    """What the operator's console asks the daemon (signed with its operator key, nobody else): status, config,
+    inventory, start, stop, input (a line typed into a hidden session), output (a hidden session's output)."""
     try:
         o = op.get("op")
+        if o == "status":
+            st = status()
+            return {k: st[k] for k in ("running", "box", "beat", "started", "fails", "folders", "after_s")} | {
+                "inventory": st["inventory"], "config": {k: st["config"].get(k) for k in ("agent", "model", "roots", "launcher")}}
+        if o == "config":
+            c = jload("butler.json", {})
+            for k in ("agent", "model", "launcher"):
+                if k in op:
+                    v = str(op.get(k) or "").strip()[:80]
+                    c.pop(k, None) if not v else c.__setitem__(k, v)
+            jsave("butler.json", c)
+            return {"config": {k: c.get(k) for k in ("agent", "model", "launcher")}}
+        if o == "input":
+            return session_input(str(op.get("profile") or ""), str(op.get("text") or "")[:20000])
+        if o == "output":
+            return session_output(str(op.get("profile") or ""), int(op.get("since") or 0), 60_000)
         if o == "start":
             return start_session(str(op.get("path") or ""), op.get("agent"), op.get("model"), op.get("title"), op.get("task"),
                                  why=op.get("why") or "asked", project=op.get("project"))
         if o == "inventory":
-            inv = inventory(refresh=bool(op.get("refresh")))
-            return {"at": inv.get("at"), "agents": len(inv.get("agents") or [])} if op.get("quiet") else inv
+            return inventory(refresh=bool(op.get("refresh")))
         if o == "list":
             return {"started": (jload("state.json", {}).get("started") or {})}
         if o == "stop":
             s = (jload("state.json", {}).get("started") or {}).get(str(op.get("profile") or ""))
             if not s:
                 return {"error": "not a session the butler started"}
-            run(["tmux", "kill-session", "-t", s["tmux"]], 10)
-            return {"stopped": s["tmux"]}
+            return stop_session(s)
         return {"error": f"unknown op {o}"}
     except (ValueError, RuntimeError) as e:
         return {"error": str(e)}
 
 
 def daemon(once: bool = False) -> int:
-    lock = open(home() / "butler.pid", "a+")
-    if os.name != "nt":
-        import fcntl
-        try:
+    lock = open(home() / "daemon.lock", "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            print("ALREADY RUNNING: a butler runs on this computer already", flush=True)
-            return 6
-    lock.seek(0)
-    lock.truncate()
-    lock.write(str(os.getpid()))
-    lock.flush()
+    except OSError:
+        print("ALREADY RUNNING: the daemon runs on this computer already", flush=True)
+        return 6
+    (home() / "butler.pid").write_text(str(os.getpid()), encoding="utf-8")
     b = butler_me()
     M.listeners(b.local, register=True)
     log("daemon", f"butler {b.label} ({b.id}) runs, pid {os.getpid()}; takes what waited {AFTER_S / 60:g} min")
@@ -780,13 +992,7 @@ def daemon(once: bool = False) -> int:
 def status() -> dict:
     st = jload("state.json", {})
     pid = read(home() / "butler.pid").strip()
-    alive = False
-    if pid.isdigit():
-        try:
-            os.kill(int(pid), 0)
-            alive = True
-        except OSError:
-            pass
+    alive = pid.isdigit() and M.pid_alive(int(pid))  # never os.kill(pid, 0): on Windows it terminates the process
     b = butler_me(create=False)
     return {"running": alive and time.time() - float(st.get("beat") or 0) < LOOP_S * 8, "pid": int(pid) if pid.isdigit() else None,
             "box": {"id": b.id, "label": b.label} if b else None, "beat": st.get("beat"), "home": str(home()),
@@ -795,30 +1001,87 @@ def status() -> dict:
             "after_s": AFTER_S, "inventory_every_s": INVENTORY_EVERY_S}
 
 
-def install_systemd() -> str:
-    unit = Path.home() / ".config" / "systemd" / "user" / "mmbox-butler.service"
-    unit.parent.mkdir(parents=True, exist_ok=True)
-    client = Path(M.__file__).resolve()
-    unit.write_text(f"""[Unit]
-Description=mmbox butler (takes what no session took, starts sessions)
+def install_service(start: bool = True) -> list[str]:
+    """The daemon as a service of this user, started at login and now: systemd (Linux), launchd (macOS), a logon task
+    running pythonw (Windows: no window). Returns what was done."""
+    client = str(Path(M.__file__).resolve())
+    done = []
+    if sys.platform.startswith("linux"):
+        unit = Path.home() / ".config" / "systemd" / "user" / "mmbox-daemon.service"
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(f"""[Unit]
+Description=mmbox daemon (its butler takes what no session took, starts sessions)
 After=network-online.target
 
 [Service]
-ExecStart={sys.executable} {client} butler run
+ExecStart={sys.executable} {client} daemon run
 Restart=on-failure
 RestartSec=30
 
 [Install]
 WantedBy=default.target
 """, encoding="utf-8")
-    return str(unit)
+        done.append(f"written {unit}")
+        if start:
+            for cmd in (["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", "mmbox-daemon.service"]):
+                code, out = run(cmd, 60)
+                done.append(f"{' '.join(cmd)}: {'ok' if code == 0 else out.strip()[:200]}")
+            done.append("on a server, also `loginctl enable-linger $USER` (it then runs without a login)")
+    elif sys.platform == "darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / "com.mmbox.daemon.plist"
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.mmbox.daemon</string>
+  <key>ProgramArguments</key><array><string>{sys.executable}</string><string>{client}</string><string>daemon</string><string>run</string></array>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>{home() / "daemon.err"}</string>
+</dict></plist>
+""", encoding="utf-8")
+        done.append(f"written {plist}")
+        if start:
+            run(["launchctl", "unload", str(plist)], 30)
+            code, out = run(["launchctl", "load", "-w", str(plist)], 30)
+            done.append("launchctl load: " + ("ok" if code == 0 else out.strip()[:200]))
+    elif os.name == "nt":
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        exe = str(pyw if pyw.is_file() else sys.executable)
+        tr = f'"{exe}" "{client}" daemon run'
+        code, out = run(["schtasks", "/Create", "/TN", "mmbox-daemon", "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", tr], 60)
+        done.append("schtasks /Create mmbox-daemon (at logon, " + ("pythonw: no window" if pyw.is_file() else "python") + "): "
+                    + ("ok" if code == 0 else out.strip()[:300]))
+        if start and code == 0:
+            code, out = run(["schtasks", "/Run", "/TN", "mmbox-daemon"], 60)
+            done.append("schtasks /Run: " + ("ok" if code == 0 else out.strip()[:200]))
+    else:
+        done.append(f"{sys.platform}: no service installer; run `mmbox.py daemon run` at login yourself")
+    return done
+
+
+def uninstall_service() -> list[str]:
+    done = []
+    if sys.platform.startswith("linux"):
+        run(["systemctl", "--user", "disable", "--now", "mmbox-daemon.service"], 60)
+        (Path.home() / ".config" / "systemd" / "user" / "mmbox-daemon.service").unlink(missing_ok=True)
+        done.append("systemd user service removed")
+    elif sys.platform == "darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / "com.mmbox.daemon.plist"
+        run(["launchctl", "unload", str(plist)], 30)
+        plist.unlink(missing_ok=True)
+        done.append("launchd agent removed")
+    elif os.name == "nt":
+        run(["schtasks", "/End", "/TN", "mmbox-daemon"], 30)
+        code, out = run(["schtasks", "/Delete", "/TN", "mmbox-daemon", "/F"], 30)
+        done.append("logon task removed" if code == 0 else out.strip()[:200])
+    return done
 
 
 def main(module, argv: list[str]) -> int:
     global M
     M = module
     import argparse
-    ap = argparse.ArgumentParser(prog="mmbox.py butler", description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(prog="mmbox.py daemon", description=__doc__.split("\n")[0])
     sp = ap.add_subparsers(dest="cmd", required=True)
     x = sp.add_parser("run", help="the butler's daemon (one per computer)")
     x.add_argument("--once", action="store_true", help="one round, then exit")
@@ -838,8 +1101,18 @@ def main(module, argv: list[str]) -> int:
     x.add_argument("text")
     x = sp.add_parser("log", help="the butler's log (JSON lines)")
     x.add_argument("-n", type=int, default=50)
-    x = sp.add_parser("install", help="a systemd user service that runs the butler (servers)")
-    x.add_argument("--systemd", action="store_true", required=True)
+    x = sp.add_parser("install", help="run the daemon as a service of this user: systemd, launchd, a Windows logon task")
+    x.add_argument("--systemd", action="store_true", help=argparse.SUPPRESS)  # the old spelling
+    x.add_argument("--no-start", action="store_true", help="install it, start it at the next login only")
+    sp.add_parser("uninstall", help="remove that service")
+    x = sp.add_parser("session-run", help=argparse.SUPPRESS)  # a hidden session's runner (started by the daemon)
+    x.add_argument("name")
+    x = sp.add_parser("session-input", help="type a line into a hidden session the daemon started")
+    x.add_argument("profile")
+    x.add_argument("text")
+    x = sp.add_parser("session-output", help="a hidden session's output (JSON lines)")
+    x.add_argument("profile")
+    x.add_argument("-n", type=int, default=40)
     a = ap.parse_args(argv)
     if a.cmd == "run":
         return daemon(a.once)
@@ -864,7 +1137,14 @@ def main(module, argv: list[str]) -> int:
     elif a.cmd == "log":
         print("\n".join(read(home() / "butler.log").splitlines()[-a.n:]))
     elif a.cmd == "install":
-        u = install_systemd()
-        print(f"written {u}; enable it with: systemctl --user enable --now mmbox-butler.service "
-              f"(and `loginctl enable-linger $USER` on a server)")
+        print("\n".join(install_service(start=not a.no_start)))
+    elif a.cmd == "uninstall":
+        print("\n".join(uninstall_service()))
+    elif a.cmd == "session-run":
+        return session_run(a.name)
+    elif a.cmd == "session-input":
+        print(json.dumps(session_input(a.profile, a.text)))
+    elif a.cmd == "session-output":
+        for l in session_output(a.profile)["lines"][-a.n:]:
+            print(json.dumps(l, ensure_ascii=False))
     return 0

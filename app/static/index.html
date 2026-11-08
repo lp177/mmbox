@@ -574,6 +574,23 @@
   </dialog>
 
   <!-- A box: who it is, what it does -->
+  <!-- A hidden session of this computer: its live output, and a line to type into it -->
+  <dialog id="session-out" aria-labelledby="so-title" closedby="any" class="wide">
+    <form method="dialog" class="dialog-body">
+      <h2 id="so-title">Session</h2>
+      <p id="so-meta" class="dim" role="status"></p>
+      <div id="so-log" class="butler-out mono" role="log" aria-live="off" tabindex="0" aria-label="The session's output"></div>
+      <div class="butler-chat-form">
+        <div class="field grow"><textarea id="so-text" rows="2" placeholder=" "></textarea><label for="so-text">Write to this session (Ctrl+Enter sends)</label></div>
+        <button class="btn filled ripple" type="button" id="so-send">Send</button>
+      </div>
+      <div class="actions">
+        <button class="btn text danger ripple" type="button" id="so-stop">Stop the session</button>
+        <button class="btn ripple" value="close" type="submit">Close</button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- Start a computer's butler: its agent and model, then Launch -->
   <dialog id="butler-launch" aria-labelledby="bl-title" closedby="any">
     <form method="dialog" class="dialog-body" id="bl-form">

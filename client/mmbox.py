@@ -113,7 +113,7 @@ SILENT = ("pinged", "pong", "link", "transport", "retired", "introduced")  # boo
 TOOL_KINDS = ("ping", "pong", "notice", "forward", "transport", "retire", "link", "introduce")  # never relayed
 # Boxes that never close: the machine box (every session of the computer) and the project boxes (every session of one
 # project: the folder it runs in). A project box is the profile PROJECT_PREFIX + its key, a child of the machine box.
-SHARED_ROLES = ("machine", "project", "butler")  # the butler's box (mmbox_butler.py): read by the butler alone
+SHARED_ROLES = ("machine", "project", "butler")  # the butler's box (mmbox_daemon.py): read by the daemon alone
 PROJECT_PREFIX = "project-"
 QUEUED: set = set()  # messages of this process the service did not accept yet (memories closed): retried later
 QUEUE_NOTES: list | None = None  # `start` collects the queued sends here and says them in one line
@@ -1253,7 +1253,7 @@ def box_declaration(me: "Me") -> dict:
             "provider": me.conf.get("provider"), "model": me.conf.get("model"),
             "host": {"hostname": socket.gethostname(), "os": platform.system().lower(), "machine_hash": machine_hash()},
             "client": {"v": str(VERSION), "caps": CAPS},
-            # the butler's box also says which agents and models its computer runs (mmbox_butler.py, every 6 h)
+            # the butler's box also says which agents and models its computer runs (mmbox_daemon.py, every 6 h)
             **({"inventory": me.conf["inventory"]} if me.role == "butler" and isinstance(me.conf.get("inventory"), dict) else {})}
 
 
@@ -2159,7 +2159,7 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
                via: str | None = None) -> dict | None:
         """One message taken by this identity: the item to hand over (logged first), or None when too slow."""
         item = {"id": msg_id, "peer": peer["alias"], "peer_id": mid,
-                "box": box_kind(me), "profile": me.local.profile}
+                "box": box_kind(me), "profile": me.local.profile, **({"via": via} if via else {})}
         p = None
         try:
             if env.get("id") != msg_id:
@@ -2171,8 +2171,10 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
                 raise ValueError(f"a `{p.get('kind')}` only comes from another session of this computer")
             if p.get("kind") == "retire" and peer.get("local_profile"):
                 raise ValueError("a `retire` only comes from a remote peer")
-            if peer.get("operator") and p.get("kind") != "answer":
-                raise ValueError("the operator's console only sends answers to questions")
+            if peer.get("operator") and p.get("kind") != "answer" and not (p.get("kind") == "op" and me.role == "butler"):
+                raise ValueError("the operator's console only sends answers to questions (and `op` to the daemon's box)")
+            if p.get("kind") == "op" and not peer.get("operator"):
+                raise ValueError("an `op` only comes from the operator key this computer pinned")
             if p.get("kind") in ("answer", "question") and not peer.get("operator"):
                 raise ValueError(f"a `{p.get('kind')}` only comes from the operator's console")
         except (ValueError, KeyError, TypeError) as exc:
@@ -2208,6 +2210,8 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
                     transports.append((mid, {"gateways": [g.get("url") for g in p["link"]["gateways"] if isinstance(g, dict)]}))
             elif kind == "answer":  # the user's answer, from the operator's console, to a question this box put there
                 status = "answer"
+            elif kind == "op":  # the operator's console asks the daemon (its butler's box) to do something
+                status = "op"
             elif kind == "forward":  # relayed from a session that did not answer: the rights of the original sender
                 status = "forwarded"
                 osrc = peers.get(((p.get("forwarded") or {}).get("original") or {}).get("from") or "")
@@ -7746,15 +7750,15 @@ def main():
     args = sys.argv[1:]  # `hook` before argparse: a harness hook must stay fast and touch nothing else
     if args[:1] == ["hook"] or (len(args) > 2 and args[0] == "--profile" and args[2] == "hook"):
         sys.exit(hook_main(args[args.index("hook") + 1:]))
-    if args[:1] == ["butler"]:  # the computer's butler: its own module, beside this file (client/BUTLER.md)
+    if args[:1] in (["daemon"], ["butler"]):  # the computer's daemon and its butler (client/BUTLER.md), beside this file
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         try:
-            import mmbox_butler
+            import mmbox_daemon
         except ImportError:
-            die("the butler needs mmbox_butler.py beside mmbox.py (a full clone of the client: mmbox-install)")
+            die("the daemon needs mmbox_daemon.py beside mmbox.py (a full clone of the client: mmbox-install)")
         apply_tuning()
         pin_hosts()
-        sys.exit(mmbox_butler.main(sys.modules[__name__], args[1:]))
+        sys.exit(mmbox_daemon.main(sys.modules[__name__], args[1:]))
     p = argparse.ArgumentParser(prog="mmbox.py", description=__doc__.split("\n")[0])
     p.add_argument("--profile", default=os.environ.get("MMBOX_PROFILE", "default"),
                    help="identity profile (one per agent on the same computer); env MMBOX_PROFILE")

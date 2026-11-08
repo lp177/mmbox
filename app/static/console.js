@@ -2359,10 +2359,12 @@ function renderButlerStarted(started) {
   $("#butler-started").replaceChildren(...(rows.length ? rows.map((s) => h("li", {},
     h("div", {}, h("span", { class: "chip " + ({ listening: "ok", failed: "stopped", starting: "queued" }[s.state] || "") }, s.state), " ",
       h("strong", {}, s.profile), h("span", { class: "dim" }, ` · ${s.agent}${s.model ? " " + s.model : ""}${s.resumed ? " · resumed" : ""} · ${fmtFull.format(new Date(s.at * 1000))}`)),
-    h("div", { class: "dim mono" }, `${s.path} · tmux ${s.tmux}` + (s.why ? ` · ${s.why}` : "")),
+    h("div", { class: "dim mono" }, `${s.path} · ${String(s.tmux).startsWith("hidden:") ? "hidden (no window)" : "tmux " + s.tmux}` + (s.why ? ` · ${s.why}` : "")),
     s.error ? h("div", { class: "err mono" }, s.error) : null,
-    s.state !== "failed" ? h("div", {}, h("button", { class: "btn small text ripple", type: "button", onclick: () => confirmRun(`End ${s.profile}?`,
-      "Its tmux session is killed: the agent stops. Its box closes after an hour without use, what waits for it then goes to its project's box.",
+    s.state !== "failed" || String(s.tmux).startsWith("hidden:") ? h("div", {}, String(s.tmux).startsWith("hidden:") ? h("button", { class: "btn small ripple", type: "button",
+      onclick: () => openSessionOut(s.profile) }, "Output") : null,
+      s.state === "failed" ? null : h("button", { class: "btn small text ripple", type: "button", onclick: () => confirmRun(`End ${s.profile}?`,
+      "Its agent stops (its hidden runner, or its tmux session). Its box closes after an hour without use, what waits for it then goes to its project's box.",
       { action: "butler_stop_session", profile: s.profile }, { okLabel: "End it", after: butlerLoad }) }, "End the session"),
       S.boxes.has(s.box) ? h("button", { class: "btn small text ripple", type: "button", onclick: () => gotoBox(s.box) }, "Its messages") : null) : null))
     : [h("li", { class: "dim" }, "None yet.")]));
@@ -2563,6 +2565,45 @@ $("#sb-run").addEventListener("change", async (e) => {
   const r = await action({ action: "butler_run", on: e.target.checked });
   $("#sb-out").textContent = r.ok ? (e.target.checked ? "The butler runs with the console" : "The butler is stopped") : "Failed: " + (r.err || "?");
 });
+
+// ---------------------------------------------------------------- a hidden session's output (this computer): live, and typed into
+const SO = { name: null, since: 0, lines: [], timer: null };
+async function openSessionOut(name) {
+  Object.assign(SO, { name, since: 0, lines: [] });
+  $("#so-title").textContent = `Session ${name}`;
+  $("#so-log").replaceChildren();
+  const dlg = $("#session-out");
+  clearInterval(SO.timer);
+  SO.timer = setInterval(sessionOutPoll, 1500);
+  dlg.addEventListener("close", () => { clearInterval(SO.timer); SO.name = null; }, { once: true });
+  dlg.showModal();
+  sessionOutPoll();
+}
+async function sessionOutPoll() {
+  if (!SO.name) return;
+  let d;
+  try { d = await api(`/api/session_output?profile=${encodeURIComponent(SO.name)}&since=${SO.since}`); } catch { return; }
+  if (d.reset && SO.since) SO.lines = [];
+  SO.since = d.next || 0;
+  const m = d.meta || {};
+  $("#so-meta").textContent = `${m.state || "?"}` + (m.agent_pid ? ` · agent pid ${m.agent_pid}` : "") + (m.cwd ? ` · ${m.cwd}` : "") + (m.code !== undefined && m.state === "ended" ? ` · exit ${m.code}` : "");
+  $("#so-send").disabled = $("#so-stop").disabled = m.state !== "running";
+  if (!d.lines?.length) return;
+  SO.lines = SO.lines.concat(d.lines).slice(-2000);
+  const out = $("#so-log"), stick = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+  out.replaceChildren(...SO.lines.flatMap((l) => [butlerLine(l.src === "operator" ? { ...l, src: "you" } : l)].flat()));
+  if (stick) out.scrollTop = out.scrollHeight;
+}
+$("#so-send").addEventListener("click", async () => {
+  const t = $("#so-text").value.trim();
+  if (!t || !SO.name) return;
+  const r = await action({ action: "session_input", profile: SO.name, text: t });
+  if (r.error || r.ok === false) { toast("Not sent: " + (r.error || r.err || "?")); return; }
+  $("#so-text").value = ""; sessionOutPoll();
+});
+$("#so-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#so-send").click(); } });
+$("#so-stop").addEventListener("click", () => SO.name && confirmRun(`Stop ${SO.name}?`, "Its agent stops; its box closes after an hour without use, and what waits for it then goes to its project's box.",
+  { action: "session_stop", profile: SO.name }, { okLabel: "Stop it" }));
 
 showTab(DEEP.get("tab") || localStorage.getItem("mmbox-console-tab") || "messages");
 if (DEEP.get("msg")) { const id = DEEP.get("msg"); const t = setInterval(() => { if (S.byId.has(id)) { clearInterval(t); openMessage(id); } }, 300); }

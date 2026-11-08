@@ -1,7 +1,7 @@
 # Project boxes and the butler (design, not implemented yet)
 
 Status: design of 2026-11-08, validated by lp177 (decisions below). Step 1 shipped (551cbbc, d07f5d4); steps 2 and 3
-implemented (client/mmbox_butler.py, the console's Butler tab): see "As built" at the end. Builds on PROTOCOL.md.
+implemented (client/mmbox_daemon.py, the console's Butler tab): see "As built" at the end. Builds on PROTOCOL.md.
 
 Decisions: sessions the butler starts run in a detached tmux session, in the agent's no-prompt mode; a project is
 the name of the folder its session runs in; step 1 (project boxes) comes first.
@@ -193,7 +193,7 @@ box for a session the operator starts.
 
 ## As built (2026-11-08)
 
-- **Code**: `client/mmbox_butler.py`, run as `mmbox.py butler run|status|inventory|start|stop|chat|log|install
+- **Code**: `client/mmbox_daemon.py`, run as `mmbox.py butler run|status|inventory|start|stop|chat|log|install
   --systemd` (it needs the full client: the module beside mmbox.py). Its box: profile `butler`, role `butler` (never
   closed, introduced with its role). Its folder: `~/.local/share/mmbox/butler/` (`butler.json`, `inventory.json`,
   `state.json`, `butler.log`, `chat.jsonl`); one daemon per computer (a lock on `butler.pid`).
@@ -237,3 +237,22 @@ box for a session the operator starts.
   and model, the butler with the console.
 - **Tests**: `MMBOX_BUTLER_CLI_<AGENT>` replaces an agent's CLI (a command line), so that a bench runs without real
   agents.
+
+## The daemon (2026-11-08)
+
+- **One program per computer**: `client/mmbox_daemon.py`, `mmbox.py daemon run|status|install|uninstall|start|stop|
+  session-input|session-output|…` (`butler` is the same command). Desktop: the console starts it when it opens (one per
+  computer; Settings can turn it off). Server or headless: `mmbox.py daemon install` makes it a service of the user:
+  systemd (Linux; `loginctl enable-linger` to run without a login), launchd (macOS), a logon task running pythonw
+  (Windows: no window). `daemon uninstall` removes it. Its folder: `~/.local/share/mmbox/daemon/`
+  (Windows `%LOCALAPPDATA%\mmbox\daemon`).
+- **Hidden sessions**: Claude Code sessions run without a terminal: a runner per session (`daemon session-run`,
+  detached, no window on any OS, outlives a restart of the daemon) keeps the agent's input open (stream-JSON: it stays
+  alive, listens, wakes on its background commands) and appends its output to `sessions/<box>/out.jsonl`; what the
+  operator types goes to `in.jsonl`. The console shows it live ("Output" beside each session the daemon started) and
+  lets the operator write into it or stop it. Other agents: tmux (Linux, macOS), not on Windows yet.
+  `butler.json` `"launcher": "tmux"` brings Claude Code back to tmux.
+- **Ops, operator key only**: what the daemon does on request (status, config, inventory, start, stop, input,
+  output) is asked by an `op` message signed by the operator's console and sent to the butler's box. The client accepts
+  an `op` only from the operator key it pinned (`collector enable … --fingerprint`), and only in the butler's box; the
+  daemon answers with an `op_result` to the operator's box. Messages from peers are never ops, whatever their rights.

@@ -124,17 +124,18 @@ def load_client(path: Path):
     return mod
 
 
+NOWIN = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: what the console runs never opens a window on Windows
 M = None  # the client module, set in main()
-B = None  # the butler's module (client/mmbox_butler.py beside the client), None with an older client
+B = None  # the daemon's module (client/mmbox_daemon.py beside the client), None with an older client
 CLIENT: Path | None = None
 
 
 def load_butler():
-    """The butler's module, beside the client (a full clone); None when the client has none yet."""
-    p = Path(CLIENT).with_name("mmbox_butler.py") if CLIENT else None
+    """The daemon's module (its butler), beside the client (a full clone); None when the client has none yet."""
+    p = Path(CLIENT).with_name("mmbox_daemon.py") if CLIENT else None
     if not p or not p.is_file():
         return None
-    spec = importlib.util.spec_from_file_location("mmbox_butler", p)
+    spec = importlib.util.spec_from_file_location("mmbox_daemon", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     mod.M = M
@@ -829,7 +830,8 @@ class Desktop:
         for cmd in (["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"], ["pw-play"], ["paplay"], ["mpg123", "-q"]):
             if shutil.which(cmd[0]):
                 try:
-                    subprocess.Popen(cmd + [str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.Popen(cmd + [str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     creationflags=NOWIN)
                 except OSError:
                     continue
                 return
@@ -1445,19 +1447,42 @@ class State:
         if time.time() - getattr(self, "_butler_started", 0) < 120:
             return  # just started: its first beat comes
         self._butler_started = time.time()
-        self._butler_proc = subprocess.Popen([sys.executable, str(CLIENT), "butler", "run"], stdin=subprocess.DEVNULL,
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                             env={**os.environ, "MMBOX_NO_SELF_UPDATE": "1"})
-        log("butler started")
+        kw = {"creationflags": NOWIN | 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
+        self._butler_proc = subprocess.Popen([sys.executable, str(CLIENT), "daemon", "run"], stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             env={**os.environ, "MMBOX_NO_SELF_UPDATE": "1"}, **kw)
+        log("daemon started")
 
     def butler_state(self) -> dict:
         if not B:
-            return {"available": False, "why": "the client has no butler yet (mmbox_butler.py): update it (mmbox-update)"}
+            return {"available": False, "why": "the client has no butler yet (mmbox_daemon.py): update it (mmbox-update)"}
         c = B.config()
         return {"available": True, "run_with_console": self.butler_on(), **B.status(), "chat": B.chat_history(200),
+                "op_results": getattr(self, "op_results", {}),
                 "settings": {"butler_agent": c.get("agent"), "butler_model": c.get("model"),
                              "session_agent": self.console_state.get("session_agent"),
                              "session_model": self.console_state.get("session_model")}}
+
+    def send_op(self, box: str, op: dict) -> dict:
+        """An `op` to a computer's daemon (its butler's box), signed with this console's operator key: the only key
+        its client accepts an op from. The answer comes back as an `op_result` in this console's box (op_results)."""
+        b = self.snapshot_box(box) or {}
+        urls = [u for u in b.get("servers") or [] if any(s.get("url") == u and s.get("operator") for s in self.snapshot.get("servers") or [])]
+        if not urls:
+            return {"ok": False, "err": "this console is no operator of a service that daemon is on"}
+        url = urls[0]
+        card = self.card(url, box)
+        if not card or not card.get("box_pub"):
+            return {"ok": False, "err": "its key is unknown on " + url}
+        mid = M.now().strftime("%Y%m%dT%H%M%SZ") + "-" + M.rand_b32(6)
+        payload = {"v": M.VERSION, "id": mid, "from": self.op.id, "from_user": self.op.user, "label": self.op.label,
+                   "agent": "console", "to": box, "ts": M.iso(), "kind": "op", "subject": f"op {op.get('op')}",
+                   "body": json.dumps(op, ensure_ascii=False), "reply_expected": True, "op": op}
+        env = M.envelope(self.op, {"id": box, "box_pub": card["box_pub"]}, payload, mid)
+        r = call(url, self.op, "/send", {"to": box, "env": env})
+        if r.get("_error") is not None:
+            return {"ok": False, "err": f"{r.get('_error')} {r.get('error', '')}".strip()}
+        return {"ok": True, "op_id": mid}
 
     @staticmethod
     def _remote(kind: str, target: str, subject: str, body: str) -> dict:
@@ -1519,6 +1544,10 @@ class State:
             if not target or (mk_local and target == mk_local.id):
                 self.butler_action("butler_settings", {"butler_agent": agent, "butler_model": model})
                 return self.butler_action("butler_run", {"on": True})
+            daemon = next((b for b in self.snapshot.get("boxes") or [] if b.get("role") == "butler" and b.get("machine") == target), None)
+            if daemon:  # its daemon runs already: configured with an op (operator key)
+                r = self.send_op(daemon["id"], {"op": "config", "agent": agent, "model": model})
+                return {**r, "out": "its daemon's agent and model are set" if r.get("ok") else None}
             text = ("lp177's console asks this computer to run its mmbox butler (client/BUTLER.md), one per computer:\n\n"
                     + (f"1. Set its agent and model in ~/.local/share/mmbox/butler/butler.json: {json.dumps({'agent': agent, 'model': model})}\n" if agent or model else "")
                     + "2. Run it for good: `python3 <mmbox client>/mmbox.py butler install --systemd`, then "
@@ -1528,9 +1557,9 @@ class State:
             r = self._remote("task", target, "Start the mmbox butler of this computer", text)
             return {**r, "out": "asked its machine box: a session there starts it, its box then shows in the explorer" if r["ok"] else None}
         if a == "butler_start" and body.get("butler") and not any((y := M.load_me(n)) and y.id == body["butler"] for n in M.local_profiles()):
-            op = {"op": "start", "quiet": True, **{k: body[k] for k in ("path", "project", "agent", "model", "title", "task") if body.get(k)}}
-            r = self._remote("request", str(body["butler"]), "butler: start a session", json.dumps(op, ensure_ascii=False))
-            return {**r, "out": "asked its butler: the new session's box shows in the explorer once it listens" if r["ok"] else None}
+            op = {"op": "start", **{k: body[k] for k in ("path", "project", "agent", "model", "title", "task") if body.get(k)}}
+            r = self.send_op(str(body["butler"]), op)
+            return {**r, "out": "asked its daemon: the new session's box shows in the explorer once it listens" if r.get("ok") else None}
         if a == "butler_start":
             args = ["butler", "start", "--path", str(body.get("path") or "")] + (["--project", str(body["project"])] if body.get("project") else [])
             for k in ("agent", "model", "title", "task"):
@@ -1543,13 +1572,20 @@ class State:
                 return {"ok": False, "err": (r.get("err") or r.get("out") or "no answer")[-1500:]}
             return {"ok": "error" not in res, **res, "err": res.get("error")}
         if a == "butler_refresh" and body.get("box") and not any((y := M.load_me(n)) and y.id == body["box"] for n in M.local_profiles()):
-            # another computer's butler: asked through this computer's machine box (it acts if that box has `execute`
-            # rights there); its new inventory comes back in the services' table, not as a message (`quiet`)
-            r = run_client(["--profile", M.MACHINE_PROFILE, "send", str(body["box"]), "--kind", "request",
-                            "--subject", "butler: inventory", "--body", json.dumps({"op": "inventory", "refresh": True, "quiet": True})],
-                           timeout=60)
-            return {"ok": r.get("ok"), "out": "asked; its table entry shows the new inventory within a round or two" if r.get("ok") else None,
-                    "err": None if r.get("ok") else (r.get("err") or r.get("out") or "")[-600:]}
+            # another computer's daemon: an op signed with this console's operator key; its new inventory comes back in
+            # the services' table (and as its op_result)
+            r = self.send_op(str(body["box"]), {"op": "inventory", "refresh": True})
+            return {**r, "out": "asked; its inventory shows within a round or two" if r.get("ok") else None}
+        if a == "daemon_op":  # any op to a computer's daemon (operator key only); its answer: op_results[op_id]
+            op = body.get("op") if isinstance(body.get("op"), dict) else {}
+            if op.get("op") not in ("status", "config", "inventory", "start", "stop", "input", "output", "list"):
+                return {"ok": False, "err": "unknown op"}
+            return self.send_op(str(body.get("box") or ""), op)
+        if a == "session_input":  # a line typed into a hidden session of this computer
+            return {"ok": True, **B.session_input(str(body.get("profile") or ""), str(body.get("text") or "")[:20000])}
+        if a == "session_stop":
+            s = (B.jload("state.json", {}).get("started") or {}).get(str(body.get("profile") or ""))
+            return {"ok": bool(s), **(B.stop_session(s) if s else {"err": "not a session the daemon started"})}
         if a == "butler_refresh":
             if B.status().get("running"):
                 (B.home() / "refresh").touch()
@@ -1623,6 +1659,11 @@ class State:
                         why = f"does not verify: {ex}"
                 if payload and payload.get("kind") == "question":
                     self.questions.add(u, sender, payload, card, known=sender in peers)
+                elif payload and payload.get("kind") == "op_result":  # a daemon's answer to an op this console sent
+                    res = getattr(self, "op_results", {})
+                    res[str(payload.get("re") or payload.get("id"))] = {"from": sender, "label": card.get("label"), "server": u,
+                                                                         "at": time.time(), "result": payload.get("op_result")}
+                    self.op_results = dict(sorted(res.items(), key=lambda kv: kv[1]["at"])[-100:])
                 else:
                     log(f"{u}: entry {e['entry']} from {sender} dropped: {why}")
                 call(u, self.op, "/done", {"box": self.op.id, "entries": [e["entry"]]})
@@ -2468,7 +2509,7 @@ def tier_of(m: dict) -> int:
 # ---------------------------------------------------------------- actions: through mmbox.py itself
 def run_client(args: list[str], stdin: str | None = None, timeout: float = 120) -> dict:
     try:
-        p = subprocess.run([sys.executable, str(CLIENT)] + args, input=stdin, capture_output=True, text=True,
+        p = subprocess.run([sys.executable, str(CLIENT)] + args, input=stdin, capture_output=True, text=True, creationflags=NOWIN,
                            timeout=timeout, env={**os.environ, "MMBOX_NO_SELF_UPDATE": "1"})
         return {"ok": p.returncode == 0, "code": p.returncode, "out": p.stdout[-20000:], "err": p.stderr[-20000:],
                 "cmd": "mmbox.py " + " ".join(a if re.fullmatch(r"[\w@.:/=,+-]+", a) else json.dumps(a) for a in args)}
@@ -2620,7 +2661,7 @@ def act(state: State, body: dict) -> dict:
         return state.purge_box(str(body.get("id") or ""))
     if a in ("box_empty", "box_close", "box_delete"):  # a box's menu: what waits in it, closing, deleting
         return state.box_command(str(body.get("id") or ""), a[4:])
-    if a.startswith("butler_"):  # the Butler tab: chat, start a session, refresh the inventory, run it or not
+    if a.startswith(("butler_", "daemon_", "session_")):  # the daemon and its butler: chat, sessions, inventory, ops
         return state.butler_action(a, body)
     if a == "empty_boxes":  # the memory view: every box of every service where this console is an operator
         return state.empty_boxes()
@@ -2829,6 +2870,16 @@ class Handler(BaseHTTPRequestHandler):
                                    "desktop": bool(st.desktop and st.desktop.ok), "held": len(st.held())})
             if u.path == "/api/butler":  # the Butler tab: its state, inventory, started sessions, chat
                 return self._json(st.butler_state())
+            if u.path == "/api/show":  # a second launch of the app: this window to the front
+                if getattr(Handler, "app", None):
+                    Handler.app.show()
+                return self._json({"ok": True, "window": bool(getattr(Handler, "app", None))})
+            if u.path == "/api/session_output":  # a hidden session's output (this computer), from a byte offset
+                try:
+                    since = int((q.get("since") or ["0"])[0])
+                except ValueError:
+                    since = 0
+                return self._json(B.session_output((q.get("profile") or [""])[0], since) if B else {"lines": [], "next": 0})
             if u.path == "/api/butler_log":  # the butler's live output, from a byte offset
                 try:
                     since = int((q.get("since") or ["0"])[0])
@@ -2946,6 +2997,9 @@ def main():
     if a.whoami:
         print(f"operator id {op.id}\nfingerprint {op.fingerprint}\nkeys in {op.home}")
         return
+    if not a.browser and show_running(op.home, a.port):
+        log("already running: its window is brought to the front")
+        return
     state = State(op, a.days)
     log(f"client {CLIENT}; operator {op.id} ({op.fingerprint}); first refresh…")
     try:
@@ -2965,11 +3019,20 @@ def main():
             except Exception as e:
                 log(f"refresh failed: {type(e).__name__}: {e}")
     threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=state.ensure_butler, daemon=True).start()  # the daemon with the app, at once (Settings)
     Handler.state, Handler.token, Handler.port = state, secrets.token_urlsafe(24), a.port
     httpd = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     url = f"http://127.0.0.1:{a.port}/#token={Handler.token}"
     url_of = lambda question=False, held=False: url + ("&question=next" if question else "&view=held" if held else "")  # noqa: E731
     app = None if a.browser else app_window(url, a.open or a.no_tray, op.home)
+    Handler.app = app
+    instance = op.home / "instance.json"  # for a second launch: bring this window to the front instead
+    try:
+        fd = os.open(instance, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "port": a.port, "token": Handler.token}, f)
+    except OSError:
+        pass
     if not a.no_tray:
         def quit_console():
             log("stopped from the notification area")
@@ -2999,6 +3062,19 @@ def main():
     except KeyboardInterrupt:
         pass
     httpd.shutdown()
+
+
+def show_running(home: Path, port: int) -> bool:
+    """Whether this console already runs (its instance file, its server answering with its token): its window is then
+    brought to the front, and this launch stops."""
+    try:
+        inst = json.loads((home / "instance.json").read_text(encoding="utf-8"))
+        req = urllib.request.Request(f"http://127.0.0.1:{int(inst.get('port') or port)}/api/show",
+                                     headers={"X-Console-Token": str(inst.get("token") or "")})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
 
 
 def app_window(url: str, shown: bool, home: Path) -> AppWindow | None:
