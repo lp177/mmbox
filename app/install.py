@@ -66,17 +66,20 @@ StartupWMClass={ID}
 def linux_install(check: bool) -> int:
     p, want = linux_paths(), linux_entry()
     have = p["desktop"].read_text(encoding="utf-8") if p["desktop"].is_file() else None
-    if have == want and p["svg"].is_file():
+    icons = [(APP / "static" / "icon.svg", p["svg"]), (APP / "static" / "icon-256.png", p["png"])]
+    icons_same = all(not src.is_file() or (dst.is_file() and dst.read_bytes() == src.read_bytes()) for src, dst in icons)
+    if have == want and icons_same:
         print(f"already installed: {p['desktop']}")
         return 0
     if check:
-        print("not installed" if have is None else f"installed but out of date (the console or Python moved): {p['desktop']}")
+        print("not installed" if have is None else
+              f"installed but out of date (the console or Python moved, or the logo changed): {p['desktop']}")
         return 1
     for k in ("desktop", "svg", "png"):
         p[k].parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(APP / "static" / "icon.svg", p["svg"])
-    if (APP / "static" / "icon-256.png").is_file():
-        shutil.copyfile(APP / "static" / "icon-256.png", p["png"])
+    for src, dst in icons:
+        if src.is_file():
+            shutil.copyfile(src, dst)
     p["desktop"].write_text(want, encoding="utf-8")
     p["desktop"].chmod(0o755)
     refresh_linux_caches(p)
@@ -120,25 +123,46 @@ def ps_quote(s: str) -> str:
     return "'" + str(s).replace("'", "''") + "'"
 
 
+def windows_icon_dir() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "mmbox" / "icons"
+
+
+def windows_icon() -> Path | None:
+    """Where the shortcut's icon is copied: its name carries the logo's hash, so that a new logo is a new path and
+    Explorer's icon cache (which keeps an icon by its path) shows it."""
+    import hashlib
+    src = APP / "static" / "icon.ico"
+    if not src.is_file():
+        return None
+    return windows_icon_dir() / f"mmbox-{hashlib.sha256(src.read_bytes()).hexdigest()[:10]}.ico"
+
+
 def windows_install(check: bool) -> int:
     link, target, args = windows_link(), python_gui(), f'"{CONSOLE}" --open'
-    icon = APP / "static" / "icon.ico"
+    icon = windows_icon()
     code, out = powershell(f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({ps_quote(link)});"
-                           f"Write-Output ($s.TargetPath + '|' + $s.Arguments)") if link.is_file() else (1, "")
-    if code == 0 and out.strip() == f"{target}|{args}":
+                           f"Write-Output ($s.TargetPath + '|' + $s.Arguments + '|' + $s.IconLocation)") if link.is_file() else (1, "")
+    if code == 0 and out.strip() == f"{target}|{args}|{f'{icon},0' if icon else ''}" and (icon is None or icon.is_file()):
         print(f"already installed: {link}")
         return 0
     if check:
-        print("not installed" if not link.is_file() else f"installed but out of date (the console or Python moved): {link}")
+        print("not installed" if not link.is_file() else
+              f"installed but out of date (the console or Python moved, or the logo changed): {link}")
         return 1
     link.parent.mkdir(parents=True, exist_ok=True)
     for old in OLD_NAMES:
         windows_link(old).unlink(missing_ok=True)
+    if icon is not None:
+        icon.parent.mkdir(parents=True, exist_ok=True)
+        for old in icon.parent.glob("mmbox-*.ico"):
+            if old != icon:
+                old.unlink(missing_ok=True)
+        shutil.copyfile(APP / "static" / "icon.ico", icon)
     code, out = powershell(
         f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut({ps_quote(link)});"
         f"$s.TargetPath={ps_quote(target)}; $s.Arguments={ps_quote(args)}; $s.WorkingDirectory={ps_quote(APP)};"
         f"$s.Description={ps_quote('The operator console of mmbox')};"
-        + (f"$s.IconLocation={ps_quote(str(icon) + ',0')};" if icon.is_file() else "") + "$s.Save()")
+        + (f"$s.IconLocation={ps_quote(str(icon) + ',0')};" if icon is not None else "") + "$s.Save()")
     if code != 0:
         print(f"failed: {out.strip()[:500]}", file=sys.stderr)
         return 1
@@ -153,6 +177,8 @@ def windows_uninstall(check: bool) -> int:
     if check:
         print("installed" if link.is_file() else "not installed")
         return 0 if link.is_file() else 1
+    for old in windows_icon_dir().glob("mmbox-*.ico"):
+        old.unlink(missing_ok=True)
     if link.is_file():
         link.unlink()
         print(f"removed: {link}")
