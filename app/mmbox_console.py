@@ -537,9 +537,9 @@ class AppWindow:
                 from gi.repository import Gdk, GdkPixbuf, Gtk
                 Gtk.init([])
                 # its icon in the task bar: set before the window exists, which the default icon applies to only
-                icon = str(STATIC / "icon.svg")
-                Gtk.Window.set_default_icon_list([GdkPixbuf.Pixbuf.new_from_file_at_size(icon, n, n)
-                                                  for n in (16, 24, 32, 48, 64, 128, 256)])
+                # the thick-stroke drawing for the small sizes (it stays readable at 16 px), the full one above
+                Gtk.Window.set_default_icon_list([GdkPixbuf.Pixbuf.new_from_file_at_size(
+                    str(STATIC / ("icon-small.svg" if n <= 32 else "icon.svg")), n, n) for n in (16, 24, 32, 48, 64, 128, 256)])
                 # most of the screen pywebview centres it on (its first), a 4K one included
                 geo = Gdk.Display.get_default().get_monitor(0).get_geometry()
                 width, height = max(1100, int(geo.width * 0.7)), max(760, int(geo.height * 0.8))
@@ -980,8 +980,9 @@ class Desktop:
 
 
 def tray_svg(dot: bool) -> str:
-    """The console's icon (static/icon.svg, the one of the tab and the header), with the red dot when something waits."""
-    svg = (STATIC / "icon.svg").read_text(encoding="utf-8").rstrip()
+    """The console's tray icon (static/icon-small.svg, the logo's thick-stroke drawing for small sizes, also the tab's
+    and the header's), with the red dot when something waits."""
+    svg = (STATIC / "icon-small.svg").read_text(encoding="utf-8").rstrip()
     if dot:
         svg = svg[:-len("</svg>")] + '<circle cx="51" cy="13" r="12" fill="#e5383b" stroke="#121212" stroke-width="3"/></svg>'
     return svg
