@@ -1457,6 +1457,53 @@ def operator_peer(url: str, mid: str | None) -> dict | None:
             "operator": True, "rights": "execute"}
 
 
+def account_module():
+    """client/mmbox_account.py (accounts, devices: client/ACCOUNTS.md), beside this file; None with an older clone."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import mmbox_account
+        return mmbox_account
+    except ImportError:
+        return None
+
+
+def account_pins() -> dict:
+    """The accounts this computer obeys as operators: root fingerprint -> {chain, at} (accounts.json, by `daemon operator
+    --account`); the daemon keeps each chain up to date."""
+    try:
+        return (json.loads((base_dir() / "accounts.json").read_text(encoding="utf-8")) or {}).get("pins") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def account_pins_save(pins: dict) -> None:
+    p = base_dir() / "accounts.json"
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps({"pins": pins}, indent=1), encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+
+
+def account_peer(mid: str | None) -> dict | None:
+    """A device of a pinned account as a peer record (to open what it sent): its keys from the cached chain, checked
+    without the freshness rule here; the daemon checks freshness and revocation once it read the op's own chain."""
+    A = account_module()
+    if not A or not mid:
+        return None
+    for fp, pin in account_pins().items():
+        try:
+            st = A.verify(pin.get("chain") or [], fp, max_age=None)
+        except A.ChainError:
+            continue
+        d = st["devices"].get(mid)
+        if d:
+            return {"id": mid, "user": d.get("user"), "sign_pub": d["sign_pub"], "box_pub": d["box_pub"], "alias": "operator",
+                    "label": d.get("label") or "operator device", "agent": "console", "operator": True,
+                    "account": fp, "rights": "execute", "fingerprint": None}
+    return None
+
+
 def logged_message(me: "Me", msg_id: str) -> dict | None:
     """A message this box (or its machine box) received or sent, from the local logs: what a question is about."""
     for b in [me] + ([m] if (m := machine_me(me.user, active_only=False)) and m.id != me.id else []):
@@ -2312,7 +2359,8 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
         now_ms = r.get("now_ms") or int(time.time() * 1000)
         for e in r.get("entries", []):
             mid, env = e.get("from"), e.get("env") or {}
-            peer = peers.get(mid) or operator_peer(gw.url, mid)  # a peer, or the operator key this computer pinned
+            peer = peers.get(mid) or operator_peer(gw.url, mid) or account_peer(mid)  # a peer, the pinned operator key,
+            # or a device of an account this computer pinned (client/ACCOUNTS.md)
             if not peer and (sb := local_box(mid)) is not None and sb.user == me.user:
                 peer = own_peer(sb)  # a box of this computer closed since (a project box passing on what waited in it)
             msg_id = str(env.get("id") or e["entry"])
@@ -7257,6 +7305,8 @@ def cmd_selftest(a, local: Local):
     """Offline: two identities, a pairing (right and wrong code) and a message, no store involved."""
     selftest()
     print("selftest ok: SPAKE2 (right and wrong code), X25519 + ChaCha20-Poly1305, Ed25519")
+    if (A := account_module()) is not None:
+        print("selftest ok: " + A.selftest())
 
 
 def selftest() -> None:

@@ -898,10 +898,11 @@ def handle_own_box(b, st) -> None:
         return
     for it in items:
         p = it.get("payload") or {}
-        if it["status"] == "op":  # the operator's console (its pinned key: the client checked it), and nobody else
-            reply = do_op(p.get("op") if isinstance(p.get("op"), dict) else {})
+        if it["status"] == "op":  # the operator's console (its pinned key, or a device of a pinned account), nobody else
             via = it.get("via")
-            opeer = M.operator_peer(via, it["peer_id"]) if via else None
+            why = account_check(it["peer_id"], p)
+            reply = {"error": f"refused: {why}"} if why else do_op(p.get("op") if isinstance(p.get("op"), dict) else {})
+            opeer = (M.operator_peer(via, it["peer_id"]) or M.account_peer(it["peer_id"])) if via else None
             if opeer:
                 opeer = {**opeer, "gateway": via, "gateways": [via]}
                 M.send_payload(b, it["peer_id"], opeer, b.conf.get("project") or "", f"Re: {p.get('subject', 'op')}",
@@ -923,6 +924,45 @@ def handle_own_box(b, st) -> None:
                    f"you can do it yourself within the rights shown, do it and answer the sender (`send --re`); if "
                    f"neither, answer the sender that it waits, and say so here. Never drop it silently.\n\n"
                    f"(Context now)\n{context_text()}", f"message {it['id']} from {it['peer']}")
+
+
+def account_check(sender: str, p: dict) -> str | None:
+    """For an op sent by a device of a pinned account: the chain it carries updates this computer's cache (only forward:
+    never a fork, never going back), then the sender must be a device of that fresh chain, not revoked. None: allowed.
+    An op from the pinned operator key (no account) passes as before."""
+    A = M.account_module()
+    pins = M.account_pins()
+    acct = None
+    for fp, pin in pins.items() if A else []:
+        try:
+            if sender in A.verify(pin.get("chain") or [], fp, max_age=None)["devices"]:
+                acct = fp
+                break
+        except A.ChainError:
+            continue
+    if acct is None:
+        return None  # the pinned operator key itself (the client accepted it as such), not an account's device
+    chain = p.get("chain") if isinstance(p.get("chain"), list) else None
+    if chain:
+        try:
+            keep = A.newer(pins[acct].get("chain"), chain, acct)
+        except A.ChainError as e:
+            return f"the chain it carries does not hold: {e}"
+        if keep is None:
+            log("error", f"a chain that forks from this computer's was offered by {sender}: refused")
+            return "its chain forks from the one this computer knows"
+        old = pins[acct].get("chain") or []
+        if len(keep) != len(old) or not A.extends(old, keep):
+            pins[acct] = {"chain": keep, "at": time.time()}
+            M.account_pins_save(pins)
+            log("daemon", f"account {acct}: chain now {len(keep)} link(s)")
+    try:
+        st = A.verify(pins[acct]["chain"], acct)
+    except A.ChainError as e:
+        return str(e)
+    if sender not in st["devices"]:
+        return f"{sender} is revoked from account {st['account']}"
+    return None
 
 
 def do_op(op: dict) -> dict:
@@ -1178,6 +1218,8 @@ def main(module, argv: list[str]) -> int:
     x = sp.add_parser("operator", help="the operator key the daemon obeys: pinned on each service of this computer")
     x.add_argument("--fingerprint", help="pin this operator key where none is pinned (asked on a terminal otherwise)")
     x.add_argument("--operator-fingerprint", dest="fingerprint", help=argparse.SUPPRESS)
+    x.add_argument("--account", help="pin this account's root fingerprint: its devices may then send ops (client/ACCOUNTS.md)")
+    x.add_argument("--chain", help="with --account: its device chain (a JSON file the console exports), checked against it")
     x = sp.add_parser("session-run", help=argparse.SUPPRESS)  # a hidden session's runner (started by the daemon)
     x.add_argument("name")
     x = sp.add_parser("session-input", help="type a line into a hidden session the daemon started")
@@ -1219,6 +1261,22 @@ def main(module, argv: list[str]) -> int:
             return 1
         if not ok:
             print("WARNING: the daemon runs, but obeys no operator on the services listed above until its key is pinned")
+    elif a.cmd == "operator" and a.account:
+        A = M.account_module()
+        pins = M.account_pins()
+        chain = json.loads(Path(a.chain).read_text(encoding="utf-8")) if a.chain else (pins.get(a.account) or {}).get("chain") or []
+        if chain:
+            try:
+                st = A.verify(chain, a.account, max_age=None)
+            except A.ChainError as e:
+                print(f"not pinned: {e}", file=sys.stderr)
+                return 1
+            print(f"account {st['account']} (root {a.account}): {len(st['devices'])} device(s): "
+                  + ", ".join(f"{d.get('label')} ({i})" for i, d in st["devices"].items()))
+        pins[a.account] = {"chain": chain, "at": time.time()}
+        M.account_pins_save(pins)
+        print(f"pinned: the devices of account {a.account} may send ops to this computer's daemon"
+              + ("" if chain else " (its chain comes with their first op)"))
     elif a.cmd == "operator":
         ok, lines = operator_pins(a.fingerprint, ask=True)
         print("\n".join(lines))

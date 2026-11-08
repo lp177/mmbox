@@ -68,3 +68,24 @@ on another computer, a device approved).
    recovery export); `MMBOX_OPERATORS` and the pinned operator fingerprints are replaced by the account's root; the
    export/import commands go.
 4. Later: several users (invitations, ownership, roles), WebAuthn.
+
+## As built: step 1 (2026-11-08)
+
+- `client/mmbox_account.py`: links, `verify` (every link, the pinned root, no revoked signer, a revoked device never
+  back, stale chain refused), `newer` (a cache only moves forward: no fork, no going back), a selftest run by
+  `mmbox.py selftest`.
+- Console: `--account-create RECOVERY_FILE` (root key in the keyring or DPAPI as `root`, beside the device's own key
+  `identity`; its recovery export sealed with a passphrase of 16 characters at least), `--account-join FILE` (a request
+  and its 6-digit code), `--account-approve FILE --code N` (the code must match), `--account-complete FILE`,
+  `--account-revoke DEVICE`, `--account-head` (also signed daily by the running console), `--account-show`,
+  `--account-chain FILE`. Every `op` carries the account's chain.
+- Client and daemon: `mmbox.py daemon operator --account <root fingerprint> [--chain FILE]` pins an account
+  (`accounts.json` in the mmbox folder); an `op` from a device of it is opened with the device's keys from the cached
+  chain, the chain it carries updates the cache (forward only), then the sender must be in the fresh chain and not
+  revoked. The pinned operator key keeps working beside it until the move (step 3).
+- Tested on the bench: a computer pinning only the account obeys device A; B joins (wrong code refused, right code
+  approved by A); B is obeyed once a device carried the new chain; after A revokes B and carries it, B is not.
+- Until step 2: the daemons learn a new chain only from the ops of known devices (a new device is obeyed after a known
+  device sent something; a revocation once a device sent something); two devices signing heads at once may fork (the
+  daemon then keeps its chain): the service will hold the chain and order its links. A device sends ops only if the
+  service lets it write to the daemon's box (today: operators of the service).

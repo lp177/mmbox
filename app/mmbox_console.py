@@ -158,9 +158,10 @@ class KeyStore:
     store; when it names a store that does not answer (a locked keyring), the console stops: it never makes a new key
     over the one that store holds (a new key is no longer the services' operator)."""
 
-    def __init__(self, home: Path):
-        self.home = home
-        self.where_file = home / "identity.where"
+    def __init__(self, home: Path, name: str = "identity"):
+        self.home, self.name = home, name  # "identity": this device's key pair; "root": the account's root key
+        self.where_file = home / f"{name}.where"
+        self.attrs = {"home": str(home), "key": name}
 
     # -- the stores
     def _secret(self):
@@ -170,7 +171,8 @@ class KeyStore:
             import gi
             gi.require_version("Secret", "1")
             from gi.repository import Secret
-            schema = Secret.Schema.new("org.mmbox.console", Secret.SchemaFlags.NONE, {"home": Secret.SchemaAttributeType.STRING})
+            schema = Secret.Schema.new("org.mmbox.console", Secret.SchemaFlags.NONE, {"home": Secret.SchemaAttributeType.STRING,
+                                                                                     "key": Secret.SchemaAttributeType.STRING})
             return Secret, schema
         except (ImportError, ValueError, AttributeError):
             return None
@@ -198,7 +200,7 @@ class KeyStore:
         try:
             return self.where_file.read_text(encoding="utf-8").strip() or None
         except OSError:
-            return "file" if (self.home / "identity.json").is_file() else None
+            return "file" if (self.home / f"{self.name}.json").is_file() else None
 
     def load(self) -> dict | None:
         """The operator identity, or None when this console has none yet; raises when its store does not answer."""
@@ -206,15 +208,15 @@ class KeyStore:
         if w is None:
             return None
         if w == "dpapi":
-            return json.loads(self._dpapi((self.home / "identity.dpapi").read_bytes(), False).decode("utf-8"))
+            return json.loads(self._dpapi((self.home / f"{self.name}.dpapi").read_bytes(), False).decode("utf-8"))
         if w == "secret-service":
             sec = self._secret()
-            v = sec[0].password_lookup_sync(sec[1], {"home": str(self.home)}, None) if sec else None
+            v = sec[0].password_lookup_sync(sec[1], self.attrs, None) if sec else None
             if not v:
                 raise RuntimeError("the operator key is kept in this session's keyring (Secret Service), which does not "
                                    "answer or is locked: unlock it (log in to the desktop), then start the console again")
             return json.loads(v)
-        return json.loads((self.home / "identity.json").read_text(encoding="utf-8"))
+        return json.loads((self.home / f"{self.name}.json").read_text(encoding="utf-8"))
 
     def save(self, ident: dict) -> str:
         """Kept in the safest store this system has; the plain file goes once the key is safely elsewhere."""
@@ -223,23 +225,23 @@ class KeyStore:
         if os.name == "nt":
             try:
                 blob = self._dpapi(data.encode("utf-8"), True)
-                self._write(self.home / "identity.dpapi", blob)
+                self._write(self.home / f"{self.name}.dpapi", blob)
                 if self._dpapi(blob, False).decode("utf-8") == data:
                     where = "dpapi"
             except OSError as e:
                 log(f"DPAPI unavailable ({e}): the operator key stays in a file of this user")
         elif (sec := self._secret()) is not None:
             try:
-                ok = sec[0].password_store_sync(sec[1], {"home": str(self.home)}, sec[0].COLLECTION_DEFAULT,
-                                                "mmbox console operator key", data, None)
-                if ok and sec[0].password_lookup_sync(sec[1], {"home": str(self.home)}, None) == data:
+                ok = sec[0].password_store_sync(sec[1], self.attrs, sec[0].COLLECTION_DEFAULT,
+                                                f"mmbox console {'account root key' if self.name == 'root' else 'operator key'}", data, None)
+                if ok and sec[0].password_lookup_sync(sec[1], self.attrs, None) == data:
                     where = "secret-service"
             except Exception as e:  # noqa: BLE001 - no Secret Service on this session: a file of this user then
                 log(f"no keyring answers ({type(e).__name__}: {e}): the operator key stays in a file of this user (0600)")
         if where == "file":
-            self._write(self.home / "identity.json", data.encode("utf-8"))
+            self._write(self.home / f"{self.name}.json", data.encode("utf-8"))
         else:
-            self._shred(self.home / "identity.json")
+            self._shred(self.home / f"{self.name}.json")
         self._write(self.where_file, where.encode("utf-8"))
         return where
 
@@ -1617,7 +1619,8 @@ class State:
         mid = M.now().strftime("%Y%m%dT%H%M%SZ") + "-" + M.rand_b32(6)
         payload = {"v": M.VERSION, "id": mid, "from": self.op.id, "from_user": self.op.user, "label": self.op.label,
                    "agent": "console", "to": box, "ts": M.iso(), "kind": "op", "subject": f"op {op.get('op')}",
-                   "body": json.dumps(op, ensure_ascii=False), "reply_expected": True, "op": op}
+                   "body": json.dumps(op, ensure_ascii=False), "reply_expected": True, "op": op,
+                   **({"chain": ch} if (ch := account_chain()) else {})}  # a pinned account's daemon checks it
         env = M.envelope(self.op, {"id": box, "box_pub": card["box_pub"]}, payload, mid)
         r = call(url, self.op, "/send", {"to": box, "env": env})
         if r.get("_error") is not None:
@@ -3134,6 +3137,18 @@ def main():
     ap.add_argument("--import-key", metavar="FILE", help="take the operator key from such a FILE (its passphrase asked), kept "
                                                         "in this system's keyring or DPAPI; then exit")
     ap.add_argument("--force", action="store_true", help="with --import-key: replace another operator key held here")
+    ap.add_argument("--account-create", metavar="RECOVERY_FILE", help="make the account: its root key (kept here, and "
+                    "sealed into RECOVERY_FILE with a passphrase) and this console as its first device")
+    ap.add_argument("--account-show", action="store_true", help="the account, its devices and revocations")
+    ap.add_argument("--account-join", metavar="FILE", help="this console asks to join an account: a request with a code")
+    ap.add_argument("--account-approve", metavar="FILE", help="from a device of the account: approve that request")
+    ap.add_argument("--code", help="with --account-approve: the code the new device shows")
+    ap.add_argument("--account-complete", metavar="FILE", help="on the new device: the approved request, back")
+    ap.add_argument("--account-revoke", metavar="DEVICE", help="revoke a device of the account")
+    ap.add_argument("--account-head", action="store_true", help="sign the chain's head now (done daily by the console)")
+    ap.add_argument("--account-chain", metavar="FILE", help="write the account's chain (for `mmbox.py daemon operator "
+                    "--account <fp> --chain FILE`)")
+    ap.add_argument("--passphrase-stdin", action="store_true", help=argparse.SUPPRESS)  # tests and automation only
     ap.add_argument("--no-tray", action="store_true", help="no icon in the notification area, no system notification")
     a = ap.parse_args()
     CLIENT = find_client(a.client)
@@ -3142,6 +3157,9 @@ def main():
     B = load_butler()
     if a.has_key or a.export_key or a.import_key:
         sys.exit(key_command(a))
+    if any(getattr(a, k) for k in ("account_create", "account_show", "account_join", "account_approve", "account_complete",
+                                   "account_revoke", "account_head", "account_chain")):
+        sys.exit(account_command(a))
     op = Operator()
     if a.whoami:
         print(f"operator id {op.id}\nfingerprint {op.fingerprint}\nkeys in {op.home}")
@@ -3164,6 +3182,12 @@ def main():
                 state.refresh()
                 if n % 8 == 0:
                     state.ensure_butler()  # runs with the console (Settings), one per computer
+                if n % 400 == 0 and account_chain():
+                    try:
+                        if account_head_due(op):  # the daily head of the account's chain (client/ACCOUNTS.md)
+                            log("account: daily head signed")
+                    except Exception as e:  # noqa: BLE001 - logged; the console goes on
+                        log(f"account head failed: {type(e).__name__}: {e}")
                 n += 1
             except Exception as e:
                 log(f"refresh failed: {type(e).__name__}: {e}")
@@ -3211,6 +3235,149 @@ def main():
     except KeyboardInterrupt:
         pass
     httpd.shutdown()
+
+
+# ---------------------------------------------------------------- the account (client/ACCOUNTS.md): root key, device chain
+def account_chain() -> list | None:
+    try:
+        return json.loads((console_home() / "account.json").read_text(encoding="utf-8")).get("chain") or None
+    except (OSError, ValueError):
+        return None
+
+
+def account_save(chain: list) -> None:
+    p = console_home() / "account.json"
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps({"chain": chain}, indent=1), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def account_lib():
+    p = Path(CLIENT).with_name("mmbox_account.py")
+    spec = importlib.util.spec_from_file_location("mmbox_account", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def ask_passphrase(a, prompt: str, twice: bool) -> str:
+    import getpass
+    if getattr(a, "passphrase_stdin", False):
+        return sys.stdin.readline().rstrip("\n")
+    pw = getpass.getpass(prompt)
+    if twice and pw != getpass.getpass("The same passphrase again: "):
+        raise SystemExit("the passphrases differ")
+    return pw
+
+
+def device_record(op: "Operator") -> dict:
+    return {"id": op.id, "sign_pub": M.b64e(op.sign_pub), "box_pub": M.b64e(op.box_pub),
+            "label": op.label, "host": socket.gethostname(), "user": op.user}
+
+
+def account_head_due(op: "Operator", hours: float = 20) -> bool:
+    """The daily head: this device re-signs the chain's end, so that daemons know it is current (a withheld revocation
+    shows as a stale chain). Returns whether it signed one."""
+    chain = account_chain()
+    if not chain or time.time() - chain[-1]["ts"] < hours * 3600:
+        return False
+    A = account_lib()
+    if op.id not in A.verify(chain, max_age=None)["devices"]:
+        return False
+    chain.append(A.make_link(chain, "head", None, op.id, op.sign))
+    account_save(chain)
+    return True
+
+
+def account_command(a) -> int:
+    """--account-*: make the account (its root key and the first device: this console), a new device asking to join,
+    approving it from a device of the account (its code checked), revoking one, the daily head, the chain for a daemon."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    A = account_lib()
+    op = Operator()
+    chain = account_chain()
+    raw_pub = dict(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    if a.account_create:
+        if chain:
+            raise SystemExit("this console is already a device of an account (--account-show)")
+        root = Ed25519PrivateKey.generate()
+        rpub = root.public_key().public_bytes(**raw_pub)
+        raw = dict(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw,
+                   encryption_algorithm=serialization.NoEncryption())
+        rec = {"id": A.account_id(rpub), "sign_key": M.b64e(root.private_bytes(**raw)), "box_key": M.b64e(os.urandom(32)),
+               "created": M.iso()}
+        out = Path(a.account_create)
+        pw = ask_passphrase(a, "A passphrase for the recovery export of the root key (16 characters at least): ", True)
+        if len(pw) < 16:
+            raise SystemExit("not made: the passphrase is shorter than 16 characters")
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({**seal_identity(rec, pw), "kind": "mmbox account root"}, f)
+        where = KeyStore(console_home(), "root").save(rec)
+        chain = [A.make_link([], "add", device_record(op), "root", root, rpub)]
+        account_save(chain)
+        print(f"account {rec['id']} made; root fingerprint {A.root_fingerprint(rpub)} (pin it on each computer: "
+              f"`mmbox.py daemon operator --account {A.root_fingerprint(rpub)}`); root key kept in {where}; recovery "
+              f"export written to {out}: keep it offline, then delete it from this computer")
+        return 0
+    if a.account_join:
+        if chain:
+            raise SystemExit("this console is already a device of an account")
+        code = f"{secrets.randbelow(10 ** 6):06d}"
+        Path(a.account_join).write_text(json.dumps({"join": device_record(op), "code": code}, indent=1), encoding="utf-8")
+        print(f"join request written to {a.account_join}; its code: {code} (the approving device checks it)")
+        return 0
+    if a.account_approve:
+        if not chain:
+            raise SystemExit("this console is no device of an account")
+        req = json.loads(Path(a.account_approve).read_text(encoding="utf-8"))
+        dev = req.get("join") or {}
+        print(f"approve {dev.get('label')} on {dev.get('host')} ({dev.get('id')})?")
+        code = a.code or input("The code the new device shows: ").strip()
+        if code != req.get("code"):
+            raise SystemExit("the codes differ: not approved")
+        chain.append(A.make_link(chain, "add", dev, op.id, op.sign))
+        A.verify(chain, max_age=None)
+        account_save(chain)
+        Path(a.account_approve).write_text(json.dumps({**req, "chain": chain}, indent=1), encoding="utf-8")
+        print(f"approved: {dev.get('id')} is a device of the account; {a.account_approve} now holds the chain: "
+              f"carry it back to the new device (--account-complete)")
+        return 0
+    if a.account_complete:
+        req = json.loads(Path(a.account_complete).read_text(encoding="utf-8"))
+        st = A.verify(req.get("chain") or [], max_age=None)
+        if op.id not in st["devices"]:
+            raise SystemExit("this console is not in that chain: not approved yet")
+        account_save(req["chain"])
+        print(f"this console is now a device of account {st['account']} (root {st['fingerprint']})")
+        return 0
+    if not chain:
+        raise SystemExit("this console is no device of an account (--account-create, or --account-join)")
+    if a.account_revoke:
+        st = A.verify(chain, max_age=None)
+        dev = st["devices"].get(a.account_revoke)
+        if not dev:
+            raise SystemExit(f"{a.account_revoke}: no active device of the account")
+        chain.append(A.make_link(chain, "revoke", dev, op.id, op.sign))
+        account_save(chain)
+        print(f"revoked {a.account_revoke}; the daemons learn it with the next op of a device (or from the service)")
+        return 0
+    if a.account_head:
+        print("head signed" if account_head_due(op, hours=0) else "not signed (this console is not an active device)")
+        return 0
+    if a.account_chain:
+        Path(a.account_chain).write_text(json.dumps(chain, indent=1), encoding="utf-8")
+        print(f"chain written to {a.account_chain}")
+        return 0
+    st = A.verify(chain, max_age=None)
+    print(f"account {st['account']} · root {st['fingerprint']} · {st['length']} link(s), newest "
+          f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(st['head_ts']))}")
+    for i, d in st["devices"].items():
+        print(f"  device {i}: {d.get('label')} on {d.get('host')}" + ("  (this console)" if i == op.id else ""))
+    for i in st["revoked"]:
+        print(f"  revoked {i}")
+    return 0
 
 
 def key_command(a) -> int:
