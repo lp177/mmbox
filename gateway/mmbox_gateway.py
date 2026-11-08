@@ -912,13 +912,16 @@ def title_of(v) -> str | None:
     return " ".join(words)[:60] or None
 
 
+BOX_ROLES = ("machine", "session", "project", "butler")  # a project box and the butler are children of a machine box
+
+
 def box_info(info) -> dict:
     """What a box may declare of itself, cut to size: nothing here is trusted beyond being said by the box's key."""
     if not isinstance(info, dict):
         raise _http(400, "`info`: an object")
     host = info.get("host") if isinstance(info.get("host"), dict) else {}
     client = info.get("client") if isinstance(info.get("client"), dict) else {}
-    out = {"role": "machine" if info.get("role") == "machine" else "session",
+    out = {"role": info.get("role") if info.get("role") in BOX_ROLES else "session",
            "machine": info.get("machine") if isinstance(info.get("machine"), str) and ID_RE.fullmatch(info["machine"]) else None,
            "project": _s(info.get("project"), 80), "work": _s(info.get("work"), 80), "label": _s(info.get("label"), 120),
            "agent": _s(info.get("agent"), 40), "user": _s(info.get("user"), 80),
@@ -938,7 +941,7 @@ async def box_open(request: web.Request) -> web.Response:
         raise _http(400, "an operator is no box")
     info = box_info(data.get("info"))
     r = request.app["redis"]
-    if info.get("role") == "session" and info.get("machine") and info["machine"] != me:
+    if info.get("role") != "machine" and info.get("machine") and info["machine"] != me:
         info["machine_ok"] = bool(await r.hexists(f"mmbox:links:{info['machine']}", me))
     now_ms = int(time.time() * 1000)
     old = _loads(await r.get(f"mmbox:box:{me}")) or {}

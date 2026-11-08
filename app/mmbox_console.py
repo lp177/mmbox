@@ -125,7 +125,20 @@ def load_client(path: Path):
 
 
 M = None  # the client module, set in main()
+B = None  # the butler's module (client/mmbox_butler.py beside the client), None with an older client
 CLIENT: Path | None = None
+
+
+def load_butler():
+    """The butler's module, beside the client (a full clone); None when the client has none yet."""
+    p = Path(CLIENT).with_name("mmbox_butler.py") if CLIENT else None
+    if not p or not p.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("mmbox_butler", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.M = M
+    return mod
 
 
 # ---------------------------------------------------------------- the operator identity
@@ -999,6 +1012,18 @@ class Archive:
             self.db.execute("DELETE FROM msgs WHERE id NOT IN (SELECT id FROM conv WHERE expired=0)")
             self.db.execute("COMMIT")
 
+    def drop(self, ids) -> int:
+        """These messages gone from the console's copy (a box's own purge); a marker stays for each (mark_purged)."""
+        ids = [(i,) for i in ids]
+        if not ids:
+            return 0
+        with self.lock:
+            self.db.execute("BEGIN")
+            self.db.executemany("UPDATE conv SET expired=1 WHERE id=?", ids)
+            n = sum(self.db.execute("DELETE FROM msgs WHERE id=?", i).rowcount for i in ids)
+            self.db.execute("COMMIT")
+        return n
+
     def purge(self, keep: set) -> int:
         """Every kept message but those of `keep` gone, pinned conversations included; a marker stays for each, so
         that the boxes' logs do not bring them back. The file is compacted after."""
@@ -1336,6 +1361,168 @@ class State:
                f"{len(keep) - len(waiting & keep)} handled by an open box within {fmt_delay(plan['keep_s'])} kept; "
                f"{fmt_bytes(max(0, before - after))} freed.")
         return {"ok": not errors, "out": out + ("\nFailed: " + "; ".join(errors) if errors else ""), "err": "; ".join(errors) or None}
+
+    def purge_box(self, bid: str) -> dict:
+        """A box's menu, "Purge its history": what no longer waits among the messages this box of this computer sent,
+        received or took, gone from its log, its attached files and the console's copy (as the memory view's purge,
+        for this box alone: what still waits, and what an open box handled within the kept delay, stays)."""
+        y = next((b for n in M.local_profiles() if (b := M.load_me(n)) and b.id == bid), None)
+        if not y:
+            return {"ok": False, "err": "not a box of this computer: its history is on its own computer"}
+        plan = self.purge_plan()
+        msgs, waiting, cut = plan["msgs"], plan["waiting"], plan["cut"]
+
+        def mine(m):
+            return bid in {m.get("from"), m.get("to"), m.get("read_by"), (m.get("taken_by") or {}).get("id"),
+                           *(m.get("to_boxes") or []), *(m.get("seen_by") or [])}
+        gone = {i for i in plan["gone"] if mine(msgs[i])}
+        outbox = {i.get("msg_id") for i in (y.local.load("state.json", {}) or {}).get("outbox") or []}
+
+        def drop(e, mid):
+            if not mid or mid in waiting or mid in outbox:
+                return False
+            if mid in gone:
+                return True
+            if mid in msgs:
+                return False
+            try:  # older than the list's horizon: by its own date
+                return M.parse_iso((e.get("payload") or {}).get("ts") or e.get("at")).timestamp() < cut
+            except (TypeError, ValueError, AttributeError):
+                return False
+        try:
+            entries, folders = self._purge_log(y, drop)
+        except OSError as ex:
+            return {"ok": False, "err": f"{y.local.profile}: {ex}"}
+        n_arch = self.archive.drop(gone)
+        self.archive.mark_purged(gone, max(self.days * 86400, self.conv_default_ttl(), plan["keep_s"]) + 86400)
+        self.purged = self.archive.purged()
+        self.logs = LogCache()
+        self._usage = (0.0, {})
+        log(f"purge of {y.local.profile}: {len(gone)} message(s), {entries} log entries, {n_arch} console cop(ies)")
+        threading.Thread(target=self.refresh, daemon=True).start()
+        return {"ok": True, "out": f"{y.label}: {len(gone)} message(s) purged ({entries} log entries, {folders} attached "
+                                   f"file folder(s), {n_arch} console cop(ies)); what still waits, and what an open box "
+                                   f"handled within {fmt_delay(plan['keep_s'])}, kept."}
+
+    def box_command(self, bid: str, what: str) -> dict:
+        """A box's menu: empty what waits in it (purged, senders told), close a session box, delete a project box (or
+        a closed session box). Only for the boxes of this computer: the client does it with the box's own keys."""
+        y = next((b for n in M.local_profiles() if (b := M.load_me(n)) and b.id == bid), None)
+        if not y:
+            return {"ok": False, "err": "not a box of this computer: only its own computer can do that"}
+        prof = y.local.profile
+        if what == "empty":
+            r = run_client(["--profile", prof, "backlog", "purge", "--box", "session", "--all"], timeout=180)
+        elif what == "close":
+            if y.role != "session" or y.closed_at:
+                return {"ok": False, "err": "only an open session box is closed"}
+            r = run_client(["--profile", M.MACHINE_PROFILE, "sessions", "--close", prof, "--reason", "closed from the console"])
+        elif what == "delete":
+            if y.role == "machine" or (y.role == "session" and not y.closed_at):
+                return {"ok": False, "err": "only a project box, or a closed session box, is deleted"}
+            r = run_client(["--profile", M.MACHINE_PROFILE, "sessions", "--remove", prof, "--reason", "deleted from the console"],
+                           timeout=180)
+        else:
+            return {"ok": False, "err": f"unknown box command {what}"}
+        self._usage = (0.0, {})
+        threading.Thread(target=self.refresh, daemon=True).start()
+        return r
+
+    # ---------------------------------------------------------------- the butler (client/BUTLER.md)
+    def butler_on(self) -> bool:
+        """Whether this console runs the computer's butler (Settings; on by default)."""
+        return self.console_state.get("butler_run", True) is not False
+
+    def ensure_butler(self) -> None:
+        """The butler's daemon started when this console runs it and none runs on this computer (one per computer: a
+        second one stops at once)."""
+        if getattr(self, "_butler_proc", None) is not None and self._butler_proc.poll() is not None:
+            self._butler_proc = None  # an ended butler this console started: reaped
+        if not B or not self.butler_on() or not M.machine_me():
+            return
+        if B.status().get("running"):
+            return
+        if time.time() - getattr(self, "_butler_started", 0) < 120:
+            return  # just started: its first beat comes
+        self._butler_started = time.time()
+        self._butler_proc = subprocess.Popen([sys.executable, str(CLIENT), "butler", "run"], stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                                             env={**os.environ, "MMBOX_NO_SELF_UPDATE": "1"})
+        log("butler started")
+
+    def butler_state(self) -> dict:
+        if not B:
+            return {"available": False, "why": "the client has no butler yet (mmbox_butler.py): update it (mmbox-update)"}
+        return {"available": True, "run_with_console": self.butler_on(), **B.status(), "chat": B.chat_history(200)}
+
+    @staticmethod
+    def butler_log(since: int) -> dict:
+        """The butler's log from byte `since` (from its start again when it was rotated): at most 400 kB a call."""
+        if not B:
+            return {"lines": [], "next": 0}
+        p = B.home() / "butler.log"
+        try:
+            size = p.stat().st_size
+        except OSError:
+            return {"lines": [], "next": 0}
+        since = since if 0 <= since <= size else 0
+        with open(p, "rb") as f:
+            f.seek(max(since, size - 400_000))
+            data = f.read(400_000)
+        lines = []
+        for ln in data.decode("utf-8", "replace").splitlines():
+            try:
+                lines.append(json.loads(ln))
+            except ValueError:
+                pass
+        return {"lines": lines, "next": size, "reset": since == 0}
+
+    def butler_action(self, a: str, body: dict) -> dict:
+        if not B:
+            return {"ok": False, "err": "the client has no butler yet: update it (mmbox-update)"}
+        if a == "butler_chat":
+            text = str(body.get("text") or "").strip()[:20000]
+            if not text:
+                return {"ok": False, "err": "an empty message"}
+            B.chat_add("operator", text)
+            with open(B.home() / "chat.queue", "a", encoding="utf-8") as f:
+                f.write(text + "\x1e")
+            self.ensure_butler()
+            return {"ok": True, "running": B.status().get("running")}
+        if a == "butler_start":
+            args = ["butler", "start", "--path", str(body.get("path") or "")]
+            for k in ("agent", "model", "title", "task"):
+                if body.get(k):
+                    args += [f"--{k}", str(body[k])]
+            r = run_client(args, timeout=90)
+            try:
+                res = json.loads((r.get("out") or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                return {"ok": False, "err": (r.get("err") or r.get("out") or "no answer")[-1500:]}
+            return {"ok": "error" not in res, **res, "err": res.get("error")}
+        if a == "butler_refresh":
+            if B.status().get("running"):
+                (B.home() / "refresh").touch()
+                return {"ok": True, "out": "the butler probes the agents and models now"}
+            r = run_client(["butler", "inventory", "--refresh"], timeout=120)
+            return {"ok": r.get("ok"), "out": "agents and models probed", "err": r.get("err") if not r.get("ok") else None}
+        if a == "butler_run":
+            on = bool(body.get("on"))
+            self.console_state["butler_run"] = on
+            self.save_console_state()
+            if on:
+                self._butler_started = 0
+                self.ensure_butler()
+            elif (pid := B.status().get("pid")) and B.status().get("running"):
+                try:
+                    os.kill(int(pid), 15)
+                except OSError as e:
+                    return {"ok": False, "err": str(e)}
+            return {"ok": True, "run_with_console": on}
+        if a == "butler_stop_session":
+            r = run_client(["butler", "stop", str(body.get("profile") or "")], timeout=30)
+            return {"ok": r.get("ok"), "out": r.get("out"), "err": r.get("err")}
+        return {"ok": False, "err": f"unknown action {a}"}
 
     def empty_boxes(self) -> dict:
         """The memory view's second button: every box of every service where this console is an operator deleted
@@ -1837,6 +2024,7 @@ class State:
                     at_ms=_ms(y.conf.get("activity_at")), provider=y.conf.get("provider"), model=y.conf.get("model"),
                     model_ms=LOCAL_WINS_MS)  # this computer's own configuration says what it runs on now
             b["local"] = True
+            b["role"] = y.role  # this computer's own configuration: what the box is, whatever an older service said
             b["closed_at"] = y.closed_at
             b["listening_here"] = bool(ss["listening"])
             if y.closed_at:
@@ -1852,6 +2040,8 @@ class State:
             b = box(pid, label=q.get("label"), role=role,
                     machine=q.get("introduced_by"), user=q.get("user"), agent=q.get("agent"), hostname=h.get("hostname"),
                     fingerprint=q.get("fingerprint"), alias=q.get("alias"))
+            if q.get("role") in ("project", "butler"):  # said by its introduction: wins over an older service's "session"
+                b["role"] = q["role"]
             if q.get("retired_at"):
                 b["retired_at"] = q["retired_at"]
             for u in M.peer_urls(q):
@@ -1962,6 +2152,8 @@ class State:
                     m["to"] = m.get("to") or p.get("to") or y.id
                     m["state"] = "read"
                     m["handled"] = e.get("status")
+                    if e.get("status") in ("rerouted", "givenback") and e.get("reason"):
+                        m["passed_on"] = e["reason"]  # where it went: its project's box, the session that asked
                     m["read_by"] = y.id
                     m["read_at"] = e.get("at")
                     if e.get("box") == "machine":
@@ -2370,6 +2562,12 @@ def act(state: State, body: dict) -> dict:
         state.save_console_state()
         state._usage = (0.0, {})
         return {"ok": True, "purge_keep_s": v}
+    if a == "box_purge":  # a box's menu: its history, from this computer
+        return state.purge_box(str(body.get("id") or ""))
+    if a in ("box_empty", "box_close", "box_delete"):  # a box's menu: what waits in it, closing, deleting
+        return state.box_command(str(body.get("id") or ""), a[4:])
+    if a.startswith("butler_"):  # the Butler tab: chat, start a session, refresh the inventory, run it or not
+        return state.butler_action(a, body)
     if a == "empty_boxes":  # the memory view: every box of every service where this console is an operator
         return state.empty_boxes()
     if a == "col_config":  # an operator's collector: retention, hold every entry 48 h more, purge
@@ -2575,6 +2773,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"count": len(pend), "ids": [x["id"] for x in pend], "version": st.snapshot.get("version", 0),
                                    "latest": ({k: pend[-1].get(k) for k in ("id", "from", "label", "title", "subject")} if pend else None),
                                    "desktop": bool(st.desktop and st.desktop.ok), "held": len(st.held())})
+            if u.path == "/api/butler":  # the Butler tab: its state, inventory, started sessions, chat
+                return self._json(st.butler_state())
+            if u.path == "/api/butler_log":  # the butler's live output, from a byte offset
+                try:
+                    since = int((q.get("since") or ["0"])[0])
+                except ValueError:
+                    since = 0
+                return self._json(st.butler_log(since))
             if u.path == "/api/usage":  # the explorer's memory frame and the memory view
                 return self._json(st.usage(fresh=(q.get("fresh") or ["0"])[0] == "1"))
             if u.path == "/api/sound":  # the operator's own sound (the presets are static files)
@@ -2666,7 +2872,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global M, CLIENT
+    global M, CLIENT, B
     ap = argparse.ArgumentParser(description="mmbox console: the operator's view of the mmbox services, boxes and messages")
     ap.add_argument("--port", type=int, default=int(os.environ.get("MMBOX_CONSOLE_PORT", "8765")))
     ap.add_argument("--client", help="path of mmbox.py (default: ../client/mmbox.py, then the one mmbox-install put here)")
@@ -2681,6 +2887,7 @@ def main():
     CLIENT = find_client(a.client)
     M = load_client(CLIENT)
     M.pin_hosts()
+    B = load_butler()
     op = Operator()
     if a.whoami:
         print(f"operator id {op.id}\nfingerprint {op.fingerprint}\nkeys in {op.home}")
@@ -2693,10 +2900,14 @@ def main():
         log(f"first refresh failed: {type(e).__name__}: {e}")
 
     def loop():
+        n = 0
         while True:
             time.sleep(max(2.0, a.refresh))
             try:
                 state.refresh()
+                if n % 8 == 0:
+                    state.ensure_butler()  # runs with the console (Settings), one per computer
+                n += 1
             except Exception as e:
                 log(f"refresh failed: {type(e).__name__}: {e}")
     threading.Thread(target=loop, daemon=True).start()

@@ -35,6 +35,9 @@ const ICON = {
   warn: "M1 21h22L12 2 1 21Zm12-3h-2v-2h2v2Zm0-4h-2v-4h2v4Z",
   box: "M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2Zm0 12h-4a3 3 0 0 1-6 0H5V5h14v10Z",
   mbox: "M12 2 2 7v10l10 5 10-5V7L12 2Zm0 2.2L19.5 8 12 11.8 4.5 8 12 4.2Z",
+  pbox: "M20 6h-8l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2Zm-2 9h-3a3 3 0 0 1-6 0H6v-5h12v5Z",
+  trash: "M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12ZM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4Z",
+  broom: "M19.36 2.72 20.78 4.14l-5.72 5.72a4 4 0 0 1-.44 5.13L9.07 9.43a4 4 0 0 1 5.13-.43l5.16-6.28ZM5.93 17.57c-2.01-2.01-3.24-4.41-3.53-6.65l5.11-2.19 7.79 7.79-2.19 5.11c-2.24-.29-4.64-1.52-6.65-3.53l-.53-.53Z",
   server: "M4 3h16a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Zm0 10h16a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Zm3-7.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0 10a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z",
   servers: "M3 13h18v-2H3v2Zm0 6h18v-2H3v2ZM3 5v2h18V5H3Z",
   model: "M9 2v2H7a3 3 0 0 0-3 3v2H2v2h2v2H2v2h2v2a3 3 0 0 0 3 3h2v2h2v-2h2v2h2v-2h2a3 3 0 0 0 3-3v-2h2v-2h-2v-2h2V9h-2V7a3 3 0 0 0-3-3h-2V2h-2v2h-2V2H9Zm-2 4h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Zm2 3v6h6V9H9Z",
@@ -113,7 +116,8 @@ const STATE_TITLE = {
 };
 const HANDLED_TXT = { execute: "executed", ask: "asked the user", archived: "archived", rejected: "rejected", expired: "expired", interrupted: "interrupted",
   forwarded: "forwarded", relayed: "relayed", purged: "purged", dropped: "dropped (closed box)", notice: "notice", introduced: "introduction", pinged: "wake-up", pong: "pong",
-  broadcast: "broadcast read", lockevent: "lock event", transport: "service announced", retired: "closing", link: "link" };
+  broadcast: "broadcast read", lockevent: "lock event", transport: "service announced", retired: "closing", link: "link",
+  rerouted: "passed on (its project's box, or the session that asked)", givenback: "given back (to the project's box)" };
 const LEVEL_TXT = { full: "full content", subject: "subject only", meta: "metadata", none: "not annotated" };
 
 // ---------------------------------------------------------------- the model: boxes, machines, projects
@@ -164,10 +168,15 @@ function nodeBoxes(node) {
     const [mk, wp] = node.key.split("\u0000");
     return new Set([...S.boxes.values()].filter((b) => machineKey(b) === mk && b.role !== "machine" && (b.work || "") === wp).map((b) => b.id));
   }
+  if (node.type === "projects") return projectBoxIds();
   return null;
 }
+// the project boxes (role project): where what is meant for a project waits for one of its sessions
+const isProjectBox = (b) => b?.role === "project";
+const projectBoxIds = () => new Set([...S.boxes.values()].filter(isProjectBox).map((b) => b.id));
 function nodeLabel(node) {
   if (node.type === "all") return "All messages";
+  if (node.type === "projects") return "Project boxes";
   if (node.type === "machine") return `Machine ${machineName(node.key)}`;
   if (node.type === "project") { const [mk, wp] = node.key.split("\u0000"); return `Project ${wp || "(no project)"} on ${machineName(mk)}`; }
   if (node.type === "box") return `Box ${boxName(node.key)}`;
@@ -199,6 +208,7 @@ function filtered() {
       case "pending": if (!["queued", "sent"].includes(m.state)) return false; break;
       case "undelivered": if (!["stranded", "dropped"].includes(m.state)) return false; break;
       case "broadcast": if (!m.broadcast) return false; break;
+      case "project": { const pb = projectBoxIds(); if (![m.from, m.to, m.read_by, ...(m.to_boxes || [])].some((b) => pb.has(b))) return false; break; }
       case "direct": if (m.broadcast) return false; break;
     }
     if (F.source !== "all") {
@@ -234,7 +244,7 @@ function treeItem({ id, type, key, icon, name, sub, badge, held, dot, children, 
   const r = rightsOf({ type, key });
   const li = h("li", { role: "treeitem", id: "t-" + id, "aria-level": level, "aria-selected": String(S.node.type === type && S.node.key === key),
     "aria-expanded": hasKids ? String(S.expanded.has(id)) : null, tabindex: "-1", dataset: { type, key: key ?? "", nid: id },
-    "aria-keyshortcuts": r ? "Shift+F10" : null, "aria-description": r ? `handling: ${RIGHTS_TXT[r.rights] || "as the workstations say"} (menu: Shift+F10)` : null });
+    "aria-keyshortcuts": r ? "Shift+F10" : null, "aria-description": r ? (r.noRights ? "menu: Shift+F10" : `handling: ${RIGHTS_TXT[r.rights] || "as the workstations say"} (menu: Shift+F10)`) : null });
   const showChip = r && r.rights && (type === "machine" || r.source === "own" || r.network || r.otherProject);
   const node = h("div", { class: "node ripple" + (held ? " held" : "") },
     h("span", { class: "twist" }, hasKids ? svg(ICON.chevron) : null),
@@ -247,7 +257,8 @@ function treeItem({ id, type, key, icon, name, sub, badge, held, dot, children, 
     type === "box" && (S.snap?.pinned || []).includes(key) ? h("button", { class: "pin-btn ripple", type: "button", tabindex: "-1",
       "aria-label": `Unpin the conversation with ${name}`, title: "Pinned conversation: nothing expires. Click to unpin (each message starts the full delay again)" }, svg(ICON.pin)) : null,
     r ? h("button", { class: "node-menu ripple", type: "button", tabindex: "-1", "aria-haspopup": "menu", "aria-expanded": "false",
-      "aria-label": `Handling of the messages from ${name}`, title: "Handling: execute, ask, ignore" }, svg(ICON.more)) : null);
+      "aria-label": r.noRights ? `Menu of ${name}` : `Handling of the messages from ${name}` + (r.acts ? ", and the box's own actions" : ""),
+      title: r.noRights ? "Purge, empty, close or delete" : "Handling: execute, ask, ignore" + (r.acts ? "; purge, empty, close or delete" : "") }, svg(ICON.more)) : null);
   li.append(node);
   if (extra) li.append(extra);
   if (hasKids) li.append(h("ul", { role: "group" }, children));
@@ -264,29 +275,30 @@ function renderTree() {
   const q = $("#tree-filter").value.trim().toLowerCase();
   const machines = new Map();
   for (const b of S.boxes.values()) {
-    if (F.treeActive && !isActive(b)) continue;
+    if (F.treeActive && !isActive(b) && !isProjectBox(b)) continue;
     const mk = machineKey(b);
     if (!machines.has(mk)) machines.set(mk, { box: null, projects: new Map() });
     const M = machines.get(mk);
     if (b.role === "machine") M.box = b;
-    else { const wp = b.work || ""; if (!M.projects.has(wp)) M.projects.set(wp, []); M.projects.get(wp).push(b); }
+    else { const wp = b.work || ""; if (!M.projects.has(wp)) M.projects.set(wp, []); M.projects.get(wp).push(b); }  // a project box: first of its folder
   }
   const dotOf = (b) => (b.closed_at || b.retired_at ? "closed" : b.listening || b.listening_here ? "listening" : b.active ? "active" : "");
   const sum = (ids) => ids.reduce((n, id) => n + (unread.get(id) || 0), 0);
   const match = (b) => !q || [b.title, b.label, b.id, b.alias, b.work, b.hostname, b.profile, b.activity, b.provider, b.model].join(" ").toLowerCase().includes(q);
-  const boxItem = (b, level, pre = "b") => treeItem({ id: pre + b.id, type: "box", key: b.id, icon: b.role === "machine" ? "mbox" : "box", level,
-    name: b.title || b.label || b.alias || b.id,
-    sub: [b.title ? (b.label || b.id) : b.local ? (b.profile === "default" ? "here" : b.profile) : null, b.role !== "machine" ? b.model : null].filter(Boolean).join(" · ") || null,
+  const boxItem = (b, level, pre = "b") => treeItem({ id: pre + b.id, type: "box", key: b.id, icon: b.role === "machine" ? "mbox" : isProjectBox(b) ? "pbox" : "box", level,
+    name: isProjectBox(b) ? (pre === "pj" ? b.work || b.label : "Project box") : b.title || b.label || b.alias || b.id,
+    sub: isProjectBox(b) ? (pre === "pj" ? machineName(machineKey(b)) : "waits for a session of the project")
+      : [b.title ? (b.label || b.id) : b.local ? (b.profile === "default" ? "here" : b.profile) : null, b.role !== "machine" ? b.model : null].filter(Boolean).join(" · ") || null,
     badge: unread.get(b.id), held: heldTo.get(b.id), dot: dotOf(b) });
   const mItems = [...machines.entries()].sort((a, b) => machineName(a[0]).localeCompare(machineName(b[0]))).map(([mk, M]) => {
     const kids = [];
     if (M.box && match(M.box)) kids.push(boxItem(M.box, 3));
     for (const [wp, bs] of [...M.projects.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      const shown = bs.filter(match).sort((a, b) => (a.label || "").localeCompare(b.label || ""));
+      const shown = bs.filter(match).sort((a, b) => isProjectBox(b) - isProjectBox(a) || (a.label || "").localeCompare(b.label || ""));
       if (!shown.length) continue;
       const pid = "p" + mk + ":" + wp;
       kids.push(treeItem({ id: pid, type: "project", key: mk + "\u0000" + wp, icon: "folder", level: 3, name: wp || "(no project)",
-        sub: `${shown.length}`, badge: sum(bs.map((b) => b.id)) || null, held: heldSum(bs.map((b) => b.id)), children: shown.map((b) => boxItem(b, 4)) }));
+        sub: `${shown.filter((b) => !isProjectBox(b)).length}`, badge: sum(bs.map((b) => b.id)) || null, held: heldSum(bs.map((b) => b.id)), children: shown.map((b) => boxItem(b, 4)) }));
     }
     if (!kids.length && q) return null;
     const all = [M.box, ...[...M.projects.values()].flat()].filter(Boolean);
@@ -298,7 +310,7 @@ function renderTree() {
   // Models: provider, then model, then the session boxes running it (machine boxes and the console run no model)
   const providers = new Map();
   for (const b of S.boxes.values()) {
-    if (b.role === "machine" || b.role === "operator" || (F.treeActive && !isActive(b)) || !match(b)) continue;
+    if (b.role === "machine" || b.role === "operator" || isProjectBox(b) || (F.treeActive && !isActive(b)) || !match(b)) continue;
     const p = providerOf(b);
     if (!providers.has(p)) providers.set(p, new Map());
     const ms = providers.get(p);
@@ -320,10 +332,16 @@ function renderTree() {
   const totalUnread = [...unread.values()].reduce((a, b) => a + b, 0);
   const keep = document.activeElement && tree.contains(document.activeElement) ? document.activeElement.dataset.nid : null;
   const totalHeld = [...heldTo.values()].reduce((a, b) => a + b, 0);
+  // Project boxes: every one, whatever its machine (a project box never closes, so the active filter keeps it)
+  const pbs = [...S.boxes.values()].filter((b) => isProjectBox(b) && match(b))
+    .sort((a, b) => (a.work || "").localeCompare(b.work || "") || machineName(machineKey(a)).localeCompare(machineName(machineKey(b))));
+  const pjItems = pbs.map((b) => boxItem(b, 2, "pj"));
   tree.replaceChildren(
     totalHeld ? treeItem({ id: "held", type: "held", key: "held", icon: "folder", level: 1, name: "Held messages", sub: "not accepted yet", held: totalHeld }) : "",
     treeItem({ id: "all", type: "all", key: null, icon: "all", level: 1, name: "All messages", badge: totalUnread || null }),
     treeItem({ id: "machines", type: "group", key: "machines", icon: "machine", level: 1, name: "Machines", sub: `${machines.size}`, children: mItems }),
+    pbs.length || [...S.boxes.values()].some(isProjectBox) ? treeItem({ id: "projects", type: "projects", key: "projects", icon: "pbox", level: 1, name: "Project boxes",
+      sub: `${pbs.length}`, badge: sum(pbs.map((b) => b.id)) || null, held: heldSum(pbs.map((b) => b.id)), children: pjItems }) : "",
     treeItem({ id: "models", type: "group", key: "models", icon: "model", level: 1, name: "Models", sub: `${providers.size}`, children: pItems }),
     treeItem({ id: "servers", type: "group", key: "servers", icon: "servers", level: 1, name: "Servers", sub: `${S.servers.size}`, children: sItems }));
   const items = $$('[role="treeitem"]', tree);
@@ -405,7 +423,7 @@ function rightsOf(node) {
   if (node.type === "machine") {
     if (node.key === snap.local?.machine) {
       const lr = snap.local_rights, op = snap.other_project_rights;
-      return lr ? { target: "local", rights: lr.rights, source: "local-default", env: lr.env,
+      return lr ? { butler: true, target: "local", rights: lr.rights, source: "local-default", env: lr.env,
         title: "The sessions of this computer, between themselves" + (op?.project ? ` (project ${op.project})` : ""),
         other: op ? { target: "projects", rights: op.computer || null, follow: "Follow each network's default (else Ask)", followed: "follows each network's default (else Ask)",
           following: !op.computer, title: "The sessions of other projects on this computer" } : null } : null;
@@ -424,7 +442,21 @@ function rightsOf(node) {
   }
   if (node.type === "box") {
     const b = S.boxes.get(node.key);
-    if (!b?.rights || b.role === "operator" || b.role === "machine") return null;  // a machine box: its machine's menu
+    const base = boxRights(b, snap);
+    const acts = b?.local && b.role !== "operator" ? boxActs(b) : null;  // what this computer can do to its own boxes
+    if (!base && !acts) return null;
+    return { ...(base || { noRights: true, title: `${boxTitle(b)} (this computer)` }), acts };
+  }
+  return null;
+}
+const boxTitle = (b) => isProjectBox(b) ? `Project box ${b.work || b.label}` : b.role === "machine" ? `Machine box ${b.label || b.id}` : `Box ${boxName(b.id)}`;
+function boxActs(b) {
+  const open = !b.closed_at;
+  return { purge: true, empty: true, close: b.role === "session" && open, del: isProjectBox(b) || (b.role === "session" && !open) };
+}
+function boxRights(b, snap) {
+  {  // the handling of what this box sends (its own setting, its project's, its computer's)
+    if (!b?.rights || b.role === "operator" || b.role === "machine" || isProjectBox(b)) return null;  // a machine box: its machine's menu
     const r = b.rights;
     if (r.other_project) {  // a session of another project of this computer: its box, then its project, the computer, the network, Ask
       const p = r.other_project, pr = snap.other_project_rights?.projects?.[p];
@@ -437,7 +469,6 @@ function rightsOf(node) {
     return { target: b.id, rights: r.rights, source: r.source, follow, following: r.source === "follows" || r.source === "local",
       env: r.local && snap.local_rights?.env, title: `Messages from ${boxName(b.id)}` + (r.local ? "" : networkNote(b)) };
   }
-  return null;
 }
 const RM = { el: $("#rights-menu"), r: null, nid: null, fromPointer: false };
 async function setReception(url, act) {
@@ -521,6 +552,17 @@ function openRightsMenu(li, fromPointer) {
   if (RM.el.matches(":popover-open")) RM.el.hidePopover();
   Object.assign(RM, { r, nid: li.dataset.nid, fromPointer, btn });
   $("#rights-menu-title").textContent = r.title;
+  $("#rights-main").hidden = !!r.noRights;
+  $("#rights-butler").hidden = $("#rights-butler-sep").hidden = !r.butler;
+  const ba = $("#box-acts");
+  ba.hidden = !r.acts;
+  if (r.acts) {
+    const b = S.boxes.get(li.dataset.key) || {};
+    $("#box-close").hidden = !r.acts.close;
+    $("#box-delete").hidden = !r.acts.del;
+    $("#box-delete").firstChild.textContent = isProjectBox(b) ? "Delete the project box" : "Delete the closed box";
+    $("#box-acts-sep").hidden = !!r.noRights;
+  }
   const o = r.other;
   $("#rights-other").hidden = !o;
   if (o) {
@@ -594,7 +636,37 @@ RM.el.addEventListener("keydown", (e) => {
   items[j]?.focus();
 });
 RM.el.addEventListener("pointermove", (e) => { const it = e.target.closest('[role="menuitemradio"]'); if (it && !it.disabled && document.activeElement !== it) it.focus({ focusVisible: false }); });
+const BOX_ACT = {
+  purge: (b) => [`Purge the history of ${boxTitle(b).toLowerCase().startsWith("box") ? boxName(b.id) : boxTitle(b)}?`,
+    "What no longer waits among its messages goes from this computer for good: its log, their attached files and the console's copy. What still waits, and what an open box handled within the kept delay (Settings), stays.",
+    "Purge", "box_purge"],
+  empty: (b) => [`Empty what waits in ${isProjectBox(b) ? boxTitle(b) : boxName(b.id)}?`,
+    "Every message still waiting in this box is purged without being handled; each sender is told. Its log keeps them, marked purged.",
+    "Empty", "box_empty"],
+  close: (b) => [`Close the session box ${boxName(b.id)}?`,
+    "Its remote peers are told; what still reaches it goes to its project's box (else the machine box). The session opens it again if it comes back.",
+    "Close", "box_close"],
+  delete: (b) => [isProjectBox(b) ? `Delete the project box ${b.work || b.label}?` : `Delete the closed box ${boxName(b.id)}?`,
+    isProjectBox(b) ? "What waits in it goes to the machine box and its remote peers are told; it closes, and its folder goes 7 days later. It opens again by itself when a session of the project starts or a message for the project arrives."
+      : "What still waits in it goes to its project's box (else the machine box); its folder is archived without its keys.",
+    "Delete", "box_delete"],
+};
 RM.el.addEventListener("click", async (e) => {
+  if (e.target.closest("#rights-butler")) {  // this computer's menu: the butler probes its agents and models now
+    RM.el.hidePopover();
+    const r = await action({ action: "butler_refresh" });
+    toast(r.ok ? (r.out || "Probed") : "Refresh failed: " + (r.err || "?"));
+    return;
+  }
+  const ba = e.target.closest("[data-box]");
+  if (ba && RM.r?.acts) {
+    const id = $(`#tree [data-nid="${CSS.escape(RM.nid || "")}"]`)?.dataset.key, b = S.boxes.get(id);
+    RM.el.hidePopover();
+    if (!b) return;
+    const [title, text, ok, act] = BOX_ACT[ba.dataset.box](b);
+    confirmRun(title, text, { action: act, id }, { okLabel: ok });
+    return;
+  }
   if (e.target.closest("#rights-range") && RM.r) { const url = RM.r.target.slice(1); RM.el.hidePopover(); setTimeout(() => openRangeMenu(url, false), 50); return; }
   const pz = e.target.closest("#rights-pause");
   if (pz && !pz.disabled && RM.r) { RM.el.hidePopover(); setReception(RM.r.target.slice(1), pz.dataset.act); return; }
@@ -952,13 +1024,13 @@ function openBoxCard(id) {
     h("dl", { class: "meta" },
       h("dt", {}, "Label"), h("dd", {}, b.label || "—"),
       h("dt", {}, "Id"), h("dd", { class: "mono" }, id),
-      h("dt", {}, "Role"), h("dd", {}, b.role === "machine" ? "machine box" : "session"),
+      h("dt", {}, "Role"), h("dd", {}, b.role === "machine" ? "machine box" : isProjectBox(b) ? "project box (every session of the project reads it; never closed)" : "session"),
       h("dt", {}, "Machine"), h("dd", {}, machineName(machineKey(b))),
       h("dt", {}, "Project"), h("dd", {}, [b.work, b.project && `space ${b.project}`].filter(Boolean).join(" · ") || "—"),
       h("dt", {}, "State"), h("dd", {}, st, b.idle_s !== undefined ? ` · ${ago(b.idle_s)}` : ""),
       b.opened_ms ? [h("dt", {}, "Opened"), h("dd", {}, fmtFull.format(new Date(b.opened_ms)))] : null,
       h("dt", {}, "Unread"), h("dd", {}, String(mine)),
-      rightsOf({ type: "box", key: id }) ? [h("dt", {}, "Handling"), h("dd", {}, RIGHTS_TXT[b.rights.rights] || "?",
+      b.rights && !rightsOf({ type: "box", key: id })?.noRights ? [h("dt", {}, "Handling"), h("dd", {}, RIGHTS_TXT[b.rights.rights] || "?",
         h("span", { class: "dim" }, b.rights.other_project
           ? ` · another project (${b.rights.other_project}): ` + ({ own: "own setting", project: "its project's setting", computer: "this computer's setting for other projects",
             network: `default of the network ${(S.servers.get(String(b.rights.source).slice(8)) || {}).name || String(b.rights.source).slice(8)}`,
@@ -1167,7 +1239,8 @@ function renderDetail(m, partial) {
   if (!m) { d.replaceChildren(h("p", { class: "empty" }, "Loading…")); return; }
   const chips = h("div", { class: "chips" },
     m.kind ? h("span", { class: "chip " + m.kind }, m.kind) : null, stateChip(m),
-    m.handled ? h("span", { class: "chip" }, HANDLED_TXT[m.handled] || m.handled) : null,
+    m.handled ? h("span", { class: "chip", title: m.passed_on || null }, HANDLED_TXT[m.handled] || m.handled) : null,
+    m.passed_on ? h("div", { class: "dim" }, m.passed_on) : null,
     m.reply_expected ? h("span", { class: "chip request" }, "reply expected") : null,
     decisionWaits(m) ? h("span", { class: "chip queued" }, "your decision waits") : null,
     m.level ? h("span", { class: "chip", title: "what the source gives of the content" }, LEVEL_TXT[m.level] || m.level) : null,
@@ -1496,6 +1569,7 @@ function showTab(name) {
     t.setAttribute("aria-selected", String(on)); t.tabIndex = on ? 0 : -1;
     $("#" + t.getAttribute("aria-controls")).hidden = !on;
   }
+  butlerTab(name === "butler");
   localStorage.setItem("mmbox-console-tab", name);
 }
 $(".tabs").addEventListener("click", (e) => { const t = e.target.closest(".tab"); if (t) showTab(t.id.slice(4)); });
@@ -2177,6 +2251,166 @@ $("#mem-empty").addEventListener("click", () => {
   confirmRun("Delete every mmbox box",
     `${r.boxes} box(es) of ${r.rows.map((s) => s.name).join(", ")} are deleted, for every computer and every session, with the ${r.waiting} message(s) waiting in them: nobody will receive those. Sessions still running come back on their own.`,
     { action: "empty_boxes" }, { okLabel: "Delete the boxes", after: () => loadUsage(true) });
+});
+
+
+// ---------------------------------------------------------------- the Butler tab: the computer's butler (client/BUTLER.md)
+// Its state and inventory every 5 s, its log every 2 s (from a byte offset), only while the tab is shown.
+const BT = { since: 0, lines: [], timers: [], data: null, sentAt: 0, folderPicked: false };
+const fmtSec = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+function butlerTab(on) {
+  BT.timers.forEach(clearInterval); BT.timers = [];
+  if (!on || !token) return;
+  butlerLoad(); butlerLog();
+  BT.timers.push(setInterval(() => document.visibilityState === "visible" && butlerLoad(), 5000));
+  BT.timers.push(setInterval(() => document.visibilityState === "visible" && !$("#bo-pause").checked && butlerLog(), 2000));
+}
+async function butlerLoad() {
+  let d;
+  try { d = await api("/api/butler"); } catch { return; }
+  BT.data = d;
+  $("#butler-missing").hidden = d.available !== false;
+  $("#butler-missing").textContent = d.why || "";
+  if (d.available === false) { $("#butler-state").textContent = "unavailable"; $("#butler-state").className = "chip stopped"; return; }
+  $("#butler-state").textContent = d.running ? "running" : "stopped";
+  $("#butler-state").className = "chip " + (d.running ? "running" : "stopped");
+  $("#butler-meta").textContent = [d.box ? `box ${d.box.label}` : "no box yet", d.running && d.pid ? `pid ${d.pid}` : null,
+    d.beat ? `last round ${fmtSec.format(new Date(d.beat * 1000))}` : null, `takes what waited ${Math.round(d.after_s / 60)} min`].filter(Boolean).join(" · ");
+  $("#butler-run").checked = !!d.run_with_console;
+  renderButlerChat(d.chat || []);
+  renderButlerInventory(d.inventory || {});
+  renderButlerForm(d);
+  renderButlerStarted(d.started || {});
+}
+function renderButlerChat(chat) {
+  const log = $("#butler-chat-log"), stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+  const last = chat[chat.length - 1];
+  const waiting = last && last.role === "operator";
+  log.replaceChildren(...(chat.length ? chat.map((m) => h("div", { class: "butler-msg " + (m.role === "operator" ? "operator" : "butler") },
+    m.text, h("span", { class: "when" }, (m.role === "operator" ? "you" : "butler") + " · " + fmtFull.format(new Date(m.t * 1000)))))
+    : [h("p", { class: "dim" }, "Ask the butler anything about this computer: which sessions run, what waits, why a start failed. It answers with what it knows now (its boxes, the inventory) and may act within its rights.")]),
+    waiting ? h("div", { class: "butler-msg butler pending" }, BT.data?.running ? "The butler is thinking… (its stream is in the live output below)" : "The butler is stopped: it answers once it runs.") : "");
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+function renderButlerInventory(inv) {
+  $("#butler-inv-at").textContent = inv.at ? `Probed ${fmtFull.format(new Date(inv.at * 1000))}, again every ${Math.round((BT.data?.inventory_every_s || 21600) / 3600)} h or on Refresh` + (inv.tmux === false ? " · tmux is missing: no session can be started" : "") : "Not probed yet.";
+  $("#butler-inv").replaceChildren(...(inv.agents || []).map((a) => h("tr", { class: a.available ? "" : "dim" },
+    h("td", {}, a.agent, h("div", { class: "dim" }, a.provider)),
+    h("td", {}, a.available ? (a.version || "?") : "not installed"),
+    h("td", {}, a.available ? (a.logged_in === false ? "no" : a.logged_in ? "yes" : "?") : "—"),
+    h("td", {}, (a.models || []).join(", ") || "—", a.models_source ? h("div", { class: "dim" }, a.models_source) : null))));
+}
+function renderButlerForm(d) {
+  const folders = Object.entries(d.folders || {}).sort((a, b) => a[0].localeCompare(b[0]));
+  const fs = $("#bn-folder"), keepF = fs.value;
+  if (fs.options.length !== folders.length + 1) {
+    fs.replaceChildren(h("option", { value: "" }, folders.length ? "— choose —" : "no known folder yet"),
+      ...folders.map(([k, p]) => h("option", { value: p }, `${k} — ${p}`)));
+    fs.value = keepF;
+  }
+  const agents = (d.inventory?.agents || []).filter((a) => a.available && a.can_start);
+  const as = $("#bn-agent"), keepA = as.value;
+  if (as.options.length !== agents.length) {
+    as.replaceChildren(...agents.map((a) => h("option", { value: a.agent }, `${a.agent}${a.logged_in === false ? " (not logged in)" : ""}`)));
+    if (keepA) as.value = keepA;
+  }
+  const cur = agents.find((a) => a.agent === as.value) || agents[0];
+  $("#bn-models").replaceChildren(...(cur?.models || []).map((m) => h("option", { value: m })));
+  if (!$("#bn-model").value && cur?.models?.length && !BT.modelTouched) $("#bn-model").value = cur.models[0];  // its first model by default
+  $("#bn-go").disabled = !agents.length || d.inventory?.tmux === false;
+}
+function renderButlerStarted(started) {
+  const rows = Object.values(started).sort((a, b) => b.at - a.at).slice(0, 30);
+  $("#butler-started").replaceChildren(...(rows.length ? rows.map((s) => h("li", {},
+    h("div", {}, h("span", { class: "chip " + ({ listening: "ok", failed: "stopped", starting: "queued" }[s.state] || "") }, s.state), " ",
+      h("strong", {}, s.profile), h("span", { class: "dim" }, ` · ${s.agent}${s.model ? " " + s.model : ""}${s.resumed ? " · resumed" : ""} · ${fmtFull.format(new Date(s.at * 1000))}`)),
+    h("div", { class: "dim mono" }, `${s.path} · tmux ${s.tmux}` + (s.why ? ` · ${s.why}` : "")),
+    s.error ? h("div", { class: "err mono" }, s.error) : null,
+    s.state !== "failed" ? h("div", {}, h("button", { class: "btn small text ripple", type: "button", onclick: () => confirmRun(`End ${s.profile}?`,
+      "Its tmux session is killed: the agent stops. Its box closes after an hour without use, what waits for it then goes to its project's box.",
+      { action: "butler_stop_session", profile: s.profile }, { okLabel: "End it", after: butlerLoad }) }, "End the session"),
+      S.boxes.has(s.box) ? h("button", { class: "btn small text ripple", type: "button", onclick: () => gotoBox(s.box) }, "Its messages") : null) : null))
+    : [h("li", { class: "dim" }, "None yet.")]));
+}
+// the live output: one line per daemon step, per agent turn's event (its thinking, tool calls, answer), per error
+function butlerLine(l) {
+  const t = fmtSec.format(new Date(l.t * 1000));
+  const row = (cls, src, text) => h("div", { class: "ln " + cls, dataset: { src: l.src } }, h("span", { class: "t" }, t), h("span", { class: "s" }, src), h("span", { class: "x" }, text));
+  if (l.src !== "agent" || !l.event) return row(l.src === "error" ? "error" : l.src === "turn" ? "turn" : "", l.src, (l.text || "") + (l.tail ? "\n" + l.tail : "") + (l.result ? "\n→ " + l.result : ""));
+  const e = l.event, out = [];
+  if (e.type === "assistant" || e.type === "user") {
+    for (const c of e.message?.content || []) {
+      if (c.type === "text") out.push(row("", "agent", c.text));
+      else if (c.type === "thinking") out.push(row("think", "thinks", c.thinking || "(thinking)"));
+      else if (c.type === "tool_use") out.push(row("tool", "tool", `${c.name} ${JSON.stringify(c.input).slice(0, 600)}`));
+      else if (c.type === "tool_result") out.push(row("", "result", (typeof c.content === "string" ? c.content : JSON.stringify(c.content)).slice(0, 1200)));
+    }
+  } else if (e.type === "result") out.push(row("turn", "answer", e.result || (e.is_error ? "(error)" : "")));
+  else if (e.type === "system") out.push(row("", "agent", `session ${e.session_id || "?"} ${e.subtype || ""}`.trim()));
+  return out;
+}
+function butlerShown(l) {
+  const f = $("#bo-filter").value;
+  return f === "all" || (f === "daemon" && (l.src === "daemon" || l.src === "turn")) || (f === "agent" && (l.src === "agent" || l.src === "turn")) || (f === "error" && l.src === "error");
+}
+function renderButlerOut() {
+  const out = $("#butler-out"), stick = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+  out.replaceChildren(...BT.lines.filter(butlerShown).flatMap((l) => [butlerLine(l)].flat()));
+  if (stick) out.scrollTop = out.scrollHeight;
+}
+async function butlerLog() {
+  let d;
+  try { d = await api(`/api/butler_log?since=${BT.since}`); } catch { return; }
+  if (d.reset && BT.since) BT.lines = [];
+  BT.since = d.next || 0;
+  if (!d.lines?.length && BT.lines.length) return;
+  BT.lines = BT.lines.concat(d.lines || []).slice(-1500);
+  renderButlerOut();
+}
+$("#bo-filter").addEventListener("change", renderButlerOut);
+$("#bo-pause").addEventListener("change", () => { if (!$("#bo-pause").checked) butlerLog(); });
+$("#bn-agent").addEventListener("change", () => { $("#bn-model").value = ""; BT.modelTouched = false; renderButlerForm(BT.data || {}); });
+$("#bn-model").addEventListener("input", () => { BT.modelTouched = true; });
+$("#bn-folder").addEventListener("change", () => { if ($("#bn-folder").value) $("#bn-path").value = ""; });
+$("#butler-run").addEventListener("change", async (e) => {
+  const on = e.target.checked, r = await action({ action: "butler_run", on });
+  if (!r.ok) { showOutput("Butler", r); e.target.checked = !on; return; }
+  toast(on ? "The butler runs with this console" : "The butler is stopped and no longer runs with this console");
+  setTimeout(butlerLoad, 1500);
+});
+$("#butler-refresh").addEventListener("click", async (e) => {
+  const b = e.currentTarget; b.classList.add("loading"); b.setAttribute("aria-busy", "true");
+  const r = await action({ action: "butler_refresh" });
+  b.classList.remove("loading"); b.removeAttribute("aria-busy");
+  toast(r.ok ? (r.out || "Probed") : "Refresh failed: " + (r.err || "?"));
+  setTimeout(butlerLoad, 3000);
+});
+$("#butler-chat-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const ta = $("#butler-chat-text"), text = ta.value.trim();
+  if (!text) return;
+  $("#butler-chat-send").disabled = true;
+  const r = await action({ action: "butler_chat", text });
+  $("#butler-chat-send").disabled = false;
+  if (!r.ok) { showOutput("Butler", r); return; }
+  ta.value = "";
+  if (!r.running) toast("Sent; the butler is stopped: it answers once it runs");
+  butlerLoad();
+});
+$("#butler-chat-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#butler-chat-form").requestSubmit(); } });
+$("#butler-new").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const path = $("#bn-path").value.trim() || $("#bn-folder").value;
+  if (!path) { $("#bn-out").textContent = "Choose a folder, or write one."; return; }
+  const body = { action: "butler_start", path, agent: $("#bn-agent").value, model: $("#bn-model").value.trim(),
+    title: $("#bn-title").value.trim(), task: $("#bn-task").value.trim() };
+  const go = $("#bn-go"); go.disabled = true; go.classList.add("loading"); go.setAttribute("aria-busy", "true");
+  $("#bn-out").textContent = "Starting…";
+  const r = await action(body);
+  go.disabled = false; go.classList.remove("loading"); go.removeAttribute("aria-busy");
+  $("#bn-out").textContent = r.ok ? `Started: box ${r.profile} (${r.box}), tmux ${r.tmux}. It listens within a minute or so (see below).` : `Not started: ${r.err || "?"}`;
+  if (r.ok) { $("#bn-task").value = ""; $("#bn-title").value = ""; }
+  butlerLoad();
 });
 
 showTab(DEEP.get("tab") || localStorage.getItem("mmbox-console-tab") || "messages");

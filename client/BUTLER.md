@@ -1,6 +1,7 @@
 # Project boxes and the butler (design, not implemented yet)
 
-Status: design of 2026-11-08, validated by lp177 (decisions below); step 1 in progress. Builds on PROTOCOL.md.
+Status: design of 2026-11-08, validated by lp177 (decisions below). Step 1 shipped (551cbbc, d07f5d4); steps 2 and 3
+implemented (client/mmbox_butler.py, the console's Butler tab): see "As built" at the end. Builds on PROTOCOL.md.
 
 Decisions: sessions the butler starts run in a detached tmux session, in the agent's no-prompt mode; a project is
 the name of the folder its session runs in; step 1 (project boxes) comes first.
@@ -65,8 +66,8 @@ nobody took for `BUTLER_AFTER_S` (300 s by default).
 - **A closed session box** forwards what it still receives to its **project box**, not to the machine box. Same
   for the relay round: a session that does not answer its wake-up ping gets its waiting messages moved to its
   project box, with the same header as today ("for <session>, which does not answer: …").
-- **Retention:** messages wait 8 days on the service today. A project box keeps them 30 days
-  (`MMBOX_PROJECT_KEEP_DAYS`). The sender's "nobody took it" alert after 7 days stays, and tells where it waits.
+- **Retention:** the same for every box, one setting (lp177's decision): 7 days (`MMBOX_RECEIPT_DAYS`), with the
+  sender's "nobody took it" alert at the end.
 - **A message read by the wrong session:** a session that takes a message and finds it cannot do it gives it back
   (`mmbox.py giveback <id> --why "…"`): it goes back to its project box (or to the box the session names) with a
   line saying who gave it back and why. The inbox skill tells agents to give back rather than drop. The butler may
@@ -181,7 +182,7 @@ A new tab per machine that runs a butler:
 
 ## 7. Order of work
 
-1. Project boxes, the take rules, forwarding to the project box, `giveback` (client, gateway retention, PROTOCOL,
+1. Project boxes, the take rules, forwarding to the project box, `giveback` (client, PROTOCOL,
    skills `memories-mailbox-inbox` and `-start`).
 2. The butler daemon: watching, claims, waking, resuming, starting in tmux, inventory, the `butler` messages.
 3. The console: Butler tab, chat, the new-session form, inventory, project boxes, settings.
@@ -189,3 +190,38 @@ A new tab per machine that runs a butler:
 
 Each step works without the next: step 1 alone already keeps tasks from being lost; they wait in their project
 box for a session the operator starts.
+
+## As built (2026-11-08)
+
+- **Code**: `client/mmbox_butler.py`, run as `mmbox.py butler run|status|inventory|start|stop|chat|log|install
+  --systemd` (it needs the full client: the module beside mmbox.py). Its box: profile `butler`, role `butler` (never
+  closed, introduced with its role). Its folder: `~/.local/share/mmbox/butler/` (`butler.json`, `inventory.json`,
+  `state.json`, `butler.log`, `chat.jsonl`); one daemon per computer (a lock on `butler.pid`).
+- **A round every 15 s**: the inventory (every 6 h, `refresh` file or `butler_refresh`); the project boxes and the
+  machine box (what nobody took for 5 min, `MMBOX_BUTLER_AFTER_S`; never the backlog, older than 24 h: the user
+  decides on it); the sessions it started (listening, or failed after 3 min with the tail of their tmux pane); its
+  own box; the chat.
+- **Machine box**: what is meant for a project goes to that project's box first; what is meant for the computer is
+  taken by the butler.
+- **Project box**: nothing while a session of the project listens or starts; else the session of the project used
+  last within 7 days is resumed by its agent session id (`claude --resume`, `codex resume`), or a new one is started in
+  the project's folder (where its sessions ran, or `butler.json` `projects.<key>.path`), with the project's agent and
+  model (`butler.json`) or the computer's best one. One start per project per 15 min; three failures in a row and the
+  project waits for the operator.
+- **What the butler takes** (nobody to start, or the computer's own messages): only what a sender with `execute`
+  rights sent; its agent acts without asking. The rest stays where it is, and the butler tells the operator in its
+  chat. A request in its box whose body is JSON (`{"op": "start" | "stop" | "list" | "inventory", …}`) from a sender
+  with `execute` rights is done at once and answered (`reply`, JSON); any other message from such a sender goes to its
+  agent; from another sender, to the operator (chat).
+- **Its agent**: Claude Code in print mode (`claude -p --output-format stream-json`), in its folder, no-prompt mode,
+  the computer's context (boxes, folders, inventory) in each turn; the chat resumes one conversation. Every event of
+  every turn is in `butler.log`. Other agents for the butler's own thinking: later.
+- **Started sessions**: tmux `mmbox-<box>`, the agent in its no-prompt mode (Claude Code `--permission-mode
+  bypassPermissions`, Codex `--dangerously-bypass-approvals-and-sandbox`, Gemini `--yolo`; `butler.json`
+  `permission_mode.<agent>` overrides), first prompt: start the mailbox with that box and listen. Folders: under
+  `butler.json` `roots` (default `~/Code`) or a known project folder.
+- **Console**: the Butler tab (state, run it with the console: on by default; chat; new session with folder, agent,
+  model, title, first task; the sessions it started, with "End the session"; the inventory; the live output, filtered,
+  paused); this computer's menu has "Refresh agents and models".
+- **Tests**: `MMBOX_BUTLER_CLI_<AGENT>` replaces an agent's CLI (a command line), so that a bench runs without real
+  agents.

@@ -113,7 +113,7 @@ SILENT = ("pinged", "pong", "link", "transport", "retired", "introduced")  # boo
 TOOL_KINDS = ("ping", "pong", "notice", "forward", "transport", "retire", "link", "introduce")  # never relayed
 # Boxes that never close: the machine box (every session of the computer) and the project boxes (every session of one
 # project: the folder it runs in). A project box is the profile PROJECT_PREFIX + its key, a child of the machine box.
-SHARED_ROLES = ("machine", "project")
+SHARED_ROLES = ("machine", "project", "butler")  # the butler's box (mmbox_butler.py): read by the butler alone
 PROJECT_PREFIX = "project-"
 QUEUED: set = set()  # messages of this process the service did not accept yet (memories closed): retried later
 QUEUE_NOTES: list | None = None  # `start` collects the queued sends here and says them in one line
@@ -2000,6 +2000,8 @@ def accept_introduction(me: Me, peers: dict, mid: str, peer: dict, p: dict) -> t
             changes["gateways"] = [str(u).rstrip("/") for u in c["gateways"] if u][:20]
         if known.get("retired_at") and (p.get("ts") or iso()) > known["retired_at"]:
             changes.update(retired_at=None, reopened_at=p.get("ts") or iso())  # it closed its box, and came back
+        if p.get("role") in ("project", "butler") and known.get("role") != p["role"]:
+            changes["role"] = p["role"]
         if not changes:
             return "introduced", "already known"
         owner.update("peers.json", lambda ps: ps[c["id"]].update(changes))
@@ -2015,7 +2017,8 @@ def accept_introduction(me: Me, peers: dict, mid: str, peer: dict, p: dict) -> t
                            peer.get("rights", "ask"), None, peer.get("project") or me.conf.get("project"))
         slug = re.sub(r"[^a-z0-9-]+", "-", str(c.get("label", "")).lower()).strip("-")[:40].strip("-") or c["id"]
         q["alias"] = unique_alias(ps, slug if slug.startswith(peer["alias"]) else f"{peer['alias']}-{slug}"[:40].strip("-"), c["id"])
-        q.update(rights_from=mid, introduced_by=mid, note=f"introduced by {peer['alias']}; rights follow it")
+        q.update(rights_from=mid, introduced_by=mid, note=f"introduced by {peer['alias']}; rights follow it",
+                 **({"role": p["role"]} if p.get("role") in ("project", "butler") else {}))
         if isinstance(c.get("gateway"), str) and c["gateway"]:
             q["gateway"] = c["gateway"].rstrip("/")
         if isinstance(c.get("gateways"), list):
@@ -2304,6 +2307,8 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
         for e in r.get("entries", []):
             mid, env = e.get("from"), e.get("env") or {}
             peer = peers.get(mid) or operator_peer(gw.url, mid)  # a peer, or the operator key this computer pinned
+            if not peer and (sb := local_box(mid)) is not None and sb.user == me.user:
+                peer = own_peer(sb)  # a box of this computer closed since (a project box passing on what waited in it)
             msg_id = str(env.get("id") or e["entry"])
             if not peer or rights_of(peers, peer) is None or peer.get("revoked_at"):
                 continue  # not (or no longer) a peer: the gateway let it in from stale links; it expires there
@@ -3101,8 +3106,9 @@ def project_me(user: str | None, key: str | None) -> "Me | None":
 
 
 def own_project_box(me: "Me") -> "Me | None":
-    """The project box a session reads: the one of its work project."""
-    return project_me(me.user, session_key(me)) if me.role == "session" else None
+    """The project box a session reads: the one of its work project, while it is open."""
+    p = project_me(me.user, session_key(me)) if me.role == "session" else None
+    return p if p and not p.closed_at else None
 
 
 def ensure_project_box(me: "Me", key: str | None, project: str, folder: str | None = None) -> "Me | None":
@@ -3111,6 +3117,9 @@ def ensure_project_box(me: "Me", key: str | None, project: str, folder: str | No
     if not key:
         return None
     if (p := project_me(me.user, key)) is not None:
+        if p.closed_at:  # deleted from the console, and needed again before its folder went: open again
+            p = reopen_session(p, project)
+            sync_local_links(me.user)
         return p
     m = machine_me(me.user)
     if not m:
@@ -3121,7 +3130,7 @@ def ensure_project_box(me: "Me", key: str | None, project: str, folder: str | No
         if os.name != "nt":
             import fcntl
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        if (p := project_me(me.user, key)) is not None:
+        if (p := project_me(me.user, key)) is not None and not p.closed_at:
             return p
         local = Local(PROJECT_PREFIX + key)
         if local.load("identity.json"):
@@ -3250,12 +3259,14 @@ def parallel(fns: list, limit_s: float) -> None:
 
 
 def describe_session(o: Me) -> str:
+    if o.role == "project":
+        return f"the box of project {session_key(o)} {o.label} (mailbox {o.id}, profile {o.local.profile})"
     return (f"session {o.label} (mailbox {o.id}, profile {o.local.profile}, "
             f"{o.agent} session {o.session_id or 'unknown'})")
 
 
 def untaken(y: Me, store: Store, project: str, min_age: float,
-            ephemeral: list | None = None) -> tuple[dict, list[dict]]:
+            ephemeral: list | None = None, forwards: bool = False) -> tuple[dict, list[dict]]:
     """What waits for session `y` that nobody took, older than `min_age`, on memories and on its gateway; the tool's own
     messages between sessions (ping, pong, notice, forward) left out. With `ephemeral` (a list), the untaken gateway
     entries of an EPHEMERAL_KINDS are added to it (with their payload) instead of being only skipped."""
@@ -3273,7 +3284,8 @@ def untaken(y: Me, store: Store, project: str, min_age: float,
                 continue
             if read_receipts(y, store, f"{ack_root(y, project, pid)}/{e['name'][:-5]}"):
                 continue  # taken (or being taken) by that session
-            if peer.get("local_profile") and (peek(y, store, peer, f"{folder}/{e['name']}") or {}).get("kind") in TOOL_KINDS:
+            if peer.get("local_profile") and (k := (peek(y, store, peer, f"{folder}/{e['name']}") or {}).get("kind")) in TOOL_KINDS \
+                    and not (forwards and k == "forward"):
                 continue
             out.append({"src": "memories", "pid": pid, "peer": peer, "msg_id": e["name"][:-5], "age": age,
                         "path": f"{folder}/{e['name']}"})
@@ -3297,7 +3309,7 @@ def untaken(y: Me, store: Store, project: str, min_age: float,
                 continue
             try:  # the tool's own messages (ping, notice, transport, link…) are never relayed, whoever sent them
                 p = open_envelope(y, peer, e.get("env") or {})
-                if p.get("kind") in TOOL_KINDS:
+                if p.get("kind") in TOOL_KINDS and not (forwards and p.get("kind") == "forward"):
                     if ephemeral is not None and p.get("kind") in EPHEMERAL_KINDS:
                         ephemeral.append({"src": "gateway", "gw": gw.url, "pid": e["from"], "peer": peer, "age": age,
                                           "entry": e["entry"], "payload": p,
@@ -3408,11 +3420,12 @@ def relay(me: Me, project: str, ack_wait: float = ACK_WAIT_S, min_age: float | N
         if name in (me.local.profile, machine.local.profile):
             continue
         y = load_me(name)
-        if not y or y.user != me.user or y.conf.get("project") != project or y.role in SHARED_ROLES:
+        if not y or y.user != me.user or y.conf.get("project") != project or y.role == "machine" \
+                or (y.role == "project" and not y.closed_at):
             continue
         if y.closed_at:  # a closed box: what still reaches it goes to its project box at once, without a ping
             stale: list = []
-            ypeers, waiting = untaken(y, store, project, 0, ephemeral=None if dry_run else stale)
+            ypeers, waiting = untaken(y, store, project, 0, ephemeral=None if dry_run else stale, forwards=True)
             if waiting:
                 closed.append((y, ypeers, waiting))
             drop_ephemeral(y, store, project, stale)
@@ -3555,24 +3568,36 @@ def forward_to_machine(me: Me, machine: Me, machine_peer: dict | None, y: Me, yp
             continue
         stored = iso(store.server_now() - dt.timedelta(seconds=age))
         rights = rights_of(ypeers, peer) or "ask"
+        body, hid, hpeer = str(p.get("body", "")), msg_id, peer  # what the header names: the first message and sender
+        osender = {"id": pid, "alias": peer["alias"], "user": peer["user"], "label": peer["label"], "rights": rights}
+        if p.get("kind") == "forward" and isinstance(p.get("forwarded"), dict):  # a box going away with what was put in
+            pf = p["forwarded"]  # it (a project box): passed on with its first sender, rights and date, not as a forward of
+            if isinstance(pf.get("original"), dict) and isinstance(pf.get("original_sender"), dict):  # a forward
+                osender = pf["original_sender"]
+                rights = osender.get("rights") or "ask"
+                stored = pf.get("original_stored_at") or stored
+                atts_p = p.get("attachments")
+                p = {**pf["original"], **({"attachments": atts_p} if atts_p else {})}
+                body, hid = str(p.get("body", "")), str(p.get("id") or msg_id)
+                hpeer = {"alias": osender.get("alias") or "?", "user": osender.get("user") or "?",
+                         "label": osender.get("label") or "?"}
         header = (f"[mmbox] Forwarded from {describe_session(y)}, {header_why}.\n"
                   f"Relayed by {describe_session(me)} on {iso(store.server_now())} (store time).\n"
-                  f"Original message {msg_id} from {peer['alias']} ({peer['user']}, {peer['label']}), sent {p.get('ts')}, "
+                  f"Original message {hid} from {hpeer['alias']} ({hpeer['user']}, {hpeer['label']}), sent {p.get('ts')}, "
                   f"kind {p.get('kind')}, re {p.get('re') or '-'}, reply expected: {'yes' if p.get('reply_expected') else 'no'}, "
                   f"rights of its sender on that session: {rights}.\n"
                   f"Decide what to do with it: handle it if it does not need that session's own context, otherwise ask "
-                  f"the user or tell the sender the session is unavailable. Answer the sender with --re {msg_id}.\n"
+                  f"the user or tell the sender the session is unavailable. Answer the sender with --re {hid}.\n"
                   f"----\n")
         fwd = {"from_session": {"id": y.id, "label": y.label, "profile": y.local.profile, "agent": y.agent,
                                 "session_id": y.session_id, "closed_at": y.closed_at, **live},
                "relayed_by": {"id": me.id, "label": me.label, "profile": me.local.profile, "session_id": me.session_id},
                "reason": why, "project": session_key(y), "original": {k: v for k, v in p.items() if k != "attachments"},
-               "original_sender": {"id": pid, "alias": peer["alias"], "user": peer["user"], "label": peer["label"],
-                                   "rights": rights},
+               "original_sender": osender,
                "original_stored_at": stored}
         atts = [dict(x) for x in p.get("attachments") or [] if isinstance(x, dict)]  # carried once, by the forward itself
         fid = send_payload(me, machine.id, machine_peer, project, f"[forwarded from {y.label}] {p.get('subject', '')}",
-                           header + str(p.get("body", "")), "forward", None, bool(p.get("reply_expected")),
+                           header + body, "forward", None, bool(p.get("reply_expected")),
                            extra={"forwarded": fwd, **({"attachments": atts} if atts else {})})
         y.local.append_log({"dir": "in", "id": msg_id, "peer": pid, "status": "relayed", "at": iso(), "payload": p,
                             "reason": f"forwarded to {dest_name} as {fid} by {me.label}"})
@@ -3659,7 +3684,8 @@ def remove_session(y: Me, project: str, say) -> None:
     dest.parent.mkdir(mode=0o700, exist_ok=True)
     y.local.path("identity.json").unlink(missing_ok=True)
     y.local.dir.rename(dest)
-    say(f"REMOVED: {describe_session(y)}, closed on {y.closed_at}: box deleted, log kept in {dest}")
+    say(f"REMOVED: {describe_session(y) if y.role != 'project' else 'project box ' + y.label}, closed on {y.closed_at}: "
+        f"box deleted, log kept in {dest}")
 
 
 def lifecycle(me: Me, project: str, say) -> None:
@@ -3673,7 +3699,8 @@ def lifecycle(me: Me, project: str, say) -> None:
         if name in (me.local.profile, machine.local.profile):
             continue
         y = load_me(name)
-        if not y or y.user != me.user or y.conf.get("project") != project or y.role in SHARED_ROLES:
+        if not y or y.user != me.user or y.conf.get("project") != project or y.role == "machine" \
+                or (y.role == "project" and not y.closed_at):
             continue
         if not y.closed_at:
             idle = session_idle(y)
@@ -3683,7 +3710,7 @@ def lifecycle(me: Me, project: str, say) -> None:
         if time.time() - parse_iso(y.closed_at).timestamp() > SESSION_KEEP_S and session_idle(y) is not None:
             store = Store(me.local)
             mpeers = mpeers or peers_load(me.local)
-            ypeers, waiting = untaken(y, store, project, 0)
+            ypeers, waiting = untaken(y, store, project, 0, forwards=True)
             if waiting:
                 dest, dpeer, dname = forward_dest(me, machine, mpeers, y, project)
                 forward_to_machine(me, dest, dpeer, y, ypeers, waiting, "whose box is being removed",
@@ -4648,6 +4675,39 @@ def cmd_sessions(a, local: Local):
     if not me:
         die("no mailbox identity on this computer (run `mmbox.py start --session <name>`)")
     project = me.project(a.project)
+    if getattr(a, "remove", None):
+        y = load_me(a.remove)
+        if not y:
+            die(f"no profile {a.remove} on this computer")
+        if y.role == "machine":
+            die("the machine box is never removed")
+        if y.role != "project" and not y.closed_at:
+            die(f"{a.remove} is an open session box: close it first (`sessions --close {a.remove}`)")
+        machine = machine_me(y.user)
+        # what waits in it is passed on first, by a box both it and the destination list: the project box itself while
+        # it is still open (to the machine box), else this profile (a closed session's, to its project's box)
+        closer = y if y.role == "project" else me if me.id != y.id else machine
+        if machine and closer:
+            store = Store(closer.local)
+            ypeers, waiting = untaken(y, store, project, 0, forwards=True)
+            dest, dpeer, dname = forward_dest(closer, machine, peers_load(closer.local), y, project)
+            done = forward_to_machine(closer, dest, dpeer, y, ypeers, waiting, "whose box is being removed",
+                                      a.reason or "removed on the user's request", store, project, print, dname) \
+                if waiting else []
+            if len(done) < len(waiting):
+                die(f"{a.remove} not removed: {len(waiting) - len(done)} message(s) waiting in it could not be passed on "
+                    f"to {dname}; nothing was lost, try again later")
+            print(f"{len(done)} message(s) forwarded to {dname}" if done else "nothing waiting in it")
+        if y.role == "project":  # closed as a session box is: its remote peers told (`retire`), its folder removed
+            # SESSION_KEEP_S later (what it passed on stays verifiable meanwhile), or opened again when needed
+            close_session(y, project, a.reason or "project box deleted on the user's request", print)
+            sync_local_links(y.user)
+            print(f"the box of project {session_key(y)} is closed: its folder goes in {SESSION_KEEP_S / 86400:g} days; it opens "
+                  f"again (or is made again) when a session of the project starts or a message for the project arrives")
+            return
+        remove_session(y, project, print)
+        sync_local_links(y.user)
+        return
     if a.close:
         y = load_me(a.close)
         if not y:
@@ -4661,7 +4721,7 @@ def cmd_sessions(a, local: Local):
         closer = me if me.id != y.id else machine
         if machine and closer:
             store = Store(closer.local)
-            ypeers, waiting = untaken(y, store, project, 0)
+            ypeers, waiting = untaken(y, store, project, 0, forwards=True)
             dest, dpeer, dname = forward_dest(closer, machine, peers_load(closer.local), y, project)
             done = forward_to_machine(closer, dest, dpeer, y, ypeers, waiting,
                                       "whose box was closed on the user's request", "closed on the user's request",
@@ -4677,7 +4737,10 @@ def cmd_sessions(a, local: Local):
         s = session_state(y.local)
         if y.role == "machine":
             state = "machine box (never closed)"
-        elif y.role == "project":
+        elif y.role == "butler":
+            state = "the butler's box (never closed)" + (" · its daemon runs (pid " + ", ".join(map(str, s["listening"])) + ")"
+                                                         if s["listening"] else " · its daemon is not running")
+        elif y.role == "project" and not y.closed_at:
             state = (f"box of project {y.conf.get('work_project')} (never closed), read by its sessions"
                      + (" · listened to now (pid " + ", ".join(map(str, s["listening"])) + ")" if s["listening"] else ""))
         elif y.closed_at:
@@ -5466,10 +5529,12 @@ def introduce(me: Me, parent: str, project: str) -> int:
         if rights_of(ppeers, peer) is None or peer.get("revoked_at") or peer.get("revoked_by_peer") \
                 or peer.get("retired_at") or peer.get("local_profile"):
             continue  # the sessions of this computer know each other already
+        what = (f"the box of project {session_key(me)} of {pme.label} (what is meant for that project waits there)"
+                if me.role == "project" else f"another agent session of {pme.label} on the same computer")
         send_payload(pme, pid, peer, peer.get("project") or project, f"introduces {me.label}",
-                     f"{me.label} ({me.agent}) is another agent session of {pme.label} on the same computer. Trust it with the "
+                     f"{me.label} ({me.agent}) is {what}. Trust it with the "
                      f"rights you gave {pme.label}; its fingerprint is {fingerprint(me.sign_pub, me.box_pub)}.", "introduce", None, False,
-                     extra={"card": card})
+                     extra={"card": card, **({"role": me.role} if me.role in ("project", "butler") else {})})
         print(f"introduced to {peer['alias']} ({peer['user']}, {peer['label']}) through {pme.label}")
         n += 1
     if not n:
@@ -7679,6 +7744,15 @@ def main():
     args = sys.argv[1:]  # `hook` before argparse: a harness hook must stay fast and touch nothing else
     if args[:1] == ["hook"] or (len(args) > 2 and args[0] == "--profile" and args[2] == "hook"):
         sys.exit(hook_main(args[args.index("hook") + 1:]))
+    if args[:1] == ["butler"]:  # the computer's butler: its own module, beside this file (client/BUTLER.md)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import mmbox_butler
+        except ImportError:
+            die("the butler needs mmbox_butler.py beside mmbox.py (a full clone of the client: mmbox-install)")
+        apply_tuning()
+        pin_hosts()
+        sys.exit(mmbox_butler.main(sys.modules[__name__], args[1:]))
     p = argparse.ArgumentParser(prog="mmbox.py", description=__doc__.split("\n")[0])
     p.add_argument("--profile", default=os.environ.get("MMBOX_PROFILE", "default"),
                    help="identity profile (one per agent on the same computer); env MMBOX_PROFILE")
@@ -7819,7 +7893,10 @@ def main():
     x.add_argument("--force", action="store_true", help="even if asked less than 5 min ago")
     x.add_argument("--project")
     x = sub("sessions", cmd_sessions, "the boxes of this computer and their state (open, idle, closed); --close one now")
-    x.add_argument("--close", metavar="PROFILE", help="close this session box now (what waits for it goes to the machine box)")
+    x.add_argument("--close", metavar="PROFILE", help="close this session box now (what waits for it goes to its project's box)")
+    x.add_argument("--remove", metavar="PROFILE", help="delete a project box (closed, what waits in it goes to the "
+                                                      "machine box; its folder goes 7 days later) or a closed session box "
+                                                      "(what waits in it goes to its project's box)")
     x.add_argument("--reason")
     x.add_argument("--project")
     x = sub("remind", cmd_remind, "tell the user about messages nobody processed for days (once per 3 days per user)")

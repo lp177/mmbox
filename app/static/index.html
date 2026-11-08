@@ -18,6 +18,7 @@
       <button class="tab ripple" role="tab" id="tab-boxes" aria-controls="view-boxes" aria-selected="false" tabindex="-1">Boxes</button>
       <button class="tab ripple" role="tab" id="tab-servers" aria-controls="view-servers" aria-selected="false" tabindex="-1">Servers</button>
       <button class="tab ripple" role="tab" id="tab-activity" aria-controls="view-activity" aria-selected="false" tabindex="-1">Activity</button>
+      <button class="tab ripple" role="tab" id="tab-butler" aria-controls="view-butler" aria-selected="false" tabindex="-1">Butler</button>
       <button class="tab ripple" role="tab" id="tab-settings" aria-controls="view-settings" aria-selected="false" tabindex="-1">Settings</button>
     </nav>
     <div class="appbar-end">
@@ -73,6 +74,7 @@
               <option value="read">Taken</option>
               <option value="pending">Queued / sent</option>
               <option value="undelivered">Never read (closed box, dropped)</option>
+              <option value="project">Project boxes (waiting for a session of the project)</option>
               <option value="broadcast">Broadcasts</option>
               <option value="direct">Direct messages</option>
             </select>
@@ -247,6 +249,63 @@
           <thead><tr><th scope="col">When</th><th scope="col">Event</th><th scope="col">Box</th><th scope="col">Machine</th><th scope="col">Server</th></tr></thead>
           <tbody id="activity-body"></tbody>
         </table>
+      </div>
+    </section>
+
+    <!-- The butler of this computer (client/BUTLER.md): chat, new sessions, agents and models, its live output -->
+    <section id="view-butler" class="view view-butler" role="tabpanel" aria-labelledby="tab-butler" hidden>
+      <div class="butler-head">
+        <span id="butler-state" class="chip" role="status"></span>
+        <span id="butler-meta" class="dim"></span>
+        <span class="grow"></span>
+        <label class="switch-row"><input type="checkbox" role="switch" id="butler-run" class="switch"> <span>Run the butler with this console</span></label>
+        <button class="btn small ripple" id="butler-refresh" type="button">Refresh agents and models</button>
+      </div>
+      <p id="butler-missing" class="notice pad" hidden></p>
+      <div class="butler-grid">
+        <section class="card butler-chat" aria-labelledby="butler-chat-title">
+          <h3 id="butler-chat-title">Chat with the butler</h3>
+          <div id="butler-chat-log" class="butler-chat-log" role="log" aria-live="polite" aria-label="Conversation with the butler"></div>
+          <form id="butler-chat-form" class="butler-chat-form">
+            <div class="field grow"><textarea id="butler-chat-text" rows="2" placeholder=" "></textarea><label for="butler-chat-text">Write to the butler (Ctrl+Enter sends)</label></div>
+            <button class="btn filled ripple" type="submit" id="butler-chat-send">Send</button>
+          </form>
+        </section>
+        <section class="card" aria-labelledby="butler-new-title">
+          <h3 id="butler-new-title">New session</h3>
+          <form id="butler-new" class="butler-new">
+            <div class="field"><select id="bn-folder"></select><label for="bn-folder">Folder</label></div>
+            <div class="field"><input id="bn-path" placeholder=" " autocomplete="off"><label for="bn-path">Or another folder, under a root of butler.json</label></div>
+            <div class="row">
+              <div class="field"><select id="bn-agent"></select><label for="bn-agent">Agent</label></div>
+              <div class="field"><input id="bn-model" list="bn-models" placeholder=" " autocomplete="off"><datalist id="bn-models"></datalist><label for="bn-model">Model</label></div>
+            </div>
+            <div class="field"><input id="bn-title" maxlength="60" placeholder=" "><label for="bn-title">Title (three words at most)</label></div>
+            <div class="field"><textarea id="bn-task" rows="2" placeholder=" "></textarea><label for="bn-task">First task (optional)</label></div>
+            <div class="actions"><button class="btn filled ripple" type="submit" id="bn-go">Start the session</button></div>
+            <p id="bn-out" class="dim" role="status"></p>
+          </form>
+          <h4 class="sub-title">Sessions the butler started</h4>
+          <ul id="butler-started" class="butler-started"></ul>
+        </section>
+        <section class="card" aria-labelledby="butler-inv-title">
+          <h3 id="butler-inv-title">Agents and models of this computer</h3>
+          <p id="butler-inv-at" class="dim"></p>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th scope="col">Agent</th><th scope="col">Version</th><th scope="col">Logged in</th><th scope="col">Models</th></tr></thead>
+              <tbody id="butler-inv"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="card butler-out-card" aria-labelledby="butler-out-title">
+          <h3 id="butler-out-title">Live output</h3>
+          <div class="row">
+            <div class="field"><select id="bo-filter"><option value="all">Everything</option><option value="daemon">The daemon</option><option value="agent">Agent turns</option><option value="error">Errors</option></select><label for="bo-filter">Show</label></div>
+            <label class="switch-row"><input type="checkbox" role="switch" id="bo-pause" class="switch"> <span>Pause</span></label>
+          </div>
+          <div id="butler-out" class="butler-out mono" role="log" aria-live="off" tabindex="0" aria-label="The butler's output"></div>
+        </section>
       </div>
     </section>
 
@@ -551,9 +610,19 @@
   <div id="rights-menu" class="menu" popover="auto">
     <div role="menu" aria-labelledby="rights-menu-title" id="rights-menu-items">
       <p id="rights-menu-title" class="menu-title"></p>
+      <div id="box-acts" hidden>
+        <button type="button" role="menuitem" class="pause-item" data-box="purge">Purge its history<span class="hint">what no longer waits, from this computer</span></button>
+        <button type="button" role="menuitem" class="pause-item" data-box="empty">Empty what waits<span class="hint">purged unhandled, senders told</span></button>
+        <button type="button" role="menuitem" class="pause-item" data-box="close" id="box-close">Close the session<span class="hint">what reaches it goes to its project's box</span></button>
+        <button type="button" role="menuitem" class="pause-item danger" data-box="delete" id="box-delete">Delete the project box<span class="hint">what waits goes on, nothing is lost</span></button>
+        <hr id="box-acts-sep">
+      </div>
+      <button type="button" role="menuitem" id="rights-butler" class="pause-item" hidden>Refresh agents and models<span class="hint">the butler probes this computer now</span></button>
+      <hr id="rights-butler-sep" hidden>
       <button type="button" role="menuitem" id="rights-pause" class="pause-item" hidden></button>
       <button type="button" role="menuitem" id="rights-range" class="pause-item" hidden>Statistics period…</button>
       <hr id="rights-pause-sep" hidden>
+      <div id="rights-main">
       <div role="group" aria-label="Handling">
         <button type="button" role="menuitemradio" aria-checked="false" data-rights="execute">Execute<span class="hint">acts without asking</span></button>
         <button type="button" role="menuitemradio" aria-checked="false" data-rights="ask">Ask<span class="hint">asks you the question</span></button>
@@ -561,6 +630,7 @@
       </div>
       <hr>
       <button type="button" role="menuitemradio" aria-checked="false" data-rights="follow" id="rights-follow">Follow the workstation</button>
+      </div>
       <div id="rights-other" hidden>
         <hr>
         <p id="rights-other-title" class="menu-title"></p>
