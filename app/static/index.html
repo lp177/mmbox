@@ -7,18 +7,17 @@
   <title>mmbox</title>
   <link rel="icon" href="/icon-small.svg" type="image/svg+xml">
   <link rel="stylesheet" href="console.css">
+  <link rel="stylesheet" href="splash.css">
   <script src="console.js" defer></script>
 </head>
 <body>
   <!-- the start screen: shown at once, until the first view of the boxes arrives (the first refresh reads every service) -->
   <div id="splash" class="splash" role="status" aria-live="polite">
-    <div class="splash-in">
-      <img src="/icon.svg" alt="" class="splash-logo" width="112" height="112">
-      <div class="splash-name">mmbox</div>
-      <div class="splash-bar" aria-hidden="true"><span></span></div>
-      <div class="splash-text" id="splash-text">Starting: reading the services…</div>
-    </div>
+    <div id="splash-anim" aria-hidden="true"></div>
+    <span class="sr-only" id="splash-text">mmbox is starting: reading the services…</span>
   </div>
+  <script src="splash-data.js"></script>
+  <script src="splash.js"></script>
   <a class="skip" href="#main">Skip to content</a>
   <header class="appbar">
     <h1 class="brand"><img class="logo" src="/icon-small.svg" alt="" width="28" height="28">mmbox</h1>
