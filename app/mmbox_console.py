@@ -40,6 +40,8 @@ def log(*a):
 
 
 WAITING = ("queued", "sent", "unread", "taken")  # a message's states while it is still in a box (or on its way)
+PURGE_KEEP_DEFAULT_S = 86400  # the purge keeps this much of the open boxes' finished messages (Settings)
+PURGE_KEEP_MAX_S = 366 * 86400
 HELD_AFTER_S = 300  # a message its sender keeps queued (the service refuses it) for longer than this is "held": shown loud
 HELD_RETRY_S = 1800  # no refusal seen for this long: its sender stopped retrying (console.js: HELD_RETRY_S)
 # final states besides read: "delivered" (its service says it was consumed: what the logs of this computer and the
@@ -55,6 +57,15 @@ def fmt_bytes(n: float) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1000
     return f"{n:.1f} GB"
+
+
+def fmt_delay(s: float) -> str:
+    """A delay in the largest unit that divides it: 1 day, 36 hours, 90 minutes, 0 minutes."""
+    for div, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if s and s % div == 0:
+            n = int(s // div)
+            return f"{n} {unit}" + ("s" if n > 1 else "")
+    return f"{s / 60:g} minutes"
 
 
 def dir_size(p: Path) -> int:
@@ -323,7 +334,8 @@ class Questions:
             if p.get("withdraw"):  # the box's user answered elsewhere (in its chat)
                 q = self.items.get(str(p["withdraw"]))
                 if q and q["from"] == sender and q["state"] == "pending":
-                    q.update(state="withdrawn", closed_at=time.time())
+                    q.update(state="withdrawn", closed_at=time.time(),
+                             **({"withdrawn_answer": str(p["withdraw_answer"])[:4000]} if p.get("withdraw_answer") else {}))
                     self.save()
                 return
             if p.get("id") in self.items:
@@ -932,7 +944,22 @@ class Archive:
                 CREATE TABLE IF NOT EXISTS conv (box TEXT NOT NULL, id TEXT NOT NULL, received REAL NOT NULL,
                                                  expires REAL, expired INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (box, id));
                 CREATE TABLE IF NOT EXISTS convset (box TEXT PRIMARY KEY, ttl_s REAL, pinned INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS purged (id TEXT PRIMARY KEY, at REAL NOT NULL);
             """)
+
+    def purged(self) -> set:
+        """The messages the purge removed: hidden from the list even when a collector still holds an event of them."""
+        with self.lock:
+            return {r[0] for r in self.db.execute("SELECT id FROM purged")}
+
+    def mark_purged(self, ids, forget_after_s: float) -> None:
+        """A marker for each of `ids`; the markers older than `forget_after_s` go (nothing can bring those back)."""
+        now = time.time()
+        with self.lock:
+            self.db.execute("BEGIN")
+            self.db.executemany("INSERT OR REPLACE INTO purged (id, at) VALUES (?, ?)", [(i, now) for i in ids])
+            self.db.execute("DELETE FROM purged WHERE at < ?", (now - forget_after_s,))
+            self.db.execute("COMMIT")
 
     def settings(self, box: str) -> tuple[float | None, bool]:
         r = self.db.execute("SELECT ttl_s, pinned FROM convset WHERE box=?", (box,)).fetchone()
@@ -1046,6 +1073,7 @@ class State:
         self._seen_saved = 0.0
         self.questions = Questions(op.home)
         self.archive = Archive(op.home)
+        self.purged: set = self.archive.purged()
         self.clients: dict[str, float] = {}  # when a browser tab last said it shows notifications / plays the sound
         self.desktop: Desktop | None = None
         self.known_q: set | None = None  # the questions seen at the last tick (None: not yet: no sound at the opening)
@@ -1140,6 +1168,41 @@ class State:
         self._usage = (time.time(), out)
         return out
 
+    def purge_keep_s(self) -> float:
+        """How much of the open boxes' finished messages the purge keeps (Settings; 24 h by default)."""
+        try:
+            v = float(self.console_state.get("purge_keep_s"))
+        except (TypeError, ValueError):
+            return PURGE_KEEP_DEFAULT_S
+        return min(max(v, 0.0), PURGE_KEEP_MAX_S)
+
+    def purge_plan(self) -> dict:
+        """What the purge removes: every message of the list that no longer waits in a box (or was only "sent" by a
+        box that closed since), but those younger than the kept delay that an open box sent, received or saw (its
+        session may still answer them)."""
+        keep_s = self.purge_keep_s()
+        cut = time.time() - keep_s
+        with self.lock:
+            msgs = dict(self.messages)
+            boxes = {b["id"]: b for b in self.snapshot.get("boxes") or []}
+        open_ids = {i for i, b in boxes.items() if b.get("active") or (b.get("local") and not b.get("closed_at"))}
+
+        def recent_open(m):
+            t = _ms(m.get("ts"))
+            if t is None or t / 1000 < cut:
+                return False
+            rel = {m.get("from"), m.get("to"), m.get("read_by"), (m.get("taken_by") or {}).get("id"),
+                   *(m.get("to_boxes") or []), *(m.get("seen_by") or [])}
+            return bool(rel & open_ids)
+        def still_waiting(m):
+            # "sent" by a box that is no longer open: its copy in the recipient's box is delivered without the
+            # sender's log, and a deleted sender can no longer ask the service whether it was consumed
+            st = m.get("state")
+            return st in WAITING and not (st == "sent" and m.get("from") not in open_ids)
+        waiting = {i for i, m in msgs.items() if still_waiting(m)}
+        gone = {i for i, m in msgs.items() if i not in waiting and not recent_open(m)}
+        return {"keep_s": keep_s, "cut": cut, "msgs": msgs, "waiting": waiting, "gone": gone, "open": open_ids}
+
     def local_usage(self) -> dict:
         """This computer: the console's folder (its copy of the messages, their attached files, the window's data)
         and the boxes' folder (their keys, logs and attached files)."""
@@ -1147,22 +1210,109 @@ class State:
         archive = sum(dir_size(home / f"archive.sqlite{x}") for x in ("", "-wal", "-shm"))
         atts, wv_home = dir_size(home / "attachments"), dir_size(home / "webview")
         webkit, total_home = sum(dir_size(d) for d in webkit_dirs()), dir_size(home)
-        waiting = self.waiting_ids()
+        plan = self.purge_plan()
         with self.archive.lock:
             ids = [r[0] for r in self.archive.db.execute("SELECT id FROM msgs")]
         console = {"archive": archive, "attachments": atts, "window": wv_home + webkit,
                    "other": max(0, total_home - archive - atts - wv_home), "total": total_home + webkit, "path": str(home)}
-        boxes = {"total": dir_size(boxes_dir), "path": str(boxes_dir),
+        logs, closed = 0, 0
+        for d in boxes_dir.iterdir() if boxes_dir.is_dir() else []:
+            f = d / "log.jsonl"
+            if f.is_file() and f.stat().st_size:
+                logs += f.stat().st_size
+                try:
+                    closed += bool((json.loads((d / "config.json").read_text(encoding="utf-8")) or {}).get("closed_at"))
+                except (OSError, ValueError):
+                    pass
+        boxes = {"total": dir_size(boxes_dir), "path": str(boxes_dir), "logs": logs, "closed_with_log": closed,
                  "profiles": sum(1 for d in boxes_dir.iterdir() if d.is_dir()) if boxes_dir.is_dir() else 0}
         return {"console": console, "boxes": boxes, "total": console["total"] + boxes["total"],
-                "messages": len(ids), "purgeable": sum(1 for i in ids if i not in waiting)}
+                "messages": len(ids), "listed": len(plan["msgs"]), "waiting": len(plan["waiting"]),
+                "purgeable": len(plan["gone"]), "keep_s": plan["keep_s"],
+                "kept_open": len(plan["msgs"]) - len(plan["gone"]) - len(plan["waiting"])}
 
-    def purge_archive(self) -> dict:
-        """The memory view's first button: every message the console keeps that no longer waits in a box, and the
-        attached files it keeps for them. The boxes' own logs on this computer are not touched."""
-        keep = self.waiting_ids()
-        before = self.local_usage()["console"]["total"]
-        n = self.archive.purge(keep)
+    @staticmethod
+    def _purge_log(y, drop) -> tuple[int, int]:
+        """y's log.jsonl rewritten without the entries `drop(entry)` names, under the profile's own lock (a listener
+        appending meanwhile waits); the attached files of the messages no entry names any more go too.
+        Returns (entries removed, attachment folders removed)."""
+        p = y.local.path("log.jsonl")
+        removed, gone, kept_ids = 0, set(), set()
+        with y.local.locked():
+            if not p.is_file():
+                return 0, 0
+            kept = []
+            for line in p.read_bytes().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    kept.append(line + b"\n")
+                    continue
+                mid = e.get("id") or (e.get("payload") or {}).get("id") if isinstance(e, dict) else None
+                if isinstance(e, dict) and drop(e, mid):
+                    removed += 1
+                    gone.add(mid)
+                else:
+                    kept.append(line + b"\n")
+                    kept_ids.add(mid)
+            if removed:
+                tmp = p.with_name(p.name + ".purge")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.writelines(kept)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, p)
+        folders = 0
+        name_of = getattr(M, "_attach_dir_name", None)
+        root = y.local.dir / "attachments"
+        if name_of and root.is_dir():
+            import shutil
+            for mid in gone - kept_ids - {None}:
+                d = root / name_of(mid)
+                if d.is_dir():
+                    shutil.rmtree(d, ignore_errors=True)
+                    folders += 1
+        return removed, folders
+
+    def purge_everything(self) -> dict:
+        """The memory view's first button, a real purge: every message that no longer waits in a box goes from this
+        computer for good - the boxes' logs (a closed box's log is emptied of everything but what still waits), their
+        attached files, the console's copy - but what an open box handled within the kept delay (Settings). A marker
+        stays for each, so that a collector's events do not bring them back to the list."""
+        plan = self.purge_plan()
+        msgs, waiting, gone, cut = plan["msgs"], plan["waiting"], plan["gone"], plan["cut"]
+        before = self.local_usage()["total"]
+        entries = folders = logs = 0
+        errors = []
+        for n in M.local_profiles():
+            y = M.load_me(n)
+            if not y:
+                continue
+            closed = bool(y.closed_at) and y.id not in plan["open"]
+            outbox = {i.get("msg_id") for i in (y.local.load("state.json", {}) or {}).get("outbox") or []}
+
+            def drop(e, mid, closed=closed, outbox=outbox):
+                if not mid or mid in waiting or mid in outbox:
+                    return False
+                if closed or mid in gone:
+                    return True
+                if mid in msgs:  # in the list and kept: an open box's recent message
+                    return False
+                try:  # older than the list's horizon: by its own date
+                    return M.parse_iso((e.get("payload") or {}).get("ts") or e.get("at")).timestamp() < cut
+                except (TypeError, ValueError, AttributeError):
+                    return False
+            try:
+                r, f = self._purge_log(y, drop)
+            except OSError as ex:
+                errors.append(f"{n}: {ex}")
+                continue
+            entries, folders, logs = entries + r, folders + f, logs + bool(r)
+        keep = set(msgs) - gone
+        n_arch = self.archive.purge(keep)
         with self.lock:
             shas = {str(a.get("sha256") or "") for mid in keep for a in (self.messages.get(mid) or {}).get("attachments") or []}
         files = 0
@@ -1172,10 +1322,20 @@ class State:
                 if f.is_file() and f.name not in shas:
                     f.unlink(missing_ok=True)
                     files += 1
-        after = self.local_usage()["console"]["total"]
+        # the markers outlive what could bring a message back: the collectors' retention and the list's horizon
+        self.archive.mark_purged(gone, max(self.days * 86400, self.conv_default_ttl(), plan["keep_s"]) + 86400)
+        self.purged = self.archive.purged()
+        self.logs = LogCache()  # the rewritten logs are read again from their start
         self._usage = (0.0, {})
-        return {"ok": True, "out": f"{n} message(s) purged from the console, {files} attached file(s); "
-                                   f"{len(keep)} still waiting kept; {fmt_bytes(max(0, before - after))} freed."}
+        after = self.local_usage()["total"]
+        log(f"purge: {len(gone)} message(s), {entries} log entries in {logs} box(es), {n_arch} console cop(ies)"
+            + (f"; errors: {'; '.join(errors)}" if errors else ""))
+        threading.Thread(target=self.refresh, daemon=True).start()
+        out = (f"{len(gone)} message(s) purged: {entries} log entries in {logs} box(es), {folders + files} attached "
+               f"file folder(s) and file(s), {n_arch} console cop(ies); {len(waiting)} still waiting kept, "
+               f"{len(keep) - len(waiting & keep)} handled by an open box within {fmt_delay(plan['keep_s'])} kept; "
+               f"{fmt_bytes(max(0, before - after))} freed.")
+        return {"ok": not errors, "out": out + ("\nFailed: " + "; ".join(errors) if errors else ""), "err": "; ".join(errors) or None}
 
     def empty_boxes(self) -> dict:
         """The memory view's second button: every box of every service where this console is an operator deleted
@@ -1459,8 +1619,15 @@ class State:
                 default_rights, by_id = M.local_rights_conf()
                 rights["local"] = {"rights": default_rights, "env": bool(os.environ.get("MMBOX_LOCAL_RIGHTS"))}
                 rights["networks"] = {u: r for u, r in (machine.conf.get("service_rights") or {}).items() if r in M.RIGHTS}
+                if hasattr(M, "other_project_conf"):  # the sessions of other projects of this computer
+                    opc = M.other_project_conf()
+                    rights["other_projects"] = {"computer": opc["computer"], "projects": opc["projects"],
+                                                "networks": opc["networks"], "project": machine.conf.get("project")}
                 for pid, q in mp.items():
-                    if q.get("local_profile"):
+                    if q.get("local_profile") and q.get("other_project"):
+                        rights[pid] = {"rights": q.get("rights"), "source": q.get("rights_source") or "default",
+                                       "local": True, "other_project": q.get("project")}
+                    elif q.get("local_profile"):
                         rights[pid] = {"rights": q.get("rights"), "source": "own" if pid in by_id else "local", "local": True}
                     else:
                         src = q.get("rights_from")
@@ -1692,7 +1859,7 @@ class State:
                     b["servers"].append(u)
 
         for bid, r in self.rights.items():  # every box this computer knows the rights of
-            if bid not in ("local", "networks") and bid in boxes:
+            if bid not in ("local", "networks", "other_projects") and bid in boxes:
                 boxes[bid]["rights"] = r
 
         msgs: dict[str, dict] = {}
@@ -1970,6 +2137,9 @@ class State:
             m.setdefault("state", "sent")
             k = m.get("kind")
             m["tier"] = tier_of(m)
+        purged = self.purged  # what the purge removed stays gone, unless it waits in a box again
+        for mid in [i for i, m in msgs.items() if i in purged and m.get("state") not in WAITING]:
+            del msgs[mid]
         for m in msgs.values():  # answered: a later message of the thread, from another box than the asker
             o = msgs.get(m.get("re") or "")
             if o and not o.get("broadcast") and m.get("from") and m["from"] != o.get("from") \
@@ -1999,11 +2169,13 @@ class State:
                 "activity": activity[-3000:], "days": self.days, "errors": errors,
                 "tuning": self.tuning(), "startup": self.startup,
                 "local_rights": self.rights.get("local"), "service_rights": self.rights.get("networks") or {},
+                "other_project_rights": self.rights.get("other_projects"),
                 "questions": {"pending": self.questions.pending(), "recent": self.questions.recent(),
                               "decisions": dict(self.questions.decisions)},
                 "notify": self.notify_settings(), "sounds": SOUNDS,
                 "custom_sound": (self.console_state.get("custom_sound") or None),
-                "pinned": self.archive.pinned(), "conv_ttl": self.archive.overrides()}
+                "pinned": self.archive.pinned(), "conv_ttl": self.archive.overrides(),
+                "purge_keep_s": self.purge_keep_s()}
         d = hashlib.sha256(json.dumps(snap, sort_keys=True, default=str).encode()).hexdigest()
         if d != self.digest:
             self.digest = d
@@ -2185,8 +2357,19 @@ def act(state: State, body: dict) -> dict:
         r = run_client(args)
         threading.Thread(target=state.refresh, daemon=True).start()
         return r
-    if a == "purge_archive":  # the memory view: what the console keeps of the messages no longer waiting in a box
-        return state.purge_archive()
+    if a == "purge_archive":  # the memory view: every message no longer waiting in a box, from this computer
+        return state.purge_everything()
+    if a == "purge_keep":  # Settings: how much of the open boxes' finished messages the purge keeps
+        try:
+            v = float(body.get("seconds"))
+        except (TypeError, ValueError):
+            return {"ok": False, "err": "a duration in seconds"}
+        if not 0 <= v <= PURGE_KEEP_MAX_S:
+            return {"ok": False, "err": f"between 0 and {PURGE_KEEP_MAX_S // 86400} days"}
+        state.console_state["purge_keep_s"] = v
+        state.save_console_state()
+        state._usage = (0.0, {})
+        return {"ok": True, "purge_keep_s": v}
     if a == "empty_boxes":  # the memory view: every box of every service where this console is an operator
         return state.empty_boxes()
     if a == "col_config":  # an operator's collector: retention, hold every entry 48 h more, purge
@@ -2216,10 +2399,14 @@ def act(state: State, body: dict) -> dict:
         return state.decide(s("id"), s("decision"), str(body.get("text") or ""))
     if a == "rights":  # how this computer handles what a box (or a machine and its sessions) sends
         target, rights = s("target"), s("rights")
+        urls = {x["url"] for x in state.snapshot.get("servers", [])}
         if rights not in ("execute", "ask", "archive", "follow") or not (
-                target == "local" or re.fullmatch(r"m[0-9a-z]{12}", target)
-                or (target.startswith("@") and target[1:] in {x["url"] for x in state.snapshot.get("servers", [])})):
-            return {"ok": False, "err": "rights: execute, ask, archive or follow, for a box id, local or @<service URL>"}
+                target in ("local", "projects") or re.fullmatch(r"m[0-9a-z]{12}", target)
+                or re.fullmatch(r"project:[A-Za-z0-9._-]{1,80}", target)
+                or (target.startswith("@") and target[1:] in urls)
+                or (target.startswith("projects@") and target[9:] in urls)):
+            return {"ok": False, "err": "rights: execute, ask, archive or follow, for a box id, local, projects, "
+                                        "project:<name>, @<service URL> or projects@<service URL>"}
         r = run_client(["--profile", M.MACHINE_PROFILE, "rights", target, rights])
         threading.Thread(target=state.refresh, daemon=True).start()
         return r

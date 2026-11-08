@@ -235,7 +235,7 @@ function treeItem({ id, type, key, icon, name, sub, badge, held, dot, children, 
   const li = h("li", { role: "treeitem", id: "t-" + id, "aria-level": level, "aria-selected": String(S.node.type === type && S.node.key === key),
     "aria-expanded": hasKids ? String(S.expanded.has(id)) : null, tabindex: "-1", dataset: { type, key: key ?? "", nid: id },
     "aria-keyshortcuts": r ? "Shift+F10" : null, "aria-description": r ? `handling: ${RIGHTS_TXT[r.rights] || "as the workstations say"} (menu: Shift+F10)` : null });
-  const showChip = r && r.rights && (type === "machine" || r.source === "own" || r.network);
+  const showChip = r && r.rights && (type === "machine" || r.source === "own" || r.network || r.otherProject);
   const node = h("div", { class: "node ripple" + (held ? " held" : "") },
     h("span", { class: "twist" }, hasKids ? svg(ICON.chevron) : null),
     dot ? h("span", { class: "dot " + dot, title: { listening: "listening", active: "active", closed: "closed", paused: "receiving stopped" }[dot] || "" }) : null,
@@ -404,8 +404,11 @@ function rightsOf(node) {
   if (!snap || !node.key) return null;
   if (node.type === "machine") {
     if (node.key === snap.local?.machine) {
-      const lr = snap.local_rights;
-      return lr ? { target: "local", rights: lr.rights, source: "local-default", env: lr.env, title: "The sessions of this computer, between themselves" } : null;
+      const lr = snap.local_rights, op = snap.other_project_rights;
+      return lr ? { target: "local", rights: lr.rights, source: "local-default", env: lr.env,
+        title: "The sessions of this computer, between themselves" + (op?.project ? ` (project ${op.project})` : ""),
+        other: op ? { target: "projects", rights: op.computer || null, follow: "Follow each network's default (else Ask)", followed: "follows each network's default (else Ask)",
+          following: !op.computer, title: "The sessions of other projects on this computer" } : null } : null;
     }
     const b = S.boxes.get(node.key);
     return b?.rights ? { target: b.id, rights: b.rights.rights, source: b.rights.source, title: `Messages from ${machineName(node.key)} and its sessions` + networkNote(b) } : null;
@@ -413,13 +416,23 @@ function rightsOf(node) {
   if (node.type === "server") {
     const net = snap.service_rights?.[node.key];
     const name = (S.servers.get(node.key) || {}).name || node.key;
+    const op = snap.other_project_rights, def = op?.networks?.[node.key];
     return { target: "@" + node.key, rights: net || null, source: net ? "network" : "none", network: true,
-      follow: "Follow the workstations and boxes", following: !net, title: `Everything that arrives through ${name} from other computers` };
+      follow: "Follow the workstations and boxes", following: !net, title: `Everything that arrives through ${name} from other computers`,
+      other: op ? { target: "projects@" + node.key, rights: def || null, follow: "No default on this network", followed: "no default on this network",
+        following: !def, title: `By default, the sessions of other projects of this computer writing through ${name}` } : null };
   }
   if (node.type === "box") {
     const b = S.boxes.get(node.key);
     if (!b?.rights || b.role === "operator" || b.role === "machine") return null;  // a machine box: its machine's menu
     const r = b.rights;
+    if (r.other_project) {  // a session of another project of this computer: its box, then its project, the computer, the network, Ask
+      const p = r.other_project, pr = snap.other_project_rights?.projects?.[p];
+      return { target: b.id, rights: r.rights, source: r.source, otherProject: p, follow: "Follow its project and this computer",
+        followed: "follows its project and this computer", following: r.source !== "own", title: `Messages from ${boxName(b.id)} — another project (${p})`,
+        other: { target: "project:" + p, rights: pr || null, follow: "Follow this computer's setting for other projects",
+          followed: "follows this computer's setting for other projects", following: !pr, title: `Every session of project ${p} on this computer` } };
+    }
     const follow = r.local ? "Follow the sessions of this computer" : r.introduced_by ? `Follow its workstation (${machineName(machineKey(b))})` : null;
     return { target: b.id, rights: r.rights, source: r.source, follow, following: r.source === "follows" || r.source === "local",
       env: r.local && snap.local_rights?.env, title: `Messages from ${boxName(b.id)}` + (r.local ? "" : networkNote(b)) };
@@ -499,7 +512,8 @@ function networkNote(b) {
   const nets = (b?.servers || []).filter((u) => S.snap?.service_rights?.[u]);
   return nets.length ? ` — the network ${nets.map((u) => (S.servers.get(u) || {}).name || u).join(", ")} overrides it` : "";
 }
-function rmItems() { return $$('[role="menuitemradio"], [role="menuitem"]', RM.el).filter((b) => !b.hidden && !b.disabled); }
+function rmItems() { return $$('[role="menuitemradio"], [role="menuitem"]', RM.el).filter((b) => !b.hidden && !b.disabled && !b.parentElement.closest("[hidden]")); }
+const inOther = (it) => !!it.closest('[data-group="other"]');
 function openRightsMenu(li, fromPointer) {
   const btn = li.querySelector(":scope > .node .node-menu");
   const r = rightsOf({ type: li.dataset.type, key: li.dataset.key });
@@ -507,7 +521,17 @@ function openRightsMenu(li, fromPointer) {
   if (RM.el.matches(":popover-open")) RM.el.hidePopover();
   Object.assign(RM, { r, nid: li.dataset.nid, fromPointer, btn });
   $("#rights-menu-title").textContent = r.title;
-  for (const it of $$('[role="menuitemradio"]', RM.el)) {
+  const o = r.other;
+  $("#rights-other").hidden = !o;
+  if (o) {
+    $("#rights-other-title").textContent = o.title;
+    for (const it of $$('[data-group="other"] [role="menuitemradio"]', RM.el)) {
+      const v = it.dataset.rights;
+      if (v === "follow") { it.firstChild.textContent = o.follow; it.setAttribute("aria-checked", String(!!o.following)); it.disabled = !!o.following; }
+      else it.setAttribute("aria-checked", String(!o.following && o.rights === v));
+    }
+  }
+  for (const it of $$('[role="menuitemradio"]', RM.el).filter((x) => !inOther(x))) {
     const v = it.dataset.rights;
     if (v === "follow") {
       it.hidden = !r.follow;
@@ -576,13 +600,16 @@ RM.el.addEventListener("click", async (e) => {
   if (pz && !pz.disabled && RM.r) { RM.el.hidePopover(); setReception(RM.r.target.slice(1), pz.dataset.act); return; }
   const it = e.target.closest('[role="menuitemradio"]');
   if (!it || it.disabled || !RM.r) return;
-  const r = RM.r, v = it.dataset.rights;
-  $$('[role="menuitemradio"]', RM.el).forEach((x) => x.dataset.rights !== "follow" && x.setAttribute("aria-checked", String(x === it)));
+  const other = inOther(it), r = other ? RM.r.other : RM.r, v = it.dataset.rights;
+  $$('[role="menuitemradio"]', RM.el).filter((x) => inOther(x) === other)
+    .forEach((x) => (other || x.dataset.rights !== "follow") && x.setAttribute("aria-checked", String(x === it)));
   setTimeout(() => RM.el.hidePopover(), 160);  // the new check mark seen first
-  if (v !== "follow" && v === r.rights && r.source !== "follows" && r.source !== "local") return;
+  const same = other || r.otherProject ? v !== "follow" && !r.following && v === r.rights
+    : v !== "follow" && v === r.rights && r.source !== "follows" && r.source !== "local";
+  if (same) return;
   const res = await action({ action: "rights", target: r.target, rights: v });
   if (!res.ok) { showOutput("Handling", res); return; }
-  toast(`${r.title}: ${v === "follow" ? (r.network ? "follows the workstations and boxes" : "follows its workstation") : RIGHTS_TXT[v]}`);
+  toast(`${r.title}: ${v !== "follow" ? RIGHTS_TXT[v] : r.followed || (r.network ? "follows the workstations and boxes" : "follows its workstation")}`);
   poll(true);
 });
 
@@ -830,6 +857,7 @@ function route(m) {
   const to = m.broadcast ? (m.scope === "network" ? "the whole network" : (m.to_boxes || []).length > 1 ? `${m.to_boxes.length} channels` : "this computer") : boxName(m.to);
   return `${boxName(m.from)} → ${to}`;
 }
+const WAITING_STATES = ["queued", "sent", "unread", "taken"];  // as WAITING in mmbox_console.py
 const LATE_TIER = 2;  // late messages are reported up to this verbosity (the header button counts the same ones)
 const isUnread = (m) => m.state === "unread" || m.state === "taken";
 const isLate = (m) => !m.broadcast && isUnread(m) && Date.now() - tsOf(m) > (+F.lateMin || 5) * 60e3;
@@ -856,7 +884,10 @@ function renderList() {
   attRelease("chat");
   const list = $("#list");
   const rows = filtered();
-  $("#list-count").textContent = `${rows.length} message(s)` + (rows.length > S.limit ? ` · ${S.limit} shown` : "");
+  const span = { 3600: " over 1 hour", 86400: " over 24 hours", 604800: " over 7 days" }[F.period] || "";
+  const waitingN = rows.filter((m) => !m.broadcast && WAITING_STATES.includes(m.state)).length;
+  $("#list-count").textContent = `${rows.length} message(s)${span} · ${waitingN} waiting` + (rows.length > S.limit ? ` · ${S.limit} shown` : "");
+  $("#list-count").title = "The history of the boxes of this computer and of the collectors, with the filters above; \"waiting\": still in a box (queued, sent, unread or taken). The Memory view purges what no longer waits.";
   $("#scope").textContent = nodeLabel(S.node);
   const frag = document.createDocumentFragment();
   let last = null;
@@ -928,7 +959,11 @@ function openBoxCard(id) {
       b.opened_ms ? [h("dt", {}, "Opened"), h("dd", {}, fmtFull.format(new Date(b.opened_ms)))] : null,
       h("dt", {}, "Unread"), h("dd", {}, String(mine)),
       rightsOf({ type: "box", key: id }) ? [h("dt", {}, "Handling"), h("dd", {}, RIGHTS_TXT[b.rights.rights] || "?",
-        h("span", { class: "dim" }, { follows: " · follows its workstation", local: " · as the sessions of this computer", own: " · own setting" }[b.rights.source] || ""))] : null,
+        h("span", { class: "dim" }, b.rights.other_project
+          ? ` · another project (${b.rights.other_project}): ` + ({ own: "own setting", project: "its project's setting", computer: "this computer's setting for other projects",
+            network: `default of the network ${(S.servers.get(String(b.rights.source).slice(8)) || {}).name || String(b.rights.source).slice(8)}`,
+            default: "nothing set, so Ask" }[String(b.rights.source).split(":")[0]] || "?")
+          : { follows: " · follows its workstation", local: " · as the sessions of this computer", own: " · own setting" }[b.rights.source] || ""))] : null,
       h("dt", {}, "Servers"), h("dd", {}, (b.servers || []).map((u) => (S.servers.get(u) || {}).name || u).join(", ") || "—"),
       b.agent ? [h("dt", {}, "Agent"), h("dd", {}, b.agent + (b.user ? ` · ${b.user}` : ""))] : null,
       b.role !== "machine" && b.role !== "operator" ? [h("dt", {}, "Model"), h("dd", {}, modelName(b) || "not declared (older client, or no --model)")] : null));
@@ -1216,7 +1251,8 @@ function decisionBlock(m) {
     if (q.state === "pending") lines.push(h("p", {}, "Its question waits in the console: ", h("strong", {}, q.subject || q.id), " ",
       h("button", { class: "btn small ripple", type: "button", onclick: () => openQuestions(q.id) }, "Answer the question")));
     else if (q.state === "withdrawn") lines.push(h("p", { class: "dim" }, `Its question “${q.subject || q.id}” was withdrawn by the session`
-      + (q.closed_at ? ` on ${fmtFull.format(new Date(q.closed_at * 1000))}` : "") + ": you answered it in the session's own chat."));
+      + (q.closed_at ? ` on ${fmtFull.format(new Date(q.closed_at * 1000))}` : "")
+      + (q.withdrawn_answer ? `: answered in the IDE: ${q.withdrawn_answer}` : ": you answered it in the session's own chat.")));
     else if (q.state === "answered" && q.answer && !q.answer.decision) lines.push(h("p", { class: "dim" }, `You answered its question “${q.subject || q.id}”`
       + (q.closed_at ? ` on ${fmtFull.format(new Date(q.closed_at * 1000))}` : "")
       + `: ${[...(q.answer.chosen || []), q.answer.text].filter(Boolean).join(" · ") || "—"}`));
@@ -1667,6 +1703,7 @@ function renderSettings() {
     }
     $("#t-env").textContent = Object.keys(t.env || {}).length ? "An environment variable overrides: " + Object.keys(t.env).join(", ") : "";
   }
+  renderPurgeKeep();
   const cols = (S.snap?.servers || []).filter((s) => s.operator && s.col_conf);
   $("#col-settings").replaceChildren(...cols.map((s) => {
     const c = s.col_conf, id = "keep-" + s.name;
@@ -1698,6 +1735,43 @@ $("#t-apply").addEventListener("click", async (e) => {
   r.ok ? toast("Delays saved for this computer") : showOutput("Delays", r);
   poll(true);
 });
+// the purge's kept delay for open sessions: a number and its unit, shown in the largest unit that divides it
+const PURGE_KEEP_DEFAULT = 86400, PURGE_KEEP_MAX = 366 * 86400;
+const PK = { shown: null };  // the value last put in the fields (a refresh does not undo what is being typed)
+function renderPurgeKeep(force) {
+  const v = S.snap?.purge_keep_s ?? PURGE_KEEP_DEFAULT;
+  if (!force && (PK.shown === v || [$("#p-keep"), $("#p-unit")].includes(document.activeElement))) return;
+  const unit = [86400, 3600, 60].find((u) => v && v % u === 0) || 60;
+  $("#p-unit").value = String(unit);
+  $("#p-keep").value = String(+(v / unit).toFixed(2));
+  $("#p-keep-error").textContent = "";
+  PK.shown = v;
+}
+function purgeKeepLabel(sec) {
+  const [u, name] = [[86400, "day"], [3600, "hour"], [60, "minute"]].find(([u]) => sec && sec % u === 0) || [60, "minute"];
+  const n = +(sec / u).toFixed(2);
+  return `${n} ${name}${n === 1 ? "" : "s"}`;
+}
+async function savePurgeKeep(btn, seconds) {
+  const err = $("#p-keep-error");
+  if (!Number.isFinite(seconds) || seconds < 0) { err.textContent = "a number, 0 or more"; $("#p-keep").focus(); return; }
+  if (seconds > PURGE_KEEP_MAX) { err.textContent = "366 days at most"; $("#p-keep").focus(); return; }
+  err.textContent = "";
+  busy(btn, true);
+  const r = await action({ action: "purge_keep", seconds });
+  busy(btn, false);
+  if (!r.ok) { err.textContent = r.err || "failed"; return; }
+  S.snap.purge_keep_s = r.purge_keep_s;
+  renderPurgeKeep(true);
+  toast(`The purge keeps ${purgeKeepLabel(r.purge_keep_s)} for open sessions`);
+  loadUsage(true);
+}
+$("#p-apply").addEventListener("click", (e) => {
+  const raw = $("#p-keep").value.trim();
+  savePurgeKeep(e.currentTarget, raw === "" ? NaN : Math.round(+raw * +$("#p-unit").value));
+});
+$("#p-keep").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("#p-apply").click(); } });
+$("#p-reset").addEventListener("click", (e) => savePurgeKeep(e.currentTarget, PURGE_KEEP_DEFAULT));
 $("#t-reset").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   busy(btn, true);
@@ -1786,12 +1860,28 @@ function showNextQuestion(first = null) {
     h("input", { type: multi ? "checkbox" : "radio", name: "q-opt", value: String(k) }), h("span", {}, o))));
   $("#q-text").value = "";
   $("#q-error").textContent = "";
+  settledMode(false);
   validateAnswer();
   $("#q-skip").textContent = list.filter((x) => !Q.skipped.has(x.id)).length > 1 ? "Skip · next" : "Skip";
   if (!dlg.open) dlg.showModal();
   ($("#q-option-list input") || $("#q-text")).focus();
 }
+// the question on screen was settled in the session's chat: said so in its place, nothing left to send
+function settledMode(on, q) {
+  const n = $("#q-settled");
+  n.hidden = !on;
+  $("#q-options").disabled = on;
+  $("#q-text").disabled = on;
+  if (!on) return;
+  n.replaceChildren(h("strong", {}, "Answered in the IDE"), q.withdrawn_answer ? `: ${q.withdrawn_answer}` : ": the session withdrew this question (no answer given).");
+  $("#q-send").disabled = true;
+  $("#q-hint").hidden = true;
+  $("#q-skip").textContent = pendingQ().some((x) => !Q.skipped.has(x.id) && x.id !== q.id) ? "Next" : "Close";
+  $("#q-skip").focus();
+}
+function settledQ(id) { return (S.snap?.questions?.recent || []).find((x) => x.id === id && x.state === "withdrawn"); }
 function validateAnswer() {
+  if (!$("#q-settled").hidden) return false;
   const ok = $$("#q-option-list input:checked").length > 0 || $("#q-text").value.trim().length > 0;
   $("#q-send").disabled = !ok;
   $("#q-hint").hidden = ok;
@@ -1968,7 +2058,14 @@ async function poll(force = false, background = false) {
       const fresh = first ? [] : ids.filter((i) => !Q.known.has(i));
       Q.known = new Set([...(Q.known || []), ...ids]);
       updateQuestionSignals(fresh, first);
-      if (Q.current && !ids.includes(Q.current.id)) showNextQuestion();  // answered or withdrawn elsewhere
+      if (Q.current && !ids.includes(Q.current.id)) {  // answered or withdrawn elsewhere
+        const w = settledQ(Q.current.id);
+        if (w && $("#question").open) { if ($("#q-settled").hidden) settledMode(true, w); } else showNextQuestion();
+      }
+      const settled = (snap.questions?.recent || []).filter((x) => x.state === "withdrawn");
+      if (Q.settledSeen) for (const x of settled) if (!Q.settledSeen.has(x.id) && Q.current?.id !== x.id)
+        toast(`“${x.subject || x.id}” (${whoAsks(x)}): answered in the IDE` + (x.withdrawn_answer ? `: ${x.withdrawn_answer}` : ""));
+      Q.settledSeen = new Set(settled.map((x) => x.id));
       if (S.wantQuestion && ids.length) { S.wantQuestion = false; openQuestions(); }
       if (snap.startup && !S.startupShown) showStartup(snap.startup);
       if (RD.open && S.byId.has(RD.open) && !$("#detail").contains(document.activeElement)) {
@@ -2055,12 +2152,12 @@ function renderMemDialog() {
         ["Window data", fmtBytes(C.window)], ["Settings, keys", fmtBytes(C.other)]]),
       h("span", { class: "path" }, C.path)),
     h("div", { class: "mem-card" }, h("h4", {}, "mmbox boxes", h("span", {}, fmtBytes(B.total))),
-      memDl([["Boxes", `${B.profiles} (keys, logs, attached files)`]]),
+      memDl([["Boxes", `${B.profiles} (keys, logs, attached files)`], ["Logs", fmtBytes(B.logs || 0)]]),
       h("span", { class: "path" }, B.path)));
   $("#mem-purge-text").textContent = L.purgeable
-    ? `${L.purgeable} of the ${L.messages} messages the console keeps no longer wait in a box: they go for good, pinned conversations included, with the attached files it keeps for them. Those still waiting stay. The boxes' own logs on this computer are not touched, so the message list still shows what they hold.`
-    : `Every message the console keeps (${L.messages}) still waits in a box: nothing to purge.`;
-  $("#mem-purge").disabled = !L.purgeable;
+    ? `${L.purgeable} of the ${L.listed} message(s) of the list no longer wait in a box: they go from this computer for good, from the boxes' logs (${fmtBytes(B.logs || 0)}, ${B.closed_with_log || 0} closed box(es) with a log), their attached files and the console's copy, pinned conversations included. Kept: the ${L.waiting} still waiting` + (L.kept_open ? ` and the ${L.kept_open} an open session handled within ${purgeKeepLabel(L.keep_s)} (Settings)` : ` and what an open session handles within ${purgeKeepLabel(L.keep_s)} (Settings)`) + "."
+    : `Every message of the list (${L.listed}) still waits in a box or was handled by an open session within ${purgeKeepLabel(L.keep_s)}: nothing to purge.`;
+  $("#mem-purge").disabled = !L.purgeable && !B.closed_with_log;
   const r = redisSum(d), names = r.rows.map((s) => s.name).join(", ");
   $("#mem-empty-text").textContent = r.rows.length
     ? `${r.boxes} box(es) on ${names}, ${r.waiting} message(s) waiting in them. Every box of every computer is deleted with what waits in it, taken or not, for good (this console's own box and its questions stay). A session still running registers its box again by itself at its next contact; what is sent to it meanwhile waits in its sender's queue.`
@@ -2071,8 +2168,8 @@ $("#mem-frame").addEventListener("click", () => { renderMemDialog(); $("#mem-dia
 $("#mem-refresh").addEventListener("click", () => loadUsage(true));
 $("#mem-purge").addEventListener("click", () => {
   const L = MEM.data.local;
-  confirmRun("Purge the console's messages",
-    `${L.purgeable} message(s) no longer waiting in a box are deleted from the console's copy, pinned conversations included, and cannot come back. Those still waiting stay.`,
+  confirmRun("Purge the messages of this computer",
+    `${L.purgeable} message(s) no longer waiting in a box are deleted for good from the boxes' logs, their attached files and the console's copy, pinned conversations included. They cannot come back, and no session of this computer can show or answer them any more. Kept: what still waits, and what an open session handled within ${purgeKeepLabel(L.keep_s)}.`,
     { action: "purge_archive" }, { okLabel: "Purge", after: () => loadUsage(true) });
 });
 $("#mem-empty").addEventListener("click", () => {

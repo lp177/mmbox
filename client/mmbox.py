@@ -110,13 +110,18 @@ START_SYNC_S = 20.0  # `start` waits this long at most for the other open sessio
 CALL_TIMEOUT = [float(os.environ.get("MMBOX_CALL_TIMEOUT_S", "40"))]
 SILENT = ("pinged", "pong", "link", "transport", "retired", "introduced")  # bookkeeping done by the tool itself: never
 # wakes the agent (an introduced session is trusted by the tool on its own: the agent would only read "nothing to do")
-TOOL_KINDS = ("ping", "pong", "notice", "forward", "transport", "retire", "link")  # never relayed
+TOOL_KINDS = ("ping", "pong", "notice", "forward", "transport", "retire", "link", "introduce")  # never relayed
+# Boxes that never close: the machine box (every session of the computer) and the project boxes (every session of one
+# project: the folder it runs in). A project box is the profile PROJECT_PREFIX + its key, a child of the machine box.
+SHARED_ROLES = ("machine", "project")
+PROJECT_PREFIX = "project-"
 QUEUED: set = set()  # messages of this process the service did not accept yet (memories closed): retried later
 QUEUE_NOTES: list | None = None  # `start` collects the queued sends here and says them in one line
 ALERTED: list = []  # alert batches this process printed (a listener returns on them: the user must hear of them)
 QUIET_KINDS = ("ping", "pong", "notice", "transport", "retire", "link")  # nothing for the user to process
-EPHEMERAL_KINDS = ("ping", "pong", "notice")  # worth nothing once their session's box closed: the relay consumes them
-# there (logged in that box's own log); transport, retire and link stay, its session uses them if it comes back
+EPHEMERAL_KINDS = ("ping", "pong", "notice", "introduce")  # worth nothing once their session's box closed: the relay
+# consumes them there (logged in that box's own log; an introduction also reached the machine box, whose peers a box
+# opened again inherits); transport, retire and link stay, its session uses them if it comes back
 # Life of a session box: open while it is used (a live listener, or its agent process); closed after SESSION_IDLE_S
 # without either (what waits for it goes to the machine box, its remote peers are told); removed SESSION_KEEP_S after
 # closing (store, gateway, local keys). A session that comes back opens its box again (or gets a new one once removed).
@@ -241,9 +246,9 @@ def local_profiles() -> list[str]:
 
 def session_facts() -> dict:
     """What identifies the agent session running this command: its harness session id and process, when the harness
-    says (Claude Code: CLAUDE_CODE_SESSION_ID, CLAUDE_PID). MMBOX_SESSION_ID / MMBOX_SESSION_PID override them."""
+    says (Claude Code: CLAUDE_CODE_SESSION_ID, CLAUDE_PID; Codex: CODEX_THREAD_ID). MMBOX_SESSION_ID / MMBOX_SESSION_PID override them."""
     sid = next((os.environ[k] for k in ("MMBOX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",
-                                        "CODEX_SESSION_ID", "GEMINI_SESSION_ID", "OPENCODE_SESSION_ID") if os.environ.get(k)), None)
+                                        "CODEX_SESSION_ID", "CODEX_THREAD_ID", "GEMINI_SESSION_ID", "OPENCODE_SESSION_ID") if os.environ.get(k)), None)
     pid = next((os.environ[k] for k in ("MMBOX_SESSION_PID", "CLAUDE_PID") if os.environ.get(k, "").isdigit()), None)
     return {"session_id": sid, "session_pid": int(pid) if pid else None}
 
@@ -1361,22 +1366,22 @@ def set_activity(me: "Me", text: str) -> str:
 
 
 def work_project(cwd: str | None = None) -> tuple[str | None, str | None]:
-    """The project a session works on: MMBOX_WORK_PROJECT, else the git repository of its working folder (the main
-    repository's name for a worktree: myapp-wt-feature is myapp), else nothing. (name, folder)"""
-    if os.environ.get("MMBOX_WORK_PROJECT"):
-        return os.environ["MMBOX_WORK_PROJECT"].strip()[:80] or None, cwd or os.getcwd()
+    """The project a session works on: MMBOX_WORK_PROJECT, else the name of the folder it runs in (not its git
+    repository: a folder may hold none, or several, and git may be missing); nothing for the home folder or the root.
+    (name, folder)"""
     cwd = cwd or os.getcwd()
-    try:
-        out = subprocess.run(["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
-                             capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+    if os.environ.get("MMBOX_WORK_PROJECT"):
+        return os.environ["MMBOX_WORK_PROJECT"].strip()[:80] or None, cwd
+    p = Path(cwd).resolve()
+    if p == Path.home().resolve() or p == Path(p.anchor) or not p.name:
         return None, None
-    lines = out.stdout.split("\n") if out.returncode == 0 else []
-    if len(lines) < 2 or not lines[0]:
-        return None, None
-    top, common = Path(lines[0]), Path(lines[1])
-    name = common.parent.name if common.name == ".git" else top.name
-    return (name or top.name)[:80], str(top)
+    return p.name[:80], str(p)
+
+
+def project_key(name) -> str | None:
+    """The key of a project (its box's name): the folder's name in lower case, letters, digits, `.`, `_` and `-`."""
+    k = re.sub(r"[^a-z0-9._-]+", "-", str(name or "").strip().lower()).strip("-.")[:60]
+    return k or None
 
 
 # ---------------------------------------------------------------- the collector of a service (optional, per computer)
@@ -1471,6 +1476,16 @@ def sync_local_links(user: str | None = None) -> None:
 BOOKKEEPING_KINDS = ("transport", "link", "introduce", "retire", "ping", "pong")  # sent by the tool itself, redone when needed
 
 
+def retired_dest(peers: dict, peer: dict) -> str | None:
+    """Where to write what was meant for a peer session that closed its box: its project box when we know it (a peer
+    we may write to), else its machine box."""
+    for mid in (peer.get("retired_project"), peer.get("retired_machine")):
+        q = peers.get(mid or "")
+        if q and rights_of(peers, q) is not None and not q.get("revoked_at") and not q.get("retired_at"):
+            return mid
+    return None
+
+
 def flush_outbox(me: "Me") -> int:
     """Messages the service refused (the peer had not listed us yet, or was not on it), sent again now. Never an
     agent's to resend: the client does it, at each pass, until RECEIPT_TTL_S.
@@ -1503,11 +1518,11 @@ def flush_outbox(me: "Me") -> int:
             sent += 1
         elif peer and peer.get("retired_at") and own:
             drop(item, peer, f"{peer['alias']} closed its box on {peer['retired_at']}")
-        elif peer and peer.get("retired_at") and (mid := peer.get("retired_machine")) and (mach := peers.get(mid)) \
-                and rights_of(peers, mach) is not None and not mach.get("revoked_at"):
+        elif peer and peer.get("retired_at") and (mid := retired_dest(peers, peer)) and (mach := peers.get(mid)):
             new = send_payload(me, mid, mach, p.get("project") or me.project(None), p.get("subject", ""),
                                f"(written to {peer['alias']}, whose box closed on {peer['retired_at']} before it accepted "
-                               f"this one: sent to its machine box instead)\n\n{p.get('body', '')}", p.get("kind") or "info",
+                               f"this one: sent to its {'project' if mid == peer.get('retired_project') else 'machine'} box "
+                               f"instead)\n\n{p.get('body', '')}", p.get("kind") or "info",
                                p.get("re"), bool(p.get("reply_expected")),
                                extra={**{k: p[k] for k in ("attachments", "via_session") if k in p},
                                       "rerouted_from": {"id": peer["id"], "label": peer.get("label"), "msg_id": item["msg_id"]}})
@@ -1717,8 +1732,8 @@ def peers_load(local: Local, depth: int = 0) -> dict:
         inherited = peers_load(plocal, depth + 1)
         for pid, q in inherited.items():
             r = rights_of(inherited, q)
-            if pid in peers or pid == mine or r is None or q.get("revoked_at"):
-                continue
+            if pid in peers or pid == mine or r is None or q.get("revoked_at") or q.get("local_profile"):
+                continue  # the boxes of this computer: seen from this profile itself below (its project, not the parent's)
             peers[pid] = {**q, "rights": r, "rights_from": None, "inherited_from": parent}
     for pid, q in local_siblings(local).items():
         if pid not in peers:
@@ -1739,24 +1754,32 @@ def load_me(profile: str) -> Me | None:
 
 
 def local_siblings(local: Local) -> dict:
-    """The other profiles of this computer, same OS user, same memories user, same project: the machine box and the
-    other agent sessions. They trust each other without pairing: each can read the other's key files anyway. Their
-    rights come from local_rights_conf (`ask` by default); the tool's own kinds (ping, pong, forward,
-    notice) are handled whatever the rights."""
+    """The other profiles of this computer, same OS user, same memories user: the machine box and the other agent
+    sessions, of this project and of the others (`other_project`: their `--project` differs). They trust each other
+    without pairing: each can read the other's key files anyway. The rights of this project's sessions come from
+    local_rights_conf (`ask` by default); those of another project's, from other_project_rights (the box, its
+    project, the computer, the network, `ask`). The tool's own kinds (ping, pong, forward, notice) are handled
+    whatever the rights."""
     conf = local.load("config.json", {}) or {}
     mine = (local.load("identity.json") or {}).get("id")
     default_rights, by_id = local_rights_conf()
+    opc = other_project_conf()
     out = {}
     for name in local_profiles():
         if name == local.profile:
             continue
         o = load_me(name)
-        if not o or o.id == mine or o.user != conf.get("user") or o.conf.get("project") != conf.get("project") or o.closed_at:
+        if not o or o.id == mine or o.user != conf.get("user") or o.closed_at:
             continue
         fp = fingerprint(o.sign_pub, o.box_pub)
+        other = o.conf.get("project") != conf.get("project")
+        if other:
+            r, src = other_project_rights(o.id, o.conf.get("project"), gw_urls(o), conf=opc)
+        else:
+            r, src = by_id.get(o.id) or default_rights, ("own" if o.id in by_id else "local")
         out[o.id] = {"id": o.id, "user": o.user, "label": o.label, "agent": o.agent, "sign_pub": b64e(o.sign_pub),
-                     "box_pub": b64e(o.box_pub), "fingerprint": fp, "rights": by_id.get(o.id) or default_rights,
-                     **({"rights_own": True} if o.id in by_id else {}),
+                     "box_pub": b64e(o.box_pub), "fingerprint": fp, "rights": r, "rights_source": src,
+                     **({"rights_own": True} if src == "own" else {}), **({"other_project": True} if other else {}),
                      "alias": "machine" if o.role == "machine" else re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or o.id,
                      "project": o.conf.get("project"), "paired_at": (o.local.load("identity.json") or {}).get("created", ""),
                      "host": None, "last_host": None, "note": "", "last_in": None, "last_out": None,
@@ -1776,6 +1799,41 @@ def local_rights_conf() -> tuple[str, dict]:
     c = Local(MACHINE_PROFILE).load("config.json", {}) or {}
     by_id = {k: v for k, v in (c.get("local_rights_by_id") or {}).items() if v in RIGHTS}
     return (c.get("local_rights") if c.get("local_rights") in RIGHTS else "ask"), by_id
+
+
+OTHER_SOURCE_TEXT = {"own": "its own setting", "project": "its project's setting", "computer": "this computer's "
+                     "setting for other projects", "network": "its network's default for other projects",
+                     "default": "the default for other projects (ask)"}
+
+
+def other_project_conf() -> dict:
+    """This computer's rights for the sessions of OTHER projects (another `--project`) of this computer, kept by its
+    machine box: `projects` (the computer's choice), `project_rights` (one project's exception) and
+    `projects_by_service` (a network's default); a box's own exception is in `local_rights_by_id`."""
+    c = Local(MACHINE_PROFILE).load("config.json", {}) or {}
+    ok = lambda d: {k: v for k, v in (d or {}).items() if v in RIGHTS}
+    return {"computer": c.get("other_project_rights") if c.get("other_project_rights") in RIGHTS else None,
+            "projects": ok(c.get("project_rights")), "networks": ok(c.get("projects_by_service")),
+            "boxes": ok(c.get("local_rights_by_id"))}
+
+
+def other_project_rights(pid: str, project: str | None, urls: list, via: str | None = None,
+                         conf: dict | None = None) -> tuple[str, str]:
+    """(rights, where they come from) for a session of another project of this computer: the most precise setting
+    wins, its box (`own`), then its project (`project`), then the computer (`computer`), then the network it writes
+    through (`network:<url>`: `via` when known, else its services in order), then `ask` (`default`). MMBOX_LOCAL_RIGHTS
+    does not reach them: a neighbour project never gets `execute` by accident."""
+    c = conf or other_project_conf()
+    if pid in c["boxes"]:
+        return c["boxes"][pid], "own"
+    if project and project in c["projects"]:
+        return c["projects"][project], "project"
+    if c["computer"]:
+        return c["computer"], "computer"
+    for u in ([via] if via else list(urls or [])):
+        if u and (r := c["networks"].get(u.rstrip("/"))):
+            return r, "network:" + u.rstrip("/")
+    return "ask", "default"
 
 
 def service_rights(url: str | None) -> str | None:
@@ -1806,7 +1864,8 @@ def peer_find(local: Local, key: str) -> tuple[str, dict]:
     for mid, p in peers.items():
         if p.get("alias") == key or p.get("fingerprint", "").replace("-", "").lower() == key.replace("-", "").lower():
             return mid, p
-    die(f"no paired peer named {key!r} (see `mmbox.py peers`)")
+    die(f"no paired peer named {key!r} (see `mmbox.py peers`; the open boxes of this computer, of every project: "
+        f"`mmbox.py sessions`)")
 
 
 def peer_from_card(card: dict, host: dict | None, rights: str, alias: str | None, project: str) -> dict:
@@ -1902,7 +1961,8 @@ def apply_retire(q: dict, p: dict) -> None:
     """A peer's notice that it closed its box, unless it came back since (a retire left waiting in a box, read late)."""
     ts = p.get("ts") or iso()
     if ts > (q.get("reopened_at") or ""):
-        q.update(retired_at=ts, retired_machine=(p.get("machine") or {}).get("id"))
+        q.update(retired_at=ts, retired_machine=(p.get("machine") or {}).get("id"),
+                 retired_project=(p.get("project_box") or {}).get("id"))
 
 
 def apply_reopen(q: dict, ts: str | None) -> None:
@@ -2094,7 +2154,7 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
                via: str | None = None) -> dict | None:
         """One message taken by this identity: the item to hand over (logged first), or None when too slow."""
         item = {"id": msg_id, "peer": peer["alias"], "peer_id": mid,
-                "box": "machine" if me.role == "machine" else "session", "profile": me.local.profile}
+                "box": box_kind(me), "profile": me.local.profile}
         p = None
         try:
             if env.get("id") != msg_id:
@@ -2151,7 +2211,12 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
                 net = service_rights(via) if via and not peer.get("local_profile") and not peer.get("operator") else None
                 if net:  # the network's own setting wins for what comes through it (`rights @<service> …`)
                     item["service_rights"] = via
-                status = {"execute": "execute", "ask": "ask", "archive": "archived"}[net or rights_of(peers, peer) or "ask"]
+                r = rights_of(peers, peer)
+                if peer.get("other_project"):  # a session of another project of this computer
+                    item.update(other_project=peer.get("project"), rights_source=peer.get("rights_source"))
+                    if via and str(peer.get("rights_source") or "").startswith(("network:", "default")):
+                        r, item["rights_source"] = other_project_rights(mid, peer.get("project"), [], via=via)  # its network
+                status = {"execute": "execute", "ask": "ask", "archive": "archived"}[net or r or "ask"]
                 if kind == "introduce":  # a new session of a paired peer, presented through its channel
                     status, why = accept_introduction(me, peers, mid, peer, p)
                     if status == "rejected":
@@ -2167,7 +2232,7 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
         taker = {"taken_by": {"profile": announce.profile, "id": (announce.load("identity.json", {}) or {}).get("id"),
                               "label": (announce.load("config.json", {}) or {}).get("label"),
                               "session_id": (announce.load("config.json", {}) or {}).get("session_id")}} \
-            if me.role == "machine" and announce is not None and announce.profile != me.local.profile else {}
+            if me.role in SHARED_ROLES and announce is not None and announce.profile != me.local.profile else {}
         if taker:
             item["taken_by"] = taker["taken_by"]
         me.local.append_log({"dir": "in", "id": msg_id, "peer": mid, "status": item["status"], "at": iso(),
@@ -2247,8 +2312,12 @@ def fetch_new(me: Me, project: str, select: set[str] | None = None, action: str 
             age = (now_ms - e["stored_ms"]) / 1000
             if peer.get("local_profile"):  # a relayed message counts from when the original was stored
                 try:
-                    since = ((open_envelope(me, peer, env).get("forwarded") or {}).get("original_stored_at"))
+                    fw = open_envelope(me, peer, env).get("forwarded") or {}
+                    since = fw.get("original_stored_at")
                     age = max(age, (store.server_now() - parse_iso(since)).total_seconds()) if since else age
+                    if announce is not None and (fw.get("given_back_by") or {}).get("profile") == announce.profile \
+                            and not e.get("taken"):
+                        continue  # this session gave it back: left to the others of the project
                 except (ValueError, KeyError, TypeError):
                     pass
             if age > RECEIPT_TTL_S:
@@ -2360,10 +2429,10 @@ def announce_backlog(me: Me, listener: Local, stale: list[str]) -> list[dict]:
         got["new"] = [i for i in stale if i not in known]
         st.setdefault("announced", {})[key] = sorted(set(stale))  # forget what left the store
     # the machine box's backlog is the computer's: announced once, by the first session to see it, not by every one
-    (me.local if me.role == "machine" else listener).update("state.json", mark)
+    (me.local if me.role in SHARED_ROLES else listener).update("state.json", mark)
     if not got["new"]:
         return []
-    return [{"id": f"backlog-{me.id}", "status": "backlog", "box": "machine" if me.role == "machine" else "session",
+    return [{"id": f"backlog-{me.id}", "status": "backlog", "box": box_kind(me),
              "profile": me.local.profile, "count": len(stale), "new": len(got["new"]), "peer": "-"}]
 
 
@@ -2720,7 +2789,7 @@ def chan_hint(me: Me, h: dict, entry: str) -> None:
     m, box = machine_me(me.user), h.get("box")
     if not m or not box or box == m.id:
         return
-    if not any((y := load_me(n)) and y.id == box and y.role != "machine" and y.user == me.user for n in local_profiles()):
+    if not any((y := load_me(n)) and y.id == box and y.role not in SHARED_ROLES and y.user == me.user for n in local_profiles()):
         return
     key = str(h.get("entry") or entry)
     due = entry_key(key)[0] / 1000 + RELAY_MIN_AGE_S + 5 if entry_key(key)[0] else time.time() + RELAY_MIN_AGE_S + 5
@@ -2902,8 +2971,9 @@ def print_chan_item(it: dict) -> None:
 TAGS = {"introduced": "INTRODUCED: a new session of this peer, trusted with the same rights (nothing to do)",
         "answer": "ANSWER from the user, through the operator console: the user's decision on a question this box asked, "
                   "or on a message it asked them about",
-        "forwarded": "FORWARDED from another session of this computer: an answer to what you sent, or a message of a "
-                     "silent or closed session; decide what to do (see its header)",
+        "forwarded": "FORWARDED from another session of this computer: an answer to what you sent, a message of a "
+                     "silent or closed session, one meant for your project, or one another session gave back; decide "
+                     "what to do (see its header; one you cannot do: `giveback <id> --why`, never drop it)",
         "notice": "NOTICE from another session of this computer (information, nothing to execute)",
         "purged": "PURGED unread on the user's request",
         "relayed": "RELAYED to the machine box by another session (inbox --all --box machine)",
@@ -2953,9 +3023,14 @@ def print_items(items: list[dict], as_json: bool, show_archived: bool = False) -
             tag += f"; original sender's rights: {it.get('orig_rights', 'ask')}"
         if it.get("service_rights"):
             tag += f"; the setting of the network {server_name_of(it['service_rights'])} for everything coming through it"
+        if it.get("other_project"):
+            tag += (f"; a session of ANOTHER project ({it['other_project']}) of this computer, rights from "
+                    f"{OTHER_SOURCE_TEXT.get(str(it.get('rights_source')).split(':')[0], '?')}")
         if it.get("stale"):
             tag += f"; STALE ({it.get('age_s', 0) / 3600:.0f} h old), handed over because the user chose to process it"
-        box = " · machine box (reply with --via machine, or --re finds it)" if it.get("box") == "machine" else ""
+        box = (" · machine box (reply with --via machine, or --re finds it)" if it.get("box") == "machine" else
+               " · project box (every session of the project reads it, one takes it; reply from your own box)"
+               if it.get("box") == "project" else "")
         print(f"=== [{tag}] from {it['peer']} ({p.get('from_user')} · {p.get('label', '')} · {p.get('agent', '')}){box}")
         print(f"id {it['id']} · {p['ts']} · kind {p.get('kind')} · re {p.get('re') or '-'} · "
               f"reply expected: {'yes' if p.get('reply_expected') else 'no'}"
@@ -2980,6 +3055,14 @@ def print_items(items: list[dict], as_json: bool, show_archived: bool = False) -
             print(f"question: {an.get('question_id') or p.get('re')} · chosen: "
                   + (json.dumps(an.get("chosen") or [], ensure_ascii=False)) + f" · text: {json.dumps(an.get('text') or '', ensure_ascii=False)}"
                   + (" · asked by another box, which closed meanwhile: " + str(an.get("asked_by")) if an.get("rerouted") else ""))
+        if it["status"] == "answer" and it.get("profile"):
+            qid = (p.get("answer") or {}).get("question_id") if isinstance(p.get("answer"), dict) else None
+            w = (question_states(Local(it["profile"])).get(str(qid or p.get("re") or "")) or {}).get("withdrawn")
+            if w:  # the console's answer crossed the withdrawal: the chat settled it first
+                print(f"ALREADY SETTLED IN THE CHAT: this box withdrew question {qid or p.get('re')} at {w.get('at')}"
+                      + (f" with the chat's answer {json.dumps(w['answer'], ensure_ascii=False)}" if w.get("answer") else "")
+                      + ". Compare the two answers: the same, nothing to do; different, tell the user and ask which one "
+                        "holds before changing anything. Never apply this one silently.")
         lines = attachment_lines(p.get("attachments"))
         print(f"subject: {p.get('subject', '')}\n---\n{p.get('body', '')}\n" + "".join(f"{l}\n" for l in lines))
     if hidden:
@@ -2997,12 +3080,80 @@ def machine_me(user: str | None = None, active_only: bool = True) -> Me | None:
     return m
 
 
-def boxes_of(me: Me, which: str = "all") -> list[Me]:
-    """The boxes a session reads: its own, and the machine box when there is one."""
+def box_kind(b: "Me") -> str:
+    """`machine`, `project` or `session`: what a box is, as the items and the lists name it."""
+    return b.role if b.role in SHARED_ROLES else "session"
+
+
+def session_key(b: "Me") -> str | None:
+    """The project key of a box (its work project), None when it has none."""
+    return project_key(b.conf.get("work_project"))
+
+
+def project_me(user: str | None, key: str | None) -> "Me | None":
+    """The project box of this computer for project `key`, if one was made."""
+    if not key:
+        return None
+    p = load_me(PROJECT_PREFIX + key)
+    if not p or p.role != "project" or (user and p.user != user):
+        return None
+    return p
+
+
+def own_project_box(me: "Me") -> "Me | None":
+    """The project box a session reads: the one of its work project."""
+    return project_me(me.user, session_key(me)) if me.role == "session" else None
+
+
+def ensure_project_box(me: "Me", key: str | None, project: str, folder: str | None = None) -> "Me | None":
+    """The project box of `key`, made the first time (a child of the machine box: its peers and rights, introduced to
+    them; on the machine box's services; never closed). None without a machine box."""
+    if not key:
+        return None
+    if (p := project_me(me.user, key)) is not None:
+        return p
     m = machine_me(me.user)
-    out = [] if which == "machine" else [me]
-    if which != "session" and m and m.id != me.id:
+    if not m:
+        return None
+    lock = base_dir() / ".project-boxes.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "a+b") as fh:  # one maker at a time on this computer
+        if os.name != "nt":
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        if (p := project_me(me.user, key)) is not None:
+            return p
+        local = Local(PROJECT_PREFIX + key)
+        if local.load("identity.json"):
+            return None  # a profile of that name that is no project box: left alone
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            init_identity(local, project, "mmbox", f"{m.label}-project-{key}", parent=MACHINE_PROFILE, role="project",
+                          user=m.user, gateway=m.conf.get("gateway"))
+        local.update("config.json", lambda c: c.update(work_project=key, **({"work_dir": folder} if folder else {}),
+                                                       activity=f"The box of project {key} on this computer: what is "
+                                                                f"meant for the project waits here for one of its sessions."))
+        p = load_me(local.profile)
+        for u in gw_urls(m)[1:]:
+            if u not in gw_urls(p):
+                join_gateway(p, u, project, announce=False)
+        p = load_me(local.profile)
+    sync_local_links(me.user)
+    print(f"PROJECT BOX: {p.label} ({p.id}, profile {p.local.profile}) made for project {key}: what is meant for the "
+          f"project on this computer waits there, read by every session of the project; never closed", file=sys.stderr)
+    return p
+
+
+def boxes_of(me: Me, which: str = "all") -> list[Me]:
+    """The boxes a session reads: its own, the machine box when there is one, and its project's box."""
+    m = machine_me(me.user)
+    p = own_project_box(me)
+    out = [] if which in ("machine", "project") else [me]
+    if which in ("all", "machine") and m and m.id != me.id:
         out.append(m)
+    if which in ("all", "project") and p and p.id != me.id:
+        out.append(p)
     return out or [me]
 
 
@@ -3257,9 +3408,9 @@ def relay(me: Me, project: str, ack_wait: float = ACK_WAIT_S, min_age: float | N
         if name in (me.local.profile, machine.local.profile):
             continue
         y = load_me(name)
-        if not y or y.user != me.user or y.conf.get("project") != project:
+        if not y or y.user != me.user or y.conf.get("project") != project or y.role in SHARED_ROLES:
             continue
-        if y.closed_at:  # a closed box: what still reaches it goes to the machine box at once, without a ping
+        if y.closed_at:  # a closed box: what still reaches it goes to its project box at once, without a ping
             stale: list = []
             ypeers, waiting = untaken(y, store, project, 0, ephemeral=None if dry_run else stale)
             if waiting:
@@ -3280,11 +3431,12 @@ def relay(me: Me, project: str, ack_wait: float = ACK_WAIT_S, min_age: float | N
     moved = 0
     for y, ypeers, waiting in closed:
         why = f"its box was closed on {y.closed_at} ({y.conf.get('closed_reason') or 'unused'})"
-        done = forward_to_machine(me, machine, mpeers.get(machine.id), y, ypeers, waiting, f"whose box is closed: {why}",
-                                  why, store, project, say)
+        dest, dpeer, dname = forward_dest(me, machine, mpeers, y, project)
+        done = forward_to_machine(me, dest, dpeer, y, ypeers, waiting, f"whose box is closed: {why}",
+                                  why, store, project, say, dname)
         if done:
             moved += len(done)
-            say(f"RELAY: {len(done)} message(s) for the closed {describe_session(y)} forwarded to the machine box")
+            say(f"RELAY: {len(done)} message(s) for the closed {describe_session(y)} forwarded to {dname}")
     if not targets:
         return moved
     pinged = {}
@@ -3320,15 +3472,16 @@ def relay(me: Me, project: str, ack_wait: float = ACK_WAIT_S, min_age: float | N
         why = (f"it did not acknowledge a wake-up ping within {ack_wait:g} s "
                f"(listener: {'running, pid ' + ', '.join(map(str, live['listening'])) if live['listening'] else 'not running'}; "
                f"agent process: {'alive (busy?)' if live['session_alive'] else 'gone' if live['session_alive'] is False else 'unknown'})")
-        done = forward_to_machine(me, machine, mpeers.get(machine.id), y, ypeers, waiting,
-                                  f"which does not seem to answer: {why}", why, store, project, say)
+        dest, dpeer, dname = forward_dest(me, machine, mpeers, y, project)
+        done = forward_to_machine(me, dest, dpeer, y, ypeers, waiting,
+                                  f"which does not seem to answer: {why}", why, store, project, say, dname)
         if done:
             moved += len(done)
-            send_payload(me, y.id, mpeers[y.id], project, f"{len(done)} message(s) forwarded to the machine box",
-                         f"You did not answer {me.label}'s ping within {ack_wait:g} s, so these messages went to the machine "
-                         f"box (`inbox --all --box machine` shows them, and whoever took them):\n"
+            send_payload(me, y.id, mpeers[y.id], project, f"{len(done)} message(s) forwarded to {dname}",
+                         f"You did not answer {me.label}'s ping within {ack_wait:g} s, so these messages went to {dname} "
+                         f"(`inbox --all --box {box_kind(dest)}` shows them, and whoever took them):\n"
                          + "\n".join(f"- {i} from {a}: {sub} (now {f})" for i, a, sub, f in done), "notice", None, False)
-            say(f"RELAY: {len(done)} message(s) of {describe_session(y)} forwarded to the machine box ({why})")
+            say(f"RELAY: {len(done)} message(s) of {describe_session(y)} forwarded to {dname} ({why})")
     return moved
 
 
@@ -3369,10 +3522,21 @@ def drop_ephemeral(y: Me, store: Store, project: str, stale: list[dict]) -> int:
     return n
 
 
+def forward_dest(me: Me, machine: Me, mpeers: dict, y: Me, project: str) -> tuple:
+    """Where the messages session `y` no longer takes go: the box of its project (made if needed), else the machine
+    box. (box, its peer record here, its name for the texts)"""
+    p = ensure_project_box(me, session_key(y), project) if session_key(y) else None
+    if p and p.id != y.id and p.id in mpeers:
+        return p, mpeers[p.id], f"the box of project {session_key(y)}"
+    return machine, mpeers.get(machine.id), "the machine box"
+
+
 def forward_to_machine(me: Me, machine: Me, machine_peer: dict | None, y: Me, ypeers: dict, waiting: list[dict],
-                       header_why: str, why: str, store: Store, project: str, say) -> list[tuple]:
-    """Take the messages of session `y` in its name and forward each to the machine box (kind `forward`), with a header
-    naming that session and why; returns [(message id, sender alias, subject, forward id)]."""
+                       header_why: str, why: str, store: Store, project: str, say,
+                       dest_name: str = "the machine box") -> list[tuple]:
+    """Take the messages of session `y` in its name and forward each to `machine` (the machine box, or the box of
+    `y`'s project; kind `forward`), with a header naming that session and why; returns [(message id, sender alias,
+    subject, forward id)]."""
     if not machine_peer:  # the relaying identity is the machine box itself: another session forwards them
         return []
     live = session_state(y.local)
@@ -3402,7 +3566,7 @@ def forward_to_machine(me: Me, machine: Me, machine_peer: dict | None, y: Me, yp
         fwd = {"from_session": {"id": y.id, "label": y.label, "profile": y.local.profile, "agent": y.agent,
                                 "session_id": y.session_id, "closed_at": y.closed_at, **live},
                "relayed_by": {"id": me.id, "label": me.label, "profile": me.local.profile, "session_id": me.session_id},
-               "reason": why, "original": {k: v for k, v in p.items() if k != "attachments"},
+               "reason": why, "project": session_key(y), "original": {k: v for k, v in p.items() if k != "attachments"},
                "original_sender": {"id": pid, "alias": peer["alias"], "user": peer["user"], "label": peer["label"],
                                    "rights": rights},
                "original_stored_at": stored}
@@ -3411,7 +3575,7 @@ def forward_to_machine(me: Me, machine: Me, machine_peer: dict | None, y: Me, yp
                            header + str(p.get("body", "")), "forward", None, bool(p.get("reply_expected")),
                            extra={"forwarded": fwd, **({"attachments": atts} if atts else {})})
         y.local.append_log({"dir": "in", "id": msg_id, "peer": pid, "status": "relayed", "at": iso(), "payload": p,
-                            "reason": f"forwarded to the machine box as {fid} by {me.label}"})
+                            "reason": f"forwarded to {dest_name} as {fid} by {me.label}"})
         y.local.update("state.json", lambda st, i=msg_id: st.setdefault("seen", {}).__setitem__(i, "relayed"))
         finish_for(y, store, w, handle)
         done.append((msg_id, peer["alias"], p.get("subject", ""), fid))
@@ -3465,7 +3629,9 @@ def close_session(y: Me, project: str, why: str, say) -> Me:
         send_payload(y, pid, peer, peer.get("project") or project, "session closed",
                      f"{y.label} closed its box ({why}). Write to its machine box" + (f" {m.label}" if m else "")
                      + " instead; if the session comes back, it introduces itself again.", "retire", None, False,
-                     extra={"machine": {"id": m.id, "label": m.label} if m else None})
+                     extra={"machine": {"id": m.id, "label": m.label} if m else None,
+                            **({"project_box": {"id": pb.id, "label": pb.label, "project": session_key(y)}}
+                               if (pb := project_me(y.user, session_key(y))) and pb.id != y.id else {})})
         told.append(peer["alias"])
     say(f"CLOSED: {describe_session(y)}: {why}; remote peers told: {', '.join(told) or 'none'}"
         + (f" ({skipped} with an older client not told)" if skipped else ""))
@@ -3507,7 +3673,7 @@ def lifecycle(me: Me, project: str, say) -> None:
         if name in (me.local.profile, machine.local.profile):
             continue
         y = load_me(name)
-        if not y or y.user != me.user or y.conf.get("project") != project or y.role == "machine":
+        if not y or y.user != me.user or y.conf.get("project") != project or y.role in SHARED_ROLES:
             continue
         if not y.closed_at:
             idle = session_idle(y)
@@ -3519,8 +3685,9 @@ def lifecycle(me: Me, project: str, say) -> None:
             mpeers = mpeers or peers_load(me.local)
             ypeers, waiting = untaken(y, store, project, 0)
             if waiting:
-                forward_to_machine(me, machine, mpeers.get(machine.id), y, ypeers, waiting,
-                                   "whose box is being removed", f"its box closed on {y.closed_at} is removed", store, project, say)
+                dest, dpeer, dname = forward_dest(me, machine, mpeers, y, project)
+                forward_to_machine(me, dest, dpeer, y, ypeers, waiting, "whose box is being removed",
+                                   f"its box closed on {y.closed_at} is removed", store, project, say, dname)
             remove_session(y, project, say)
 
 
@@ -3651,7 +3818,7 @@ def waiting_list(me: Me, project: str, which: str = "all") -> list[dict]:
                 since = ((p or {}).get("forwarded") or {}).get("original_stored_at") if peer.get("local_profile") else None
                 if since:
                     age = max(age, (store.server_now() - parse_iso(since)).total_seconds())
-                out.append({"id": msg_id, "box": "machine" if box.role == "machine" else "session", "profile": box.local.profile,
+                out.append({"id": msg_id, "box": box_kind(box), "profile": box.local.profile,
                             "peer": peer["alias"], "peer_id": mid, "user": peer["user"], "label": peer["label"],
                             "stored_at": iso(store.server_now() - dt.timedelta(seconds=age)), "age_s": round(age),
                             "stale": age > EXPIRE_S, "state": "being taken" if rs else "waiting",
@@ -3676,7 +3843,7 @@ def waiting_list(me: Me, project: str, which: str = "all") -> list[dict]:
                     age = max(age, (store.server_now() - parse_iso(since)).total_seconds())
                 if age > RECEIPT_TTL_S:
                     continue
-                out.append({"id": str((e.get("env") or {}).get("id") or e["entry"]), "box": "machine" if box.role == "machine" else "session",
+                out.append({"id": str((e.get("env") or {}).get("id") or e["entry"]), "box": box_kind(box),
                             "profile": box.local.profile, "peer": peer["alias"], "peer_id": e["from"], "user": peer["user"],
                             "label": peer["label"], "stored_at": iso(store.server_now() - dt.timedelta(seconds=age)),
                             "age_s": round(age), "stale": age > EXPIRE_S,
@@ -3943,6 +4110,10 @@ def cmd_start(a, local: Local):
     if wp and (me.conf.get("work_project"), me.conf.get("work_dir")) != (wp, wd):  # declared to the services below
         local.update("config.json", lambda c: c.update(work_project=wp, work_dir=wd))
         me = load_me(local.profile)
+    had = project_me(me.user, session_key(me))
+    if (pb := ensure_project_box(me, session_key(me), project, wd)) is not None and had is not None:
+        print(f"PROJECT BOX: {pb.label} ({pb.id}): what is meant for project {session_key(me)} on this computer waits "
+              f"there, read by this session's listener as by every session of the project; never closed")
     print(f"SESSION BOX: {me.label} ({me.id}, profile {local.profile}, {me.agent} session {me.session_id or 'unknown'}, "
           f"project {me.conf.get('work_project') or 'unknown (--work-project)'}, "
           f"title {me.conf.get('title') or 'none (--title)'}, "
@@ -4041,6 +4212,8 @@ def cmd_start(a, local: Local):
         print(warn)
     if note := missing_skill_links():
         print(note)
+    if oq := open_questions_text(local, "wait"):
+        print(oq)
     print(f"NEXT: listen now with `{listen_command(local.profile)}`, as its own background command (Claude Code: "
           f"run_in_background): it returns only when something arrives for this session (a message of the session box "
           f"or the machine box, a channel post), stops by itself when this agent session ends, and runs the relay round "
@@ -4479,8 +4652,8 @@ def cmd_sessions(a, local: Local):
         y = load_me(a.close)
         if not y:
             die(f"no profile {a.close} on this computer")
-        if y.role == "machine":
-            die("the machine box is never closed")
+        if y.role in SHARED_ROLES:
+            die(f"the {y.role} box is never closed")
         if y.closed_at:
             die(f"{a.close} is already closed (since {y.closed_at})")
         y = close_session(y, project, a.reason or "closed on the user's request", print)
@@ -4489,12 +4662,14 @@ def cmd_sessions(a, local: Local):
         if machine and closer:
             store = Store(closer.local)
             ypeers, waiting = untaken(y, store, project, 0)
-            done = forward_to_machine(closer, machine, peers_load(closer.local).get(machine.id), y, ypeers, waiting,
+            dest, dpeer, dname = forward_dest(closer, machine, peers_load(closer.local), y, project)
+            done = forward_to_machine(closer, dest, dpeer, y, ypeers, waiting,
                                       "whose box was closed on the user's request", "closed on the user's request",
-                                      store, project, print)
-            print(f"{len(done)} message(s) forwarded to the machine box" if done else
-                  "nothing waiting for it" if not waiting else "what waits for it goes to the machine box at the next relay round")
+                                      store, project, print, dname)
+            print(f"{len(done)} message(s) forwarded to {dname}" if done else
+                  "nothing waiting for it" if not waiting else f"what waits for it goes to {dname} at the next relay round")
         return
+    mypeers = peers_load(me.local)
     for name in local_profiles():
         y = load_me(name)
         if not y:
@@ -4502,6 +4677,9 @@ def cmd_sessions(a, local: Local):
         s = session_state(y.local)
         if y.role == "machine":
             state = "machine box (never closed)"
+        elif y.role == "project":
+            state = (f"box of project {y.conf.get('work_project')} (never closed), read by its sessions"
+                     + (" · listened to now (pid " + ", ".join(map(str, s["listening"])) + ")" if s["listening"] else ""))
         elif y.closed_at:
             left = SESSION_KEEP_S - (time.time() - parse_iso(y.closed_at).timestamp())
             state = f"CLOSED since {y.closed_at} ({y.conf.get('closed_reason') or '-'}); removed in {max(0, left) / 3600:.0f} h"
@@ -4513,10 +4691,14 @@ def cmd_sessions(a, local: Local):
             idle = session_idle(y) or 0
             state = (f"open, unused for {idle / 60:.0f} min: closed after {SESSION_IDLE_S / 60:g} min "
                      f"(at the next relay round of an active session)")
+        other = y.conf.get("project") != me.conf.get("project")
         print(f"- {name}: {y.label} ({y.id}, {y.agent} session {y.session_id or '-'}"
               + (f", project {y.conf['work_project']}" if y.conf.get("work_project") else "") + ")"
+              + (f" · OTHER PROJECT {y.conf.get('project')} (reach it: `send {mypeers[y.id]['alias']}`, rights "
+                 f"{mypeers[y.id].get('rights')}: {OTHER_SOURCE_TEXT.get(str(mypeers[y.id].get('rights_source')).split(':')[0], '?')})"
+                 if other and y.id in mypeers else f" · other project {y.conf.get('project')}" if other else "")
               + (f" · gateway {y.conf['gateway']}" if y.conf.get("gateway") else "") + f"\n  {state}"
-              + (f" · Claude Code hook last ran {h}" if y.role != "machine" and not y.closed_at
+              + (f" · Claude Code hook last ran {h}" if y.role not in SHARED_ROLES and not y.closed_at
                  and (h := hook_seen_at(y.session_id)) else ""))
 
 
@@ -4643,13 +4825,114 @@ def cmd_tune(a, local: Local):
 QUESTION_MAX_OPTIONS = 12
 
 
+QUESTION_OPEN_MAX_S = float(os.environ.get("MMBOX_QUESTION_OPEN_MAX_S", str(7 * 86400)))  # older: no more reminders
+
+
+def question_states(local: Local) -> dict:
+    """What this box's own log says of each question it put to the operator's console, by question id: `asked`
+    (payload kept: subject, ts, re), `withdrawn` (with the answer given in the chat, if any) and `answered` (an ANSWER
+    received). Local file only, no network: the harness hooks call it on every prompt."""
+    out: dict[str, dict] = {}
+    p = local.path("log.jsonl")
+    try:
+        raw = p.read_bytes() if p.is_file() else b""
+    except OSError:
+        return out
+    for line in raw.splitlines():
+        if b'"question"' not in line and b'"answer"' not in line:
+            continue  # most lines: skipped without parsing
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        pl = e.get("payload") or {}
+        kind = pl.get("kind")
+        if e.get("dir") == "out" and kind == "question":
+            if pl.get("withdraw"):
+                q = out.setdefault(str(pl["withdraw"]), {"id": str(pl["withdraw"])})
+                q["withdrawn"] = {"at": pl.get("ts") or e.get("at"), "answer": pl.get("withdraw_answer")}
+            elif pl.get("id"):
+                q = out.setdefault(pl["id"], {"id": pl["id"]})
+                q.update(subject=pl.get("subject") or "", ts=pl.get("ts") or e.get("at"), re=pl.get("re"),
+                         server=e.get("gateway"), asked=True)
+        elif e.get("dir") == "in" and kind == "answer":
+            an = pl.get("answer") if isinstance(pl.get("answer"), dict) else {}
+            for qid in {an.get("question_id"), pl.get("re")} - {None, ""}:
+                q = out.setdefault(str(qid), {"id": str(qid)})
+                q["answered"] = {"at": pl.get("ts") or e.get("at"), "id": e.get("id"), "chosen": an.get("chosen"),
+                                 "text": an.get("text"), "decision": an.get("decision")}
+    return out
+
+
+def open_questions(local: Local, max_age_s: float | None = None) -> list[dict]:
+    """The questions this box put to the operator's console that still wait there by its own log: neither withdrawn
+    nor answered, asked less than QUESTION_OPEN_MAX_S ago. Oldest first."""
+    cut = time.time() - (QUESTION_OPEN_MAX_S if max_age_s is None else max_age_s)
+    rows = []
+    for q in question_states(local).values():
+        if not q.get("asked") or q.get("withdrawn") or q.get("answered"):
+            continue
+        try:
+            if parse_iso(q["ts"]).timestamp() < cut:
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        rows.append(q)
+    return sorted(rows, key=lambda q: q["ts"])
+
+
+def client_command(profile: str, rest: str) -> str:
+    """A command of this client for `profile`, as the agent invoked it (the hooks run the installed client)."""
+    import shlex
+    exe = "python3" if os.name != "nt" else "py -3"
+    return f"{exe} {shlex.quote(os.path.abspath(sys.argv[0]))} --profile {shlex.quote(profile)} {rest}"
+
+
+def open_questions_text(local: Local, context: str = "prompt") -> str | None:
+    """The reminder of the questions still open in the operator's console, for the agent: when the user writes in the
+    chat (`prompt`), after the agent asked the user in its own interface (`asked`), or when a listener returns
+    (`wait`). The agent judges whether the user's answer settles one: nothing is withdrawn blindly."""
+    qs = open_questions(local)
+    if not qs:
+        return None
+
+    def ago(q):
+        try:
+            return f"{max(0, time.time() - parse_iso(q['ts']).timestamp()) / 60:.0f} min ago"
+        except (KeyError, TypeError, ValueError):
+            return "?"
+    lines = "\n".join(f"- {q['id']} « {q.get('subject') or '?'} » (asked {ago(q)})" for q in qs[-8:])
+    cmd = client_command(local.profile, 'question --withdraw <id> --answer "<the user\'s answer, in one or two sentences>"')
+    if context == "wait":
+        return (f"OPEN QUESTIONS: this box's question(s) still waiting in the operator's console:\n{lines}\nIf the user "
+                f"already answered one in the chat, withdraw it with that answer: `{cmd}`.")
+    lead = ("you just asked the user here" if context == "asked" else "the user wrote in this chat")
+    return (f"mmbox: {lead}, and this session still has question(s) waiting in the operator's console:\n{lines}\n"
+            f"If what the user said here answers one of them, withdraw it now with that answer, so the console stops "
+            f"asking and keeps the decision: `{cmd}`. If it does not answer it, leave it open.")
+
+
 def cmd_question(a, local: Local):
     """Put a question to the user in the operator's console: what is asked and why, the solutions this session
     proposes (the user ticks one or several, or writes another), and the message it is about. The answer comes back to
-    this box as an ANSWER (`wait` wakes on it). `--withdraw <id>`: the user answered elsewhere (in the chat)."""
+    this box as an ANSWER (`wait` wakes on it). `--withdraw <id> --answer <text>`: the user answered elsewhere (in the
+    chat): the console shows that answer instead of asking. `--open`: the questions of this box still waiting there."""
     me = Me(local)
     if me.role == "machine":
         die("the machine box asks nothing: run it with this session's profile")
+    if a.open:
+        qs = open_questions(local)
+        if a.json:
+            print(json.dumps(qs, ensure_ascii=False, indent=1))
+        elif not qs:
+            print("no question of this box waits in the operator's console")
+        else:
+            for q in qs:
+                print(f"OPEN {q['id']} · {q.get('ts')} · {q.get('subject') or '?'}")
+            print(f"answered in the chat: `{client_command(local.profile, 'question --withdraw <id> --answer <text>')}`")
+        return
+    if a.answer is not None and not a.withdraw:
+        die("--answer goes with --withdraw <id>: the answer the user gave in the chat")
     urls = gw_urls(me)
     if a.server:
         found = server_find(a.server)
@@ -4660,8 +4943,16 @@ def cmd_question(a, local: Local):
         die("no operator console to ask on the services of this box (its operator pins nothing here, or the service "
             "is older): ask the user in the chat. To pin it: `mmbox.py collector enable <service> --level off "
             "--fingerprint <the console's fingerprint>` (any level pins it)", 2)
+    answer_text = (a.answer or "").strip()[:4000] or None
     if a.withdraw:
-        subject, body, options, about = "withdrawn", f"Question {a.withdraw} withdrawn: answered elsewhere.", [], None
+        st = question_states(local).get(a.withdraw) or {}
+        if not st.get("asked"):
+            print(f"note: {a.withdraw} is not in this box's log as one of its questions (another box's, or older): "
+                  f"the console withdraws only a question of the box that asked it", file=sys.stderr)
+        subject = "answered in the chat" if answer_text else "withdrawn"
+        body = (f"Question {a.withdraw} answered in the session's chat: {answer_text}" if answer_text else
+                f"Question {a.withdraw} withdrawn: answered elsewhere.")
+        options, about = [], None
     else:
         if not (a.text or "").strip():
             die("--text: what is asked, and what the user should know to choose (two to six sentences)")
@@ -4686,6 +4977,7 @@ def cmd_question(a, local: Local):
         payload = {"v": VERSION, "id": msg_id, "from": me.id, "from_user": me.user, "label": me.label, "agent": me.agent,
                    "to": op["id"], "ts": iso(), "kind": "question", "subject": subject, "body": body, "re": a.re,
                    "options": options, "multiple": not a.single, "about": about, "withdraw": a.withdraw,
+                   **({"withdraw_answer": answer_text} if a.withdraw and answer_text else {}),
                    "project": me.project(None), "host": host_facts(me.local),
                    **({"work": me.conf["work_project"]} if me.conf.get("work_project") else {}),
                    **{k: me.conf[k] for k in ("title", "activity") if me.conf.get(k)}}
@@ -4696,11 +4988,14 @@ def cmd_question(a, local: Local):
             if a.json:
                 print(json.dumps({"id": msg_id, "server": u, "operator": op["id"]}))
             elif a.withdraw:
-                print(f"WITHDRAWN {a.withdraw} from the operator console ({op['label']})")
+                print(f"WITHDRAWN {a.withdraw} from the operator console ({op['label']})"
+                      + (f": it shows « answered in the chat: {answer_text} »" if answer_text else
+                         " (no --answer: the console only shows it withdrawn)"))
             else:
                 print(f"QUESTION {msg_id} put to the operator console ({op['label']}, {c.get('fingerprint')}) through {u}. "
                       f"The user's answer comes to this box as an ANSWER (question {msg_id}): your listener wakes on it. "
-                      f"If the user answers in the chat first: `mmbox.py question --withdraw {msg_id}`")
+                      f"If the user answers in the chat first: `mmbox.py question --withdraw {msg_id} --answer \"<their "
+                      f"answer>\"` (the harness hook reminds you of it when the user writes)")
             return
         last = f"{u}: {r.get('_error')} {r.get('error', '')}"
     die(f"the question could not be put: {last}")
@@ -4717,11 +5012,23 @@ def cmd_rights(a, local: Local):
     if not a.target:
         peers = peers_load(m.local)
         rows = [{"target": "local", "rights": default_rights, "source": "env" if os.environ.get("MMBOX_LOCAL_RIGHTS") else "machine box"}]
+        opc = other_project_conf()
+        rows.append({"target": "projects", "rights": opc["computer"] or "-", "source": "the sessions of other projects "
+                     "on this computer" + ("" if opc["computer"] else ": not set (each network's default, else ask)")})
+        for p, r in sorted(opc["projects"].items()):
+            rows.append({"target": f"project:{p}", "rights": r, "source": f"the sessions of project {p} on this computer"})
+        for u, r in sorted(opc["networks"].items()):
+            rows.append({"target": f"projects@{server_name_of(u)}", "url": u, "rights": r,
+                         "source": "default for the sessions of other projects writing through this network"})
         for pid, q in sorted(peers.items(), key=lambda kv: kv[1].get("alias", "")):
-            src = ("own" if q.get("rights_own") else "this computer's sessions") if q.get("local_profile") else \
-                f"follows {peers.get(q['rights_from'], {}).get('alias', q['rights_from'])}" if q.get("rights_from") else "own"
+            src = (OTHER_SOURCE_TEXT.get(str(q.get("rights_source")).split(":")[0], "?") + f" (project {q.get('project')})"
+                   if q.get("other_project") else
+                   ("own" if q.get("rights_own") else "this computer's sessions") if q.get("local_profile") else
+                   f"follows {peers.get(q['rights_from'], {}).get('alias', q['rights_from'])}" if q.get("rights_from") else "own")
             rows.append({"target": q.get("alias"), "id": pid, "rights": rights_of(peers, q), "source": src,
-                         "local": bool(q.get("local_profile"))})
+                         "local": bool(q.get("local_profile")), **({"other_project": q.get("project"),
+                                                                     "rights_source": q.get("rights_source")}
+                                                                    if q.get("other_project") else {})})
         for u, r in ((m.local.load("config.json", {}) or {}).get("service_rights") or {}).items():
             rows.insert(0, {"target": "@" + server_name_of(u), "url": u, "rights": r, "source": "network: wins over the machines and boxes"})
         if a.json:
@@ -4729,6 +5036,39 @@ def cmd_rights(a, local: Local):
             return
         for r in rows:
             print(f"{r['target']}{' (' + r['id'] + ')' if r.get('id') else ''}: {r['rights']} · {r['source']}")
+        return
+    if a.target == "projects" or a.target.startswith(("project:", "projects@")):  # the sessions of other projects
+        if a.target.startswith("projects@"):
+            found = server_find(a.target[9:])
+            key = (found[1]["url"] if found else a.target[9:]).rstrip("/")
+            if not re.match(r"https?://", key):
+                die(f"{a.target[9:]}: no such service (server list)")
+            table, what = "projects_by_service", f"the sessions of other projects writing through {server_name_of(key)}"
+        elif a.target.startswith("project:"):
+            key = a.target[8:].strip()
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", key):
+                die("project:<name>: the project's name (its `--project`)")
+            table, what = "project_rights", f"the sessions of project {key} on this computer"
+        else:
+            key, table, what = None, "other_project_rights", "the sessions of other projects on this computer"
+        if a.rights is None:
+            c = m.local.load("config.json", {}) or {}
+            cur = c.get(table) if key is None else (c.get(table) or {}).get(key)
+            print(f"{what}: {cur if cur in RIGHTS else 'not set'}")
+            return
+
+        def chp(c):
+            if key is None:
+                c.pop(table, None) if a.rights == "follow" else c.__setitem__(table, a.rights)
+            else:
+                d = c.setdefault(table, {})
+                d.pop(key, None) if a.rights == "follow" else d.__setitem__(key, a.rights)
+        m.local.update("config.json", chp)
+        print(f"{what}: " + (a.rights if a.rights != "follow" else
+                             {"project_rights": "follows the computer's setting for other projects",
+                              "projects_by_service": "no default on this network any more",
+                              "other_project_rights": "not set: each network's default, else ask"}[table])
+              + " (a box with its own setting keeps it)")
         return
     if a.target.startswith("@"):  # a whole network: what comes through that service from other computers
         found = server_find(a.target[1:])
@@ -4749,7 +5089,8 @@ def cmd_rights(a, local: Local):
         return
     if a.rights is None:
         die("give the rights: execute, ask, archive (or follow)")
-    if os.environ.get("MMBOX_LOCAL_RIGHTS") and (a.target == "local" or a.target in by_id or peer_find(m.local, a.target)[1].get("local_profile")):
+    if os.environ.get("MMBOX_LOCAL_RIGHTS") and (a.target == "local" or a.target in by_id or (
+            (q0 := peer_find(m.local, a.target)[1]).get("local_profile") and not q0.get("other_project"))):
         die("MMBOX_LOCAL_RIGHTS is set in this environment: it decides for every session of this computer")
     if a.target == "local":
         if a.rights == "follow":
@@ -4763,7 +5104,11 @@ def cmd_rights(a, local: Local):
             d = c.setdefault("local_rights_by_id", {})
             d.pop(pid, None) if a.rights == "follow" else d.__setitem__(pid, a.rights)
         m.local.update("config.json", ch)
-        print(f"{q['alias']}: " + (f"follows this computer's sessions ({default_rights})" if a.rights == "follow" else a.rights))
+        if q.get("other_project") and a.rights == "follow":
+            r, src = other_project_rights(pid, q.get("project"), q.get("gateways") or [])
+            print(f"{q['alias']}: follows {OTHER_SOURCE_TEXT.get(src.split(':')[0], src)} ({r})")
+        else:
+            print(f"{q['alias']}: " + (f"follows this computer's sessions ({default_rights})" if a.rights == "follow" else a.rights))
         return
     owner = Local(q["inherited_from"]) if q.get("inherited_from") else m.local
     if pid not in own_peers(owner):
@@ -5563,6 +5908,65 @@ def reroute_replies(me: Me, project: str, items: list[dict]) -> list[dict]:
     return out
 
 
+def message_project(p: dict) -> str | None:
+    """The project a message is meant for: its `for` (`send --for`), else its sender's work project; None for the
+    computer itself (`--for machine`, or a sender with no project)."""
+    f = str(p.get("for") or "").strip()
+    if f.lower() == "machine":
+        return None
+    return project_key(f or p.get("work"))
+
+
+def reroute_projects(me: Me, project: str, items: list[dict]) -> list[dict]:
+    """Messages of the machine box meant for a project other than this session's (message_project): put in that
+    project's box (made if needed, kind `forward`, the original sender's rights), where a session of the project
+    takes them; never handed to this session. Writing to a session of another project is never blocked: only what
+    nobody addressed to this session is left to the project it belongs to. The items left to show here."""
+    if me.role != "session":
+        return items
+    mine, out, mpeers = session_key(me), [], None
+    sent_by = ((machine_me(me.user) or me).local.load("state.json", {}) or {}).get("sent_by") or {}
+    for it in items:
+        p = it.get("payload") or {}
+        target = message_project(p) if it.get("box") == "machine" and it["status"] in ("execute", "ask", "archived") else None
+        if target and str(p.get("re") or "") in sent_by:
+            target = None  # an answer to what a session of this computer sent: never sorted by its sender's project
+        if not target or target == mine:
+            out.append(it)
+            continue
+        pb = ensure_project_box(me, target, project)
+        mpeers = mpeers if mpeers is not None and (not pb or pb.id in mpeers) else peers_load(me.local)  # a box made now
+        if not pb or pb.id not in mpeers:
+            out.append(it)  # no box for it (no machine box, or not a peer of this session yet): this session decides
+            continue
+        peer = mpeers.get(it.get("peer_id")) or {}
+        rights = it["status"].replace("archived", "archive")
+        fwd = {"from_session": {"id": me.id, "label": me.label, "profile": me.local.profile, "session_id": me.session_id},
+               "relayed_by": {"id": me.id, "label": me.label, "profile": me.local.profile, "session_id": me.session_id},
+               "reason": f"a message for project {target}, received by the machine box", "project": target,
+               "original": {k: v for k, v in p.items() if k != "attachments"},
+               "original_sender": {"id": it.get("peer_id"), "alias": it.get("peer"), "user": peer.get("user"),
+                                   "label": peer.get("label"), "rights": rights},
+               "original_stored_at": iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=it.get("age_s") or 0))}
+        header = (f"[mmbox] A message for project {target} reached this computer's machine box; {me.label} (project "
+                  f"{mine or 'none'}) put it in the box of project {target}, where a session of that project takes it.\n"
+                  f"Original message {it['id']} from {it.get('peer')}, sent {p.get('ts')}, kind {p.get('kind')}, "
+                  f"re {p.get('re') or '-'}, rights of its sender: {rights}. Answer it with --re {it['id']}.\n----\n")
+        atts = [dict(x) for x in p.get("attachments") or [] if isinstance(x, dict)]
+        try:
+            fid = send_payload(me, pb.id, mpeers[pb.id], project, f"[for project {target}] {p.get('subject', '')}",
+                               header + str(p.get("body", "")), "forward", None, bool(p.get("reply_expected")),
+                               extra={"forwarded": fwd, **({"attachments": atts} if atts else {})})
+        except SystemExit:
+            out.append(it)
+            continue
+        me.local.append_log({"dir": "in", "id": it["id"], "peer": it.get("peer_id"), "status": "rerouted", "at": iso(),
+                             "box": "machine", "reason": f"meant for project {target}: put in its box {pb.label} as {fid}"})
+        print(f"REROUTED: {it['id']} from {it.get('peer')} is meant for project {target}: put in its box ({fid})",
+              file=sys.stderr, flush=True)
+    return out
+
+
 def peer_update(me: Me, pid: str, fields: dict) -> None:
     """Fields of a peer's record, where the record is kept (this profile, or the one it inherits the peer from)."""
     if pid in own_peers(me.local):
@@ -5878,7 +6282,7 @@ def cmd_send(a, local: Local):
         set_activity(me, a.activity)
     if warn := borrowed_box(me):
         print(warn, file=sys.stderr)
-    extra = None
+    extra = {"for": a.for_box.strip()[:80]} if getattr(a, "for_box", None) else None
     via = a.via
     if not via and a.re and me.role != "machine":  # an answer to a machine-box message goes out from the machine box
         m = machine_me(me.user)
@@ -5890,7 +6294,8 @@ def cmd_send(a, local: Local):
         if not m:
             die("no machine box on this computer (run `mmbox.py start --session <name>`)")
         if m.id != me.id:
-            extra = {"via_session": {"id": me.id, "label": me.label, "profile": local.profile, "session_id": me.session_id}}
+            extra = {**(extra or {}),
+                     "via_session": {"id": me.id, "label": me.label, "profile": local.profile, "session_id": me.session_id}}
             me, local = m, m.local
     pid, peer = peer_find(local, a.peer)
     if a.kind == "notice" and not peer.get("local_profile"):
@@ -5899,8 +6304,9 @@ def cmd_send(a, local: Local):
         die(f"{peer['alias']} is revoked: pair again to talk to it")
     if peer.get("retired_at"):
         mach = peers_load(local).get(peer.get("retired_machine") or "", {}).get("alias")
-        die(f"{peer['alias']} closed its box on {peer['retired_at']}: write to its machine box"
-            + (f" `{mach}`" if mach else "") + " (if the session comes back, it introduces itself again)")
+        dest = peers_load(local).get(retired_dest(peers_load(local), peer) or "", {}).get("alias")
+        die(f"{peer['alias']} closed its box on {peer['retired_at']}: write to "
+            + (f"`{dest}`" if dest else "its machine box") + " (if the session comes back, it introduces itself again)")
     project = me.project(a.project or peer.get("project"))
     if memories_off(local) and not via_gateway(me, peer):
         die(f"{peer['alias']} is not on the mmbox service yet (it has not announced it): it cannot be written to")
@@ -5928,6 +6334,66 @@ def cmd_send(a, local: Local):
           + (f" with {len(extra['attachments'])} attachment(s)" if (extra or {}).get("attachments") else ""))
 
 
+def cmd_giveback(a, local: Local):
+    """`giveback <id> --why "…"`: a message this session took and cannot do (another project's task, a skill it lacks)
+    put back where a session that can do it takes it: the box of the project it is meant for (`--to <project>`, or the
+    message's own project, else this session's), or the machine box (`--to machine`); a `forward` with the reason,
+    the original sender's rights kept. This session's listener does not take it again. Never drop such a message."""
+    me = Me(local)
+    if me.role != "session":
+        die("giveback is for a session box: the message is given back by the session that took it")
+    project = me.project(a.project)
+    found = None
+    for b in boxes_of(me):
+        for e in b.local.log():
+            if e.get("dir") == "in" and e.get("id") == a.id and e.get("payload") \
+                    and (b.id == me.id or (e.get("taken_by") or {}).get("profile") in (None, local.profile)):
+                found = (b, e)
+    if not found:
+        die(f"{a.id}: no message of that id taken by this session (its box, its project's box or the machine box)")
+    b, e = found
+    if e.get("status") not in ("execute", "ask", "archived", "forwarded"):
+        die(f"{a.id} is a `{e.get('status')}` item, not a message to give back")
+    p = e["payload"]
+    fw = p.get("forwarded") or {} if p.get("kind") == "forward" else {}
+    orig = fw.get("original") or p
+    bpeers = peers_load(b.local)
+    q = bpeers.get(e.get("peer") or "") or {}
+    osender = fw.get("original_sender") or {"id": e.get("peer"), "alias": q.get("alias"), "user": q.get("user"),
+                                            "label": q.get("label"), "rights": str(e["status"]).replace("archived", "archive")}
+    to = (a.to or "").strip()
+    machine = machine_me(me.user)
+    if to.lower() == "machine":
+        dest = machine
+    else:
+        key = project_key(to) or message_project(orig) or session_key(me)
+        dest = ensure_project_box(me, key, project) if key else machine
+    mpeers = peers_load(me.local)
+    if not dest or dest.id not in mpeers:
+        die("nowhere to give it back: " + ("no machine box on this computer" if not dest else
+                                            f"{dest.label} is not a peer of this session yet (its next pass lists it)"))
+    oid = str(orig.get("id") or a.id)
+    fwd = {"from_session": {"id": me.id, "label": me.label, "profile": local.profile, "session_id": me.session_id},
+           "relayed_by": {"id": me.id, "label": me.label, "profile": local.profile, "session_id": me.session_id},
+           "given_back_by": {"id": me.id, "label": me.label, "profile": local.profile, "session_id": me.session_id,
+                             "project": session_key(me), "why": a.why, "at": iso()},
+           "reason": f"given back by {me.label}: {a.why}", "project": session_key(dest) if dest.role == "project" else None,
+           "original": {k: v for k, v in orig.items() if k != "attachments"}, "original_sender": osender,
+           "original_stored_at": fw.get("original_stored_at") or e.get("at")}
+    header = (f"[mmbox] Given back by {describe_session(me)} (project {session_key(me) or 'none'}), which took it and "
+              f"cannot do it: {a.why}\n"
+              f"Original message {oid} from {osender.get('alias')} ({osender.get('user')}, {osender.get('label')}), sent "
+              f"{orig.get('ts')}, kind {orig.get('kind')}, re {orig.get('re') or '-'}, rights of its sender: "
+              f"{osender.get('rights')}. Answer it with --re {oid}.\n----\n")
+    atts = [dict(x) for x in p.get("attachments") or [] if isinstance(x, dict)]
+    fid = send_payload(me, dest.id, mpeers[dest.id], project, f"[given back] {orig.get('subject', '')}",
+                       header + str(orig.get("body", "")), "forward", None, bool(orig.get("reply_expected")),
+                       extra={"forwarded": fwd, **({"attachments": atts} if atts else {})})
+    b.local.append_log({"dir": "in", "id": a.id, "peer": e.get("peer"), "status": "givenback", "at": iso(),
+                        "box": box_kind(b), "reason": f"given back by {me.label} to {dest.label} as {fid}: {a.why}"})
+    print(f"GIVEN BACK: {a.id} put in {dest.label} as {fid}; this session's listener leaves it to the others")
+
+
 def cmd_inbox(a, local: Local):
     me = Me(local)
     if a.all:  # consumed messages are no longer in the store: the local log keeps them
@@ -5940,7 +6406,7 @@ def cmd_inbox(a, local: Local):
                     continue
                 i = {"id": e["id"], "peer": peers.get(e["peer"], {}).get("alias", e["peer"]), "peer_id": e["peer"],
                      "status": e["status"], "payload": e.get("payload"), "reason": e.get("reason"), "at": e.get("at", ""),
-                     "box": "machine" if box.role == "machine" else "session",
+                     "box": box_kind(box),
                      "relation": relation(host_facts(local), (e.get("payload") or {}).get("host"))}
                 if i["id"] in handled:
                     i["handled"] = handled[i["id"]]
@@ -5954,6 +6420,7 @@ def cmd_inbox(a, local: Local):
         items += fetch_new(box, project, announce=local)
     if a.box == "all":  # and the channels' posts this session has not seen yet
         items += fetch_chan(me, project)
+    items = reroute_projects(me, project, reroute_replies(me, project, items))  # as the listener does
     print_items(items, a.json)
 
 
@@ -6085,8 +6552,12 @@ def cmd_peers(a, local: Local):
     for mid, p in peers.items():
         h = p.get("last_host") or p.get("host") or {}
         p = {**p, "rights": rights_of(peers, p) or "revoked (its channel is gone)"}
-        rows.append({"via": (f"{'machine box' if p.get('role') == 'machine' else 'session'} of this computer, profile "
-                             f"{p['local_profile']}" + (f", agent session {p['session_id']}" if p.get("session_id") else "")
+        rows.append({"via": (f"{ {'machine': 'machine box', 'project': 'project box'}.get(p.get('role'), 'session')} of this computer"
+                             + (f" in ANOTHER project ({p.get('project')}; rights: "
+                                f"{OTHER_SOURCE_TEXT.get(str(p.get('rights_source')).split(':')[0], '?')})"
+                                if p.get("other_project") else "")
+                             + f", profile {p['local_profile']}" + (f", agent session {p['session_id']}" if p.get("session_id") else "")
+                             + f"; reach it with `send {p['alias']}`"
                              if p.get("local_profile") else
                              f"inherited from profile {p['inherited_from']}" if p.get("inherited_from") else
                              f"introduced by {peers.get(p['introduced_by'], {}).get('alias', p['introduced_by'])}, rights follow it" if p.get("introduced_by") else ""),
@@ -6095,7 +6566,8 @@ def cmd_peers(a, local: Local):
                      "hostname": h.get("hostname"), "local_ips": h.get("local_ips"), "public_ip": h.get("public_ip"),
                      "paired_at": p["paired_at"], "last_in": p.get("last_in"), "last_out": p.get("last_out"),
                      "note": p.get("note", ""), "revoked_by_peer": p.get("revoked_by_peer", False), "project": p.get("project"),
-                     "revoked_at": p.get("revoked_at"), "retired_at": p.get("retired_at")})
+                     "revoked_at": p.get("revoked_at"), "retired_at": p.get("retired_at"),
+                     **({"other_project": True, "rights_source": p.get("rights_source")} if p.get("other_project") else {})})
     if a.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
         return
@@ -6395,7 +6867,7 @@ def wait_loop(me: Me, project: str, timeout: float, on_items, forever: bool = Fa
         if warn_shared(me.local, others) and not forever:
             return 0  # told once: the agent tells the user, and starts its listener again
     for b in boxes:
-        if b.role == "machine":  # shared by design: every session listens to it, no warning
+        if b.role in SHARED_ROLES:  # shared by design: every session (of the project) listens to it, no warning
             listeners(b.local, register=True)
     store = Store(me.local)
     if timeout <= 0 and not forever and not agent:
@@ -6425,6 +6897,9 @@ def wait_loop(me: Me, project: str, timeout: float, on_items, forever: bool = Fa
         seen_alerts, shown = len(ALERTED), False
         if me.role != "machine":
             announce_pending(me, project)
+        if machine and (pb := own_project_box(me)) is not None and pb.id not in {b.id for b in boxes}:
+            boxes.append(pb)  # its project's box, made since this listener started: read from now on
+            listeners(pb.local, register=True)
         for b in boxes:
             for inv in list(((b.local.load("state.json", {}) or {}).get("pairs") or {}).keys()):
                 with b.local.locked():  # pairings in progress complete in the background, one process at a time
@@ -6453,6 +6928,7 @@ def wait_loop(me: Me, project: str, timeout: float, on_items, forever: bool = Fa
         if any(chan_gw(b) for b in boxes_of(me)):
             items += fetch_chan(me, project)
         items = reroute_replies(me, project, items)
+        items = reroute_projects(me, project, items)
         if not forever:
             held.extend(i for i in items if i.get("no_wake"))
             items = [i for i in items if not i.get("no_wake")]
@@ -6605,7 +7081,7 @@ def wait_loop(me: Me, project: str, timeout: float, on_items, forever: bool = Fa
     finally:
         stop.set()
         for b in boxes:  # from now on, what reaches this session's box is hinted to the other sessions at once
-            for g in gateways_of(b) if b.role != "machine" else []:
+            for g in gateways_of(b) if b.role not in SHARED_ROLES else []:
                 if "watch" in g.features():
                     g.watch(b, "$", "$", 0, leave=True)
 
@@ -6665,6 +7141,8 @@ def cmd_wait(a, local: Local):
         if handed:  # until the next `wait` of this session starts: the hook and `start` remind an agent that never came back
             local.update("state.json", lambda st: st.__setitem__("handover", {
                 "at": time.time(), "ids": handed[-50:], "agent": (agent_process() or {}).get("pid")}))
+        if not a.json and (oq := open_questions_text(local, "wait")):
+            print(oq)
         if not a.json:
             print(f"NEXT: start this listener again now, as its own background command (Claude Code: run_in_background), "
                   f"before handling anything above: {listen_command(local.profile)}", flush=True)
@@ -6742,20 +7220,8 @@ def selftest() -> None:
         pass
 
 
-def hook_claude() -> int:
-    """`mmbox.py hook claude`: a Claude Code hook (SessionStart, UserPromptSubmit, Stop), reading the event on stdin.
-    Local files only (no network, no lock held long), always exit 0. When the session owns a box that no listener
-    serves, it tells the agent (SessionStart, UserPromptSubmit: added context; Stop: once per stop, the turn goes on)
-    to start its listener, and what a dead listener handed over that may never have been read. A session without a
-    box, in a project whose instructions use the mailbox, is told at its start to open one."""
-    try:
-        ev = json.loads(sys.stdin.read() or "{}")
-    except ValueError:
-        return 0
-    event, sid = ev.get("hook_event_name") or "", ev.get("session_id") or ""
-    if not sid or event not in ("SessionStart", "UserPromptSubmit", "Stop"):
-        return 0
-    hook_seen(sid, event)
+def hook_box(sid: str) -> "tuple[str, dict] | None":
+    """The session box (profile name, config) whose harness session id is `sid`: local files only."""
     mine = None
     for n in local_profiles():
         try:
@@ -6764,36 +7230,73 @@ def hook_claude() -> int:
             continue
         if c.get("session_id") == sid and c.get("role") != "machine":
             mine = (n, c)
-    text = None
+    return mine
+
+
+def listener_text(name: str, conf: dict, event: str) -> str | None:
+    """What the hook tells a session whose box no listener serves (None: it listens, or the user turned it off)."""
+    local = Local(name)
+    if (local.load("state.json", {}) or {}).get("hook_off") or session_state(local)["listening"]:
+        return None
+    if conf.get("closed_at"):
+        if event == "Stop":
+            return None  # an old session resumed: told when the user writes, never holding its turn
+        return (f"mmbox: this session's box `{name}` was closed ({conf.get('closed_reason') or 'unused'}). If this "
+                f"session still uses the mailbox, run `mmbox.py start --session {name} …` again, then listen.")
+    text = (f"mmbox: no listener serves this session's box `{name}` (a usage limit, a reload of the editor or a "
+            f"compaction can end it without anyone noticing). Start it now, as its own background command "
+            f"(run_in_background), then go on: {listen_command(name)}")
+    if left := unhandled_handover(local):
+        text += "\n" + left
+    return text
+
+
+def project_uses_mailbox(cwd: str | None) -> bool:
+    d = Path(cwd or os.getcwd())
+    docs = [d / "CLAUDE.md", d / "AGENTS.md", d / "GEMINI.md", d / ".claude" / "CLAUDE.md"]
+    return any(f.is_file() and "memories-mailbox-start" in f.read_text(encoding="utf-8", errors="ignore") for f in docs)
+
+
+NO_BOX_TEXT = ("mmbox: this project uses the encrypted agent mailbox and this session has no box yet: run the "
+               "memories-mailbox-start skill first (a profile of its own, never another session's nor `default`), "
+               "then keep its listener running in the background.")
+
+
+def hook_claude(harness: str = "claude") -> int:
+    """`mmbox.py hook claude` (Claude Code) and `mmbox.py hook codex` (Codex, same hook protocol): SessionStart,
+    UserPromptSubmit, Stop (Claude Code only) and PostToolUse on AskUserQuestion (Claude Code only), the event on
+    stdin. Local files only (no network, no lock held long), always exit 0. When the session owns a box that no
+    listener serves, it tells the agent (SessionStart, UserPromptSubmit: added context; Stop: once per stop, the turn
+    goes on) to start its listener, and what a dead listener handed over that may never have been read. When the user
+    writes (UserPromptSubmit) or the agent has just asked the user in its own interface (AskUserQuestion), it lists the
+    box's questions still open in the operator's console: if the user's answer settles one, the agent withdraws it with
+    that answer (the agent judges; nothing is withdrawn blindly). A session without a box, in a project whose
+    instructions use the mailbox, is told at its start to open one."""
+    try:
+        ev = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return 0
+    event, sid = ev.get("hook_event_name") or "", ev.get("session_id") or ""
+    if not sid or event not in HOOK_EVENTS_OF[harness]:
+        return 0
+    hook_seen(sid, event if harness == "claude" else f"{harness}:{event}")
+    mine = hook_box(sid)
+    parts: list[str] = []
     if mine:
         name, conf = mine
-        local = Local(name)
-        st = local.load("state.json", {}) or {}
-        if st.get("hook_off"):
-            return 0
-        if session_state(local)["listening"]:
-            return 0
-        cmd = listen_command(name)
-        if conf.get("closed_at"):
-            if event == "Stop":
-                return 0  # an old session resumed: told when the user writes, never holding its turn
-            text = (f"mmbox: this session's box `{name}` was closed ({conf.get('closed_reason') or 'unused'}). If this "
-                    f"session still uses the mailbox, run `mmbox.py start --session {name} …` again, then listen.")
+        if event == "PostToolUse":
+            if ev.get("tool_name") == "AskUserQuestion" and (q := open_questions_text(Local(name), "asked")):
+                parts.append(q)
         else:
-            text = (f"mmbox: no listener serves this session's box `{name}` (a usage limit, a reload of the editor or a "
-                    f"compaction can end it without anyone noticing). Start it now, as its own background command "
-                    f"(run_in_background), then go on: {cmd}")
-            if left := unhandled_handover(local):
-                text += "\n" + left
-    elif event == "SessionStart" and ev.get("source") in ("startup", None):
-        cwd = Path(ev.get("cwd") or os.getcwd())
-        docs = [cwd / "CLAUDE.md", cwd / "AGENTS.md", cwd / ".claude" / "CLAUDE.md"]
-        if any(f.is_file() and "memories-mailbox-start" in f.read_text(encoding="utf-8", errors="ignore") for f in docs):
-            text = ("mmbox: this project uses the encrypted agent mailbox and this session has no box yet: run the "
-                    "memories-mailbox-start skill first (a profile of its own, never another session's nor `default`), "
-                    "then keep its listener running in the background.")
-    if not text:
+            if t := listener_text(name, conf, event):
+                parts.append(t)
+            if event == "UserPromptSubmit" and (q := open_questions_text(Local(name), "prompt")):
+                parts.append(q)
+    elif event == "SessionStart" and ev.get("source") in ("startup", None) and project_uses_mailbox(ev.get("cwd")):
+        parts.append(NO_BOX_TEXT)
+    if not parts:
         return 0
+    text = "\n\n".join(parts)
     if event == "Stop":
         if ev.get("stop_hook_active"):
             return 0  # told once for this stop: never a loop
@@ -6803,7 +7306,38 @@ def hook_claude() -> int:
     return 0
 
 
-HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
+def hook_gemini() -> int:
+    """`mmbox.py hook gemini`: Gemini CLI hook (BeforeAgent, in ~/.gemini/settings.json): when the user writes, the
+    listener reminder and the box's questions still open in the operator's console, appended to the prompt. Gemini
+    gives its commands no session id: the box is the one bound to this session, else the only open Gemini box without
+    one (bound then). Stdout carries the JSON only; always exit 0."""
+    try:
+        ev = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return 0
+    event, sid = ev.get("hook_event_name") or "", ev.get("session_id") or ""
+    if not sid or event != "BeforeAgent":
+        return 0
+    first = hook_seen_at(sid) is None
+    hook_seen(sid, f"gemini:{event}")
+    y = agent_box(sid, ev.get("cwd") or os.getcwd(), GEMINI_AGENTS)
+    parts: list[str] = []
+    if y:
+        if t := listener_text(y.local.profile, y.conf, "UserPromptSubmit"):
+            parts.append(t)
+        if q := open_questions_text(y.local, "prompt"):
+            parts.append(q)
+    elif first and project_uses_mailbox(ev.get("cwd")):
+        parts.append(NO_BOX_TEXT)
+    if parts:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "BeforeAgent", "additionalContext": "\n\n".join(parts)}}))
+    return 0
+
+
+HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "PostToolUse")
+HOOK_EVENTS_OF = {"claude": HOOK_EVENTS, "codex": ("SessionStart", "UserPromptSubmit")}
+HOOK_MATCHER = {"PostToolUse": "AskUserQuestion"}  # Claude Code: only after the agent asked the user in the IDE
+GEMINI_AGENTS = ("gemini", "gemini-cli", "antigravity")
 HOOK_SEEN_MAX = 300
 
 
@@ -6839,12 +7373,17 @@ VIBE_CALL_S = 8.0
 
 
 def vibe_box(sid: str, cwd: str) -> "Me | None":
-    """The open box of this Vibe session: the one whose session id is it; else the only open Vibe box without one
-    (preferring the one started in `cwd`), which is then bound to it. Vibe gives its commands no session id."""
+    return agent_box(sid, cwd, VIBE_AGENTS)
+
+
+def agent_box(sid: str, cwd: str, agents: tuple) -> "Me | None":
+    """The open box of this harness session (Vibe, Gemini): the one whose session id is it; else the only open box of
+    that harness without one (preferring the one started in `cwd`), which is then bound to it. These harnesses give
+    their commands no session id."""
     boxes = []
     for n in local_profiles():
         y = load_me(n)
-        if y and y.role != "machine" and not y.closed_at and str(y.agent).lower() in VIBE_AGENTS:
+        if y and y.role != "machine" and not y.closed_at and str(y.agent).lower() in agents:
             if y.session_id == sid:
                 return y
             if not y.session_id:
@@ -6856,7 +7395,7 @@ def vibe_box(sid: str, cwd: str) -> "Me | None":
         return None
     y = boxes[0]
     y.local.update("config.json", lambda c: c.__setitem__("session_id", sid))
-    print(f"mmbox: Vibe session {sid} bound to box {y.local.profile}", file=sys.stderr)
+    print(f"mmbox: {y.agent} session {sid} bound to box {y.local.profile}", file=sys.stderr)
     return load_me(y.local.profile)
 
 
@@ -6914,25 +7453,60 @@ def hook_vibe() -> int:
     anc = vibe_pid(sid) or harness_ancestor()
     if anc and st.get("session_pid") != anc:  # the Vibe process: the relay round sees this session alive
         y.local.update("state.json", lambda s: s.__setitem__("session_pid", anc))
-    if event == "post_tool" and time.time() - float(st.get("vibe_checked_at") or 0) < VIBE_TOOL_EVERY_S:
+    parts = [q] if (q := vibe_questions(y, event, st)) else []
+    new: list[str] = []
+    if event == "post_agent" or time.time() - float(st.get("vibe_checked_at") or 0) >= VIBE_TOOL_EVERY_S:
+        y.local.update("state.json", lambda s: s.__setitem__("vibe_checked_at", time.time()))
+        ids = waiting_for(y)
+        told = set((y.local.load("state.json", {}) or {}).get("vibe_told") or [])
+        new = [i for i in ids if i not in told]
+    if new:
+        y.local.update("state.json", lambda s: s.__setitem__("vibe_told", sorted(set(s.get("vibe_told") or []) | set(new))[-200:]))
+        cmd = client_command(y.local.profile, "inbox")
+        parts.insert(0, f"mmbox: {len(new)} message(s) arrived in this session's box `{y.local.profile}`. Read them now "
+                        f"with `{cmd}` and handle them as the memories-mailbox-inbox skill says (execute, ask the user, "
+                        f"archive), then go on with what you were doing.")
+    if not parts:
         return 0
-    y.local.update("state.json", lambda s: s.__setitem__("vibe_checked_at", time.time()))
-    ids = waiting_for(y)
-    told = set((y.local.load("state.json", {}) or {}).get("vibe_told") or [])
-    new = [i for i in ids if i not in told]
-    if not new:
-        return 0
-    y.local.update("state.json", lambda s: s.__setitem__("vibe_told", sorted(set(s.get("vibe_told") or []) | set(new))[-200:]))
-    import shlex
-    cmd = f"python3 {shlex.quote(os.path.abspath(sys.argv[0]))} --profile {shlex.quote(y.local.profile)} inbox"
-    text = (f"mmbox: {len(new)} message(s) arrived in this session's box `{y.local.profile}`. Read them now with "
-            f"`{cmd}` and handle them as the memories-mailbox-inbox skill says (execute, ask the user, archive), then "
-            f"go on with what you were doing.")
+    text = "\n\n".join(parts)
     if event == "post_agent":
-        print(json.dumps({"decision": "deny", "reason": text, "system_message": f"mmbox: {len(new)} new message(s)"}))
+        print(json.dumps({"decision": "deny", "reason": text, "system_message":
+                          f"mmbox: {len(new)} new message(s)" if new else "mmbox: a question still open in the console"}))
     else:
         print(json.dumps({"hook_specific_output": {"additional_context": text}}))
     return 0
+
+
+VIBE_QUESTION_TURN_S = 900  # a turn without a tool call: the open questions recalled at its end, once per this delay
+
+
+def vibe_questions(y: "Me", event: str, st: dict) -> str | None:
+    """Vibe has no hook when the user writes: the box's questions still open in the operator's console are recalled
+    at the first tool call of each turn (`post_tool`) or, for a turn without a tool call, at its end (`post_agent`,
+    the turn going on once; a question at most once per VIBE_QUESTION_TURN_S that way, never a loop)."""
+    told = bool(st.get("vibe_q_told"))
+    if event == "post_tool":
+        if told:
+            return None
+        text = open_questions_text(y.local, "prompt")
+        if text:
+            y.local.update("state.json", lambda s: s.__setitem__("vibe_q_told", True))
+        return text
+    if told:  # the turn that ends was told (a tool call, or the turn this hook made go on): the next one is new
+        y.local.update("state.json", lambda s: s.pop("vibe_q_told", None))
+        return None
+    qs = open_questions(y.local)
+    last = st.get("vibe_q_at") or {}
+    due = [q["id"] for q in qs if time.time() - float(last.get(q["id"]) or 0) >= VIBE_QUESTION_TURN_S]
+    if not due:
+        return None
+
+    def mark(s):
+        s["vibe_q_told"] = True
+        s["vibe_q_at"] = {**{k: v for k, v in (s.get("vibe_q_at") or {}).items() if k in {q["id"] for q in qs}},
+                          **{i: time.time() for i in due}}
+    y.local.update("state.json", mark)
+    return open_questions_text(y.local, "prompt")
 
 
 VIBE_BLOCK_START = "# >>> mmbox hook (managed by `mmbox.py hook install vibe`)"
@@ -6966,54 +7540,130 @@ def hook_install_vibe(install: bool) -> int:
     return 0
 
 
-def hook_install_claude(install: bool) -> int:
-    """`mmbox.py hook install|uninstall claude`: the mmbox hook in Claude Code's user settings (~/.claude/settings.json,
-    or $CLAUDE_CONFIG_DIR), for the three events, running the installed client (mmbox-install's folder) when there is
-    one. Only its own entries are added or removed; the other hooks and settings are kept as they are."""
-    import shlex
+def installed_client() -> Path:
     data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     installed = Path(os.environ.get("MMBOX_CLIENT_DIR") or data_home / "mmbox" / "src") / "client" / "mmbox.py"
-    client = installed if installed.is_file() else Path(_CLIENT_FILE)
+    return installed if installed.is_file() else Path(_CLIENT_FILE)
+
+
+def json_save(path: Path, conf: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".mmbox-tmp")
+    tmp.write_text(json.dumps(conf, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def hook_groups_set(hooks: dict, events, cmd: str, pattern: str, install: bool, matcher=None, extra=None) -> None:
+    """In a Claude-style `hooks` table (Claude Code, Codex, Gemini CLI): our entries out (any path), the others kept,
+    then ours in again for each event when installing."""
+    for ev in events:
+        groups = [g for g in hooks.get(ev) or [] if isinstance(g, dict)]
+        for g in groups:
+            g["hooks"] = [h for h in g.get("hooks") or [] if not re.search(pattern, str(h.get("command", "")))]
+        groups = [g for g in groups if g.get("hooks")]
+        if install:
+            g = {"hooks": [{"type": "command", "command": cmd, **(extra or {"timeout": 10})}]}
+            if matcher and matcher(ev):
+                g = {"matcher": matcher(ev), **g}
+            groups.append(g)
+        if groups:
+            hooks[ev] = groups
+        else:
+            hooks.pop(ev, None)
+
+
+def hook_install_claude(install: bool, harness: str = "claude") -> int:
+    """`mmbox.py hook install|uninstall claude`: the mmbox hook in Claude Code's user settings (~/.claude/settings.json,
+    or $CLAUDE_CONFIG_DIR) for SessionStart, UserPromptSubmit, Stop and PostToolUse (AskUserQuestion only).
+    `… codex`: the same hook in Codex's user hooks (~/.codex/hooks.json, or $CODEX_HOME) for SessionStart and
+    UserPromptSubmit, with the `codex_hooks` feature turned on in its config.toml. Both run the installed client
+    (mmbox-install's folder) when there is one. Only our own entries are added or removed."""
+    import shlex
     # never exit 2 (Claude Code would hold the stop on it): an older client without `hook` answers argparse's 2
-    cmd = f"python3 {shlex.quote(str(client))} hook claude 2>/dev/null || true"
-    path = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "settings.json"
+    cmd = f"python3 {shlex.quote(str(installed_client()))} hook {harness} 2>/dev/null || true"
+    if harness == "codex":
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        path = home / "hooks.json"
+    else:
+        path = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "settings.json"
     try:
         conf = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
     except ValueError:
         die(f"{path}: not valid JSON; fix it first (nothing changed)")
     hooks = conf.setdefault("hooks", {})
-    for ev in HOOK_EVENTS:
-        groups = [g for g in hooks.get(ev) or [] if isinstance(g, dict)]
-        for g in groups:  # ours out (any path), the others kept
-            g["hooks"] = [h for h in g.get("hooks") or [] if not re.search(r"mmbox\.py\S* hook claude", str(h.get("command", "")))]
-        groups = [g for g in groups if g.get("hooks")]
-        if install:
-            groups.append({"hooks": [{"type": "command", "command": cmd, "timeout": 10}]})
-        if groups:
-            hooks[ev] = groups
-        else:
-            hooks.pop(ev, None)
+    hook_groups_set(hooks, HOOK_EVENTS, cmd, rf"mmbox\.py\S* hook {harness}", False)  # every event of ours out first
+    if install:
+        hook_groups_set(hooks, HOOK_EVENTS_OF[harness], cmd, rf"mmbox\.py\S* hook {harness}", True,
+                        matcher=(lambda ev: HOOK_MATCHER.get(ev)) if harness == "claude" else None)
     if not hooks:
         conf.pop("hooks", None)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.mmbox-tmp")
-    tmp.write_text(json.dumps(conf, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    print(f"{'INSTALLED' if install else 'REMOVED'}: the mmbox hook ({', '.join(HOOK_EVENTS)}) in {path}"
-          + (f": {cmd}" if install else "") + ". Sessions already running take it at their next start or /hooks.")
+    json_save(path, conf)
+    note = ""
+    if harness == "codex" and install:
+        note = codex_feature_on(path.parent / "config.toml")
+    print(f"{'INSTALLED' if install else 'REMOVED'}: the mmbox hook ({', '.join(HOOK_EVENTS_OF[harness])}) in {path}"
+          + (f": {cmd}" if install else "") + (". " + note if note else "")
+          + (". Sessions already running take it at their next start or /hooks." if harness == "claude" else
+             ". Codex reads its hooks when a session starts; it may ask you once to trust a new hook (/hooks)."
+             if install else "."))
     return 0
+
+
+def codex_feature_on(path: Path) -> str:
+    """`[features] codex_hooks = true` in Codex's config.toml, the rest of the file kept byte for byte."""
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if re.search(r"(?m)^\s*codex_hooks\s*=", text):
+        return f"codex_hooks already set in {path} (left as it is)"
+    m = re.search(r"(?m)^\[features\]\s*$", text)
+    if m:
+        text = text[:m.end()] + "\ncodex_hooks = true" + text[m.end():]
+    else:
+        text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + "[features]\ncodex_hooks = true\n"
+    tmp = path.with_suffix(".toml.mmbox-tmp")
+    tmp.write_text(text, encoding="utf-8")
+    if path.exists():
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+    os.replace(tmp, path)
+    return f"codex_hooks = true in {path}"
+
+
+def hook_install_gemini(install: bool) -> int:
+    """`mmbox.py hook install|uninstall gemini`: the mmbox hook (BeforeAgent) in Gemini CLI's user settings
+    (~/.gemini/settings.json, or $GEMINI_CLI_HOME/.gemini). Only our own entry is added or removed."""
+    import shlex
+    cmd = f"python3 {shlex.quote(str(installed_client()))} hook gemini 2>/dev/null || true"
+    path = Path(os.environ.get("GEMINI_CLI_HOME") or Path.home()) / ".gemini" / "settings.json"
+    try:
+        conf = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except ValueError:
+        die(f"{path}: not valid JSON; fix it first (nothing changed)")
+    hooks = conf.setdefault("hooks", {})
+    hook_groups_set(hooks, ("BeforeAgent",), cmd, r"mmbox\.py\S* hook gemini", install,
+                    extra={"name": "mmbox", "timeout": 10000, "description": "mmbox: listener and open console questions"})
+    if not hooks:
+        conf.pop("hooks", None)
+    json_save(path, conf)
+    print(f"{'INSTALLED' if install else 'REMOVED'}: the mmbox hook (BeforeAgent) in {path}" + (f": {cmd}" if install else "")
+          + ". Gemini CLI reads its settings when a session starts.")
+    return 0
+
+
+HOOK_HARNESSES = ("claude", "codex", "vibe", "gemini")
 
 
 def hook_main(argv: list[str]) -> int:
     """`mmbox.py hook claude` (the harness hook), `mmbox.py --profile <session> hook off|on|status` (the user asked this
     session to stop listening: the hook keeps quiet about it)."""
-    if argv[:1] in (["claude"], ["vibe"]):
+    if argv[:1] and argv[0] in HOOK_HARNESSES:
         try:
-            return hook_claude() if argv[0] == "claude" else hook_vibe()
+            return {"claude": hook_claude, "codex": lambda: hook_claude("codex"), "vibe": hook_vibe,
+                    "gemini": hook_gemini}[argv[0]]()
         except Exception:  # a hook never breaks the session it serves
             return 0
-    if argv[:1] in (["install"], ["uninstall"]) and argv[1:2] in (["claude"], ["vibe"]):
-        return (hook_install_claude if argv[1] == "claude" else hook_install_vibe)(argv[0] == "install")
+    if argv[:1] in (["install"], ["uninstall"]) and argv[1:2] and argv[1] in HOOK_HARNESSES:
+        on = argv[0] == "install"
+        return {"claude": lambda: hook_install_claude(on), "codex": lambda: hook_install_claude(on, "codex"),
+                "vibe": lambda: hook_install_vibe(on), "gemini": lambda: hook_install_gemini(on)}[argv[1]]()
     prof = os.environ.get("MMBOX_PROFILE", "default")
     rest = list(argv)
     if "--profile" in sys.argv:
@@ -7210,7 +7860,7 @@ def main():
         x = bls.add_parser(name, help=help_)
         x.set_defaults(fn=cmd_backlog)
         x.add_argument("ids", nargs="*", help="message ids")
-        x.add_argument("--box", choices=("session", "machine", "all"), default="all")
+        x.add_argument("--box", choices=("session", "machine", "project", "all"), default="all")
         x.add_argument("--stale", action="store_true", help=f"only those older than {EXPIRE_S / 3600:g} h")
         x.add_argument("--older-than", metavar="WHEN", help="stored before: 48h, 3d, 2026-10-28, 2026-10-28T14:00")
         x.add_argument("--newer-than", metavar="WHEN", help="stored after: same forms")
@@ -7317,13 +7967,23 @@ def main():
     x.add_argument("--reply-expected", action="store_true")
     x.add_argument("--via", choices=("machine",), help="send from the machine box (default for --re of a machine-box message)")
     x.add_argument("--activity", help="what this session is doing now (two or three sentences), updated before sending")
+    x.add_argument("--for", dest="for_box", metavar="PROJECT|machine",
+                   help="which project of the peer's computer the message is for, when it reaches the machine box "
+                        "(default: this session's own project); `machine`: the computer itself, any session takes it")
     x.add_argument("-a", "--attach", action="append", default=[], metavar="FILE",
                    help=f"attach a file (repeatable: {ATTACH_MAX_FILES} files, {ATTACH_MAX_BYTES // 1000} kB in all at most; "
                         "images are shown as images in the console); not on a broadcast")
     x.add_argument("--project")
+    x = sub("giveback", cmd_giveback, "put back a message this session took and cannot do (another project's task): "
+                                      "to its project's box, where a session that can do it takes it")
+    x.add_argument("id", help="the message id, as the listener printed it")
+    x.add_argument("--why", required=True, help="why this session cannot do it (one sentence)")
+    x.add_argument("--to", metavar="PROJECT|machine", help="the project whose sessions should take it (default: the "
+                                                           "message's own project, else this session's), or `machine`")
+    x.add_argument("--project")
     x = sub("inbox", cmd_inbox, "read new messages (rights applied); each is consumed once")
     x.add_argument("--all", action="store_true", help="show the messages already consumed (local log), archived included")
-    x.add_argument("--box", choices=("session", "machine", "all"), default="all")
+    x.add_argument("--box", choices=("session", "machine", "project", "all"), default="all")
     x.add_argument("-n", type=int, default=50, help="with --all: how many")
     x.add_argument("--json", action="store_true")
     x.add_argument("--project")
@@ -7397,12 +8057,19 @@ def main():
     x.add_argument("--re", help="the message the question is about (its id)")
     x.add_argument("--single", action="store_true", help="one option at most")
     x.add_argument("--server", help="one service (name or URL)")
-    x.add_argument("--withdraw", metavar="ID", help="withdraw a question the user answered elsewhere")
+    x.add_argument("--withdraw", metavar="ID", help="withdraw a question the user answered elsewhere (in the chat)")
+    x.add_argument("--answer", metavar="TEXT", help="with --withdraw: the answer the user gave in the chat, shown in "
+                                                    "the console instead of the question and kept in its history")
+    x.add_argument("--open", action="store_true", help="the questions of this box still waiting in the console")
     x.add_argument("--json", action="store_true")
     x = sub("rights", cmd_rights, "how this computer handles what a box sends: execute, ask, archive (or follow)")
     x.add_argument("target", nargs="?", help="a peer (alias, id): a remote machine and its sessions, one box; `local`: "
-                                             "the sessions of this computer; `@<service>`: a whole network, everything "
-                                             "coming through that service from other computers (wins over the rest)")
+                                             "the sessions of this computer (same project); `@<service>`: a whole "
+                                             "network, everything coming through that service from other computers "
+                                             "(wins over the rest); the sessions of OTHER projects of this computer: "
+                                             "`projects` (the computer), `project:<name>` (one project), "
+                                             "`projects@<service>` (a network's default); most precise wins: box, "
+                                             "project, computer, network, then ask")
     x.add_argument("rights", nargs="?", choices=RIGHTS + ("follow",))
     x.add_argument("--json", action="store_true")
     cl = sp.add_parser("collector", help="annotations for a service's collector (its operator's console): status, "

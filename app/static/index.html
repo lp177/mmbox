@@ -277,6 +277,26 @@
             <button id="t-apply" class="btn filled ripple" type="button">Apply</button>
           </div>
         </section>
+        <section class="card" aria-labelledby="set-purge">
+          <h3 id="set-purge">Purge</h3>
+          <p class="help" id="p-keep-help">The purge (Memory view) removes from this computer every message that no longer waits in a box: the boxes' logs, their attached files, the console's copy. What an open session sent, received or saw within this delay stays, so that it can still answer it. 24 hours by default.</p>
+          <div class="row">
+            <div class="field"><input id="p-keep" type="number" min="0" step="1" placeholder=" " aria-describedby="p-keep-help p-keep-error"><label for="p-keep">Keep</label></div>
+            <div class="field select">
+              <select id="p-unit" aria-describedby="p-keep-help">
+                <option value="60">minutes</option>
+                <option value="3600">hours</option>
+                <option value="86400">days</option>
+              </select>
+              <label for="p-unit">Unit</label>
+            </div>
+          </div>
+          <p id="p-keep-error" class="error" aria-live="polite"></p>
+          <div class="actions">
+            <button id="p-reset" class="btn ripple" type="button">Default value</button>
+            <button id="p-apply" class="btn filled ripple" type="button">Apply</button>
+          </div>
+        </section>
         <section class="card" aria-labelledby="set-questions">
           <h3 id="set-questions">Questions from sessions</h3>
           <p class="help">A session whose messages are in "Ask" mode puts its question here, with the solutions it proposes; your answer goes back to its box.</p>
@@ -435,7 +455,7 @@
       <h3 class="mem-h">Free space</h3>
       <div class="mem-action">
         <div>
-          <strong>Purge the console's messages</strong>
+          <strong>Purge the messages of this computer</strong>
           <p id="mem-purge-text"></p>
         </div>
         <button id="mem-purge" class="btn danger ripple" type="button">Purge</button>
@@ -507,6 +527,7 @@
         <span id="q-count" class="chip request"></span>
       </div>
       <p id="q-from" class="q-from"></p>
+      <p id="q-settled" class="q-settled" role="status" hidden></p>
       <div id="q-desc" class="q-desc"></div>
       <div id="q-about"></div>
       <fieldset id="q-options" class="q-options">
@@ -540,6 +561,16 @@
       </div>
       <hr>
       <button type="button" role="menuitemradio" aria-checked="false" data-rights="follow" id="rights-follow">Follow the workstation</button>
+      <div id="rights-other" hidden>
+        <hr>
+        <p id="rights-other-title" class="menu-title"></p>
+        <div role="group" aria-labelledby="rights-other-title" data-group="other">
+          <button type="button" role="menuitemradio" aria-checked="false" data-rights="execute">Execute<span class="hint">acts without asking</span></button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-rights="ask">Ask<span class="hint">asks you the question</span></button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-rights="archive">Ignore<span class="hint">archived without showing</span></button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-rights="follow" id="rights-other-follow">Follow</button>
+        </div>
+      </div>
     </div>
   </div>
 

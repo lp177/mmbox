@@ -362,6 +362,10 @@ fieldset { border: 0; margin: 0; padding: 0; }
 .q-head { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
 .q-head h2 { margin-bottom: 0; }
 .q-from { color: var(--text-2); font-size: 13px; margin: 6px 0 10px; }
+.q-settled { margin: 0 0 10px; padding: 10px 12px; border-radius: 8px; background: rgb(76 175 80 / .12);
+  border-left: 3px solid var(--ok); color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+.q-settled strong { color: var(--ok); }
+.q-options:disabled, #q-text:disabled { opacity: .45; }
 .q-desc { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--s1); border: 1px solid var(--line); border-left: 3px solid var(--warn);
   border-radius: var(--radius); padding: 12px 14px; margin: 0 0 12px; max-height: 32vh; overflow: auto; }
 .q-about summary { cursor: pointer; color: var(--text-2); font-size: 13px; margin-bottom: 6px; }
