@@ -7653,7 +7653,7 @@ def hook_install_vibe(install: bool) -> int:
     data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     installed = Path(os.environ.get("MMBOX_CLIENT_DIR") or data_home / "mmbox" / "src") / "client" / "mmbox.py"
     client = installed if installed.is_file() else Path(_CLIENT_FILE)
-    cmd = f"python3 {shlex.quote(str(client))} hook vibe 2>/dev/null || true"
+    cmd = hook_command(client, "vibe")
     path = Path(os.environ.get("VIBE_HOME") or Path.home() / ".vibe") / "hooks.toml"
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     text = re.sub(re.escape(VIBE_BLOCK_START) + r".*?" + re.escape(VIBE_BLOCK_END) + r"\n?", "", text, flags=re.S)
@@ -7670,7 +7670,46 @@ def hook_install_vibe(install: bool) -> int:
     os.replace(tmp, path)
     print(f"{'INSTALLED' if install else 'REMOVED'}: the mmbox hooks (post_agent, post_tool) in {path}"
           + (f": {cmd}" if install else "") + ". Vibe reads hooks.toml when a session starts.")
+    if install:
+        print(hook_check(client, "vibe"))
     return 0
+
+
+def hook_python() -> tuple[str, list[str]]:
+    """The interpreter a harness hook runs the client with, as a shell word and as argv. On Windows `python3` is often
+    the Microsoft Store alias stub ("Python was not found", exit 49): the `py` launcher (`py -3`) when there is one,
+    else this very interpreter (sys.executable)."""
+    import shlex
+    import shutil
+    if os.name == "nt":
+        if shutil.which("py"):
+            return "py -3", ["py", "-3"]
+        exe = sys.executable.replace("\\", "/")  # the harness runs hooks in a POSIX shell (Git Bash)
+        return shlex.quote(exe), [sys.executable]
+    return "python3", ["python3"]
+
+
+def hook_command(client: Path, harness: str) -> str:
+    """The command written in a harness's hook settings: never fails the harness (`|| true`), never prints an error."""
+    import shlex
+    exe, _ = hook_python()
+    path = str(client).replace("\\", "/") if os.name == "nt" else str(client)
+    return f"{exe} {shlex.quote(path)} hook {harness} 2>/dev/null || true"
+
+
+def hook_check(client: Path, harness: str) -> str:
+    """Run the hook once as the harness will (its interpreter, an empty event): a line saying whether it works."""
+    import subprocess
+    _, argv = hook_python()
+    try:
+        r = subprocess.run(argv + [str(client), "hook", harness], input="{}", capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"WARNING: the hook command does not run here ({argv[0]}: {exc}): the hook would do nothing, silently"
+    if r.returncode != 0:
+        why = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["no output"]
+        return (f"WARNING: the hook command exits {r.returncode} here ({' '.join(argv)}: {why[0][:200]}): the hook "
+                f"would do nothing, silently")
+    return f"CHECK ok: the hook command runs here ({' '.join(argv)}, exit 0)"
 
 
 def installed_client() -> Path:
@@ -7713,7 +7752,7 @@ def hook_install_claude(install: bool, harness: str = "claude") -> int:
     (mmbox-install's folder) when there is one. Only our own entries are added or removed."""
     import shlex
     # never exit 2 (Claude Code would hold the stop on it): an older client without `hook` answers argparse's 2
-    cmd = f"python3 {shlex.quote(str(installed_client()))} hook {harness} 2>/dev/null || true"
+    cmd = hook_command(installed_client(), harness)
     if harness == "codex":
         home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         path = home / "hooks.json"
@@ -7739,6 +7778,8 @@ def hook_install_claude(install: bool, harness: str = "claude") -> int:
           + (". Sessions already running take it at their next start or /hooks." if harness == "claude" else
              ". Codex reads its hooks when a session starts; it may ask you once to trust a new hook (/hooks)."
              if install else "."))
+    if install:
+        print(hook_check(installed_client(), harness))
     return 0
 
 
@@ -7764,7 +7805,7 @@ def hook_install_gemini(install: bool) -> int:
     """`mmbox.py hook install|uninstall gemini`: the mmbox hook (BeforeAgent) in Gemini CLI's user settings
     (~/.gemini/settings.json, or $GEMINI_CLI_HOME/.gemini). Only our own entry is added or removed."""
     import shlex
-    cmd = f"python3 {shlex.quote(str(installed_client()))} hook gemini 2>/dev/null || true"
+    cmd = hook_command(installed_client(), "gemini")
     path = Path(os.environ.get("GEMINI_CLI_HOME") or Path.home()) / ".gemini" / "settings.json"
     try:
         conf = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -7778,6 +7819,8 @@ def hook_install_gemini(install: bool) -> int:
     json_save(path, conf)
     print(f"{'INSTALLED' if install else 'REMOVED'}: the mmbox hook (BeforeAgent) in {path}" + (f": {cmd}" if install else "")
           + ". Gemini CLI reads its settings when a session starts.")
+    if install:
+        print(hook_check(installed_client(), "gemini"))
     return 0
 
 

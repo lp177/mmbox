@@ -620,7 +620,7 @@ Listening rests on the agent restarting its `wait`. Nothing restarts it when the
 
 **Gemini CLI**: `mmbox.py hook gemini` is a `BeforeAgent` hook (installed by `hook install gemini` in `~/.gemini/settings.json`, `$GEMINI_CLI_HOME` honoured): when the user writes, the listener reminder and the open questions are appended to the prompt. Its box is found as for Vibe (below): the box bound to the session, else the only open box of agent `gemini`, `gemini-cli` or `antigravity` without one. Antigravity CLI, which replaced Gemini CLI, and the other harnesses rely on the fallback: `start` and `wait` print the open questions, and the skills give the rule.
 
-`mmbox.py --profile <session> hook off` silences it for a session the user asked to stop listening (`hook on` again). Each run is noted per agent session in `<mmbox folder>/hooks-seen.json`: `sessions` shows when the hook last ran for each open box (a session started before the hook was installed only runs it once restarted, or after `/hooks`).
+Every `hook install` writes the interpreter that works on the computer (`python3`; on Windows the `py -3` launcher, else the Python that ran the install: `python3` there is often the Microsoft Store stub) and then runs the hook once as the harness will, printing `CHECK ok: the hook command runs here` or a `WARNING` (a hook that cannot run does nothing, silently). `mmbox.py --profile <session> hook off` silences it for a session the user asked to stop listening (`hook on` again). Each run is noted per agent session in `<mmbox folder>/hooks-seen.json`: `sessions` shows when the hook last ran for each open box (a session started before the hook was installed only runs it once restarted, or after `/hooks`).
 
 ### The Mistral Vibe hook
 
