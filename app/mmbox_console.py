@@ -567,9 +567,6 @@ class AppWindow:
     icon is there (`can_hide`, set by Desktop), otherwise it quits the console. Every call may come from any thread:
     pywebview's own calls wait for the window, so they run in a short thread of their own."""
 
-    # the questions: at once when the page has them, else at its next poll (what #question=next does at the opening)
-    JS_QUESTION = "pendingQ().length ? openQuestions() : (S.wantQuestion = true, poll(true))"
-    JS_HELD = "showHeld()"
 
     def __init__(self, webview, url: str, shown: bool, home: Path):
         self.wv, self.home = webview, home
@@ -577,6 +574,7 @@ class AppWindow:
         self.left_front = 0.0  # when the window last lost the focus (monotonic): a click on the panel may take it
         self.activation_token = None  # Wayland: the token the panel gives just before its click (xdg-activation)
         self._watched = False
+        self.goto, self.goto_n = None, 0  # a notification's click: what the page opens (also at its next poll, 20 s)
         self.on_change = lambda: None  # the icon's menu follows the window
         webview.settings["ALLOW_DOWNLOADS"] = True  # the attached files: a save dialog
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
@@ -664,8 +662,15 @@ class AppWindow:
         GLib.timeout_add(250, insist)
         return False
 
-    def show(self, question: bool = False, held: bool = False) -> None:
-        """Opened (created the first time) and put in front, whether it was hidden, minimized or behind others."""
+    def show(self, question: bool | str = False, held: bool = False, msg: str | None = None) -> None:
+        """Opened (created the first time) and put in front, whether it was hidden, minimized or behind others; then
+        what a notification's click is about: one message (`msg`), the questions (`question`: True, or the id of the
+        one to show first) or the held messages. The page opens it at once, or as soon as its next poll has it."""
+        target = {"msg": msg} if msg else {"question": question} if question else {"held": True} if held else None
+        if target:
+            self.goto_n += 1
+            self.goto = {**target, "n": self.goto_n, "until": time.time() + 20}
+
         def run():
             if desktop_session() and self._gtk_window() is not None:
                 from gi.repository import GLib
@@ -673,13 +678,35 @@ class AppWindow:
             else:
                 self.win.show()
                 self.win.restore()  # out of the task bar, in front
-            if question:
-                self.win.evaluate_js(self.JS_QUESTION)
-            elif held:
-                self.win.evaluate_js(self.JS_HELD)
+            if target:
+                self._run_js(f"typeof openFromNotification === 'function' && openFromNotification({json.dumps(self.goto)})")
         self.visible = True
         self._bg(run)
         self.on_change()
+
+    def take_goto(self) -> dict | None:
+        """For the window's page at its poll: the last click's target, while it is fresh (the page skips one it ran)."""
+        g = self.goto
+        return g if g and g["until"] > time.time() else None
+
+    def _run_js(self, code: str) -> None:
+        """The page runs `code` now. Not pywebview's evaluate_js: it wraps the code in eval(), which the page's CSP
+        (script-src 'self') refuses. On GTK, WebKit runs it as is; elsewhere the page takes the target at its next
+        poll of /api/pending (take_goto), as it does when it was not loaded yet."""
+        try:
+            from webview.platforms.gtk import BrowserView
+            wv = BrowserView.instances[self.win.uid].webview
+            from gi.repository import GLib
+        except Exception:
+            return
+
+        def run():
+            try:
+                wv.evaluate_javascript(code, -1, None, None, None, None, None)
+            except Exception as e:
+                log(f"window: {type(e).__name__}: {e}")
+            return False
+        GLib.idle_add(run)
 
     def on_screen(self) -> bool:
         """Shown and not minimized. Called in the GTK loop on Linux, where the window itself says it."""
@@ -867,6 +894,7 @@ class Desktop:
     def __init__(self, home: Path, url_of, on_quit, app: AppWindow | None = None):
         self.ok, self.url_of, self.on_quit, self.app = False, url_of, on_quit, app
         self.note, self.dismissed, self.shown, self.tray, self.pending_n = None, set(), None, None, 0
+        self.note_q, self.held_one, self.recap_notes = None, None, {}  # what each notification's click opens
         self.held_note, self.held_dismissed, self.held_shown, self.held_n, self.badge = None, set(), None, 0, True
         if not desktop_session():
             return
@@ -958,11 +986,12 @@ class Desktop:
         else:
             self.open()
 
-    def open(self, question: bool = False, held: bool = False) -> None:
+    def open(self, question: bool | str = False, held: bool = False, msg: str | None = None) -> None:
+        """The console in front, on what is asked: one message, the questions (or one of them), the held messages."""
         if self.app:
-            self.app.show(question=question, held=held)
+            self.app.show(question=question, held=held, msg=msg)
         else:
-            self._browser(self.url_of(question, held))
+            self._browser(self.url_of(question, held, msg))
 
     def open_browser(self) -> None:
         self._browser(self.url_of(False))
@@ -1013,13 +1042,13 @@ class Desktop:
             note.set_timeout(0)  # never expires: it stays until answered or closed
             note.set_hint("resident", self.GLib.Variant.new_boolean(True))
             note.set_hint("desktop-entry", self.GLib.Variant.new_string("mmbox-console"))
-            note.add_action("default", "Answer", lambda *_: self.open(question=True))
-            note.add_action("answer", "Answer", lambda *_: self.open(question=True))
+            note.add_action("default", "Answer", lambda *_: self.open(question=self.note_q or True))
+            note.add_action("answer", "Answer", lambda *_: self.open(question=self.note_q or True))
             note.connect("closed", lambda nn, ids=ids: self._closed(nn, ids))
             self.note = note
         else:
             self.note.update(title, body, icon)
-        self.note.ids = ids
+        self.note.ids, self.note_q = ids, last["id"]  # its click: the question it names
         try:
             self.note.show()
             self.shown = (title, body)
@@ -1061,19 +1090,27 @@ class Desktop:
             note.set_urgency(self.Notify.Urgency.CRITICAL)
             note.set_hint("resident", self.GLib.Variant.new_boolean(True))
             note.set_hint("desktop-entry", self.GLib.Variant.new_string("mmbox-console"))
-            note.add_action("default", "Show", lambda *_: self.open(held=True))
-            note.add_action("held", "Show them", lambda *_: self.open(held=True))
+            note.add_action("default", "Show", lambda *_: self._open_held())
+            note.add_action("held", "Show them", lambda *_: self._open_held())
             note.connect("closed", lambda nn, ids=ids: self._held_closed(nn, ids))
             self.held_note = note
         else:
             self.held_note.update(title, body, icon)
         self.held_note.ids = ids
+        self.held_one = held[0]["id"] if len(held) == 1 else None
         try:
             self.held_note.show()
             self.held_shown = ids
         except Exception as e:
             log(f"notification: {e}")
         return False
+
+    def _open_held(self) -> None:
+        """The held notification's click: the message itself when it is the only one, else the list of them all."""
+        if self.held_one:
+            self.open(msg=self.held_one)
+        else:
+            self.open(held=True)
 
     def recap(self, r: dict) -> None:
         if self.ok:
@@ -1087,9 +1124,13 @@ class Desktop:
             note = self.Notify.Notification.new(f"mmbox: {who}" + (f" on {host}" if host else "") + " is done",
                                                 str(r.get("subject") or "")[:200], str(self.icons / "mmbox-console.svg"))
             note.set_hint("desktop-entry", self.GLib.Variant.new_string("mmbox-console"))
-            note.add_action("default", "Show", lambda *_: self.open())
+            mid = r.get("id")
+            note.add_action("default", "Show", lambda *_, mid=mid: self.open(msg=mid) if mid else self.open())
+            note.connect("closed", lambda *_, mid=mid: self.recap_notes.pop(mid, None))
             note.show()
-            self._recap_note = note  # kept, or its action is lost with the object
+            self.recap_notes[mid] = note  # kept (each one, until closed), or its action is lost with the object
+            for old in list(self.recap_notes)[:-20]:
+                self.recap_notes.pop(old, None)
         except Exception as e:
             log(f"notification: {e}")
         return False
@@ -3566,7 +3607,10 @@ class Handler(BaseHTTPRequestHandler):
                 pend = st.questions.pending()
                 return self._json({"count": len(pend), "ids": [x["id"] for x in pend], "version": st.snapshot.get("version", 0),
                                    "latest": ({k: pend[-1].get(k) for k in ("id", "from", "label", "title", "subject")} if pend else None),
-                                   "desktop": bool(st.desktop and st.desktop.ok), "held": len(st.held())})
+                                   "desktop": bool(st.desktop and st.desktop.ok), "held": len(st.held()),
+                                   # the window's own page: what a notification's click asked it to open
+                                   **({"goto": g} if (q.get("app") or ["0"])[0] == "1" and getattr(Handler, "app", None)
+                                      and (g := Handler.app.take_goto()) else {})})
             if u.path == "/api/passphrase":  # the onboarding's Generate: a recovery passphrase from the system's CSPRNG
                 try:
                     return self._json({"ok": True, **recovery_passphrase()})
@@ -3761,7 +3805,11 @@ def main():
     Handler.state, Handler.token, Handler.port = state, secrets.token_urlsafe(24), a.port
     httpd = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     url = f"http://127.0.0.1:{a.port}/#token={Handler.token}"
-    url_of = lambda question=False, held=False: url + ("&question=next" if question else "&view=held" if held else "")  # noqa: E731
+    def url_of(question: bool | str = False, held: bool = False, msg: str | None = None) -> str:
+        """The console's address in the browser, on a message, a question (or the next one) or the held messages."""
+        q = urllib.parse.quote
+        return url + (f"&msg={q(msg, safe='')}" if msg else f"&question={q(question, safe='') if isinstance(question, str) else 'next'}"
+                      if question else "&view=held" if held else "")
     app = None if a.browser else app_window(url, a.open or a.no_tray, op.home)
     Handler.app = app
     instance = op.home / "instance.json"  # for a second launch: bring this window to the front instead

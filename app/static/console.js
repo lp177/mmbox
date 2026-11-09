@@ -1834,7 +1834,28 @@ function remember(key) {
 function notify(title, body, tag) {
   if (F.desktop && "Notification" in window && Notification.permission === "granted") {
     const n = new Notification(title, { body: body.slice(0, 300), tag, silent: false });
-    n.onclick = () => { window.focus(); if (tag === "late:summary") showLate(); else openMessage(tag.replace(/^(late|fw):/, "")); };
+    n.onclick = () => { window.focus(); n.close(); if (tag === "late:summary") showLate(); else openWhenListed(tag.replace(/^(late|fw):/, "")); };
+  }
+}
+// a message a notification (or a deep link) is about: open at once when the list has it, else once a poll brought it
+// (a recap that has just arrived, a window that has just opened); after 15 s it is fetched by its id all the same
+function openWhenListed(id, tries = 50) {
+  if (!id) return;
+  if (S.byId.has(id) || tries <= 0) { openMessage(id); return; }
+  if (tries === 50 && token) poll();
+  setTimeout(() => openWhenListed(id, tries - 1), 300);
+}
+// the app window's notifications (mmbox_console.py, AppWindow.show): {msg: id} | {question: true | id} | {held: true},
+// with n, its number: run at once by the window, and handed again at the next /api/pending (run once only)
+let gotoDone = 0;
+function openFromNotification(t) {
+  if (t.n) { if (t.n <= gotoDone) return; gotoDone = t.n; }
+  if ($("#question").open && !t.question) $("#question").close();  // the modal question would hide the message
+  if (t.msg) openWhenListed(t.msg);
+  else if (t.held) showHeld();
+  else if (t.question) {
+    if (pendingQ().length) openQuestions(t.question);
+    else { S.wantQuestion = t.question; poll(true); }
   }
 }
 function watchAlerts(first) {
@@ -1965,7 +1986,8 @@ function heldSignals() {
         const nt = new Notification(list.length === 1 ? "mmbox: 1 message held" : `mmbox: ${list.length} messages held`, {
           body: g.slice(0, 4).map((x) => `${x.msgs.length} for ${recipientName(x.to)}`).join("; ") + ". The recipient's computer has not accepted them yet.",
           tag: "mmbox-held", requireInteraction: true, renotify: fresh.length > 0 });
-        nt.onclick = () => { window.focus(); nt.close(); showHeld(); };
+        const one = list.length === 1 ? list[0].id : null;  // the message itself when it is the only one
+        nt.onclick = () => { window.focus(); nt.close(); if (one) openWhenListed(one); else showHeld(); };
         nt.onclose = () => { if (H.notif === nt) H.notif = null; };
         H.notif = nt;
       }
@@ -2241,7 +2263,7 @@ function updateQuestionSignals(newIds, quiet = false) {
       Q.notif?.close();
       const nt = new Notification(n === 1 ? "mmbox: one question waiting" : `mmbox: ${n} questions waiting`, {
         body: `${whoAsks(last)}: ${last.subject || ""}`, tag: "mmbox-questions", requireInteraction: true, renotify: newIds.length > 0, silent: true });
-      nt.onclick = () => { window.focus(); nt.close(); openQuestions(); };
+      nt.onclick = () => { window.focus(); nt.close(); openQuestions(last.id); };  // the question it names
       nt.onclose = () => { if (Q.notif === nt) Q.notif = null; };
       Q.notif = nt;
     }
@@ -2286,7 +2308,8 @@ function setBadge(n) {
 async function pollPending() {
   if (!token) return;
   try {
-    const r = await api(`/api/pending?notify=${canNotify() ? 1 : 0}&audio=${canAudio() ? 1 : 0}`);
+    const r = await api(`/api/pending?notify=${canNotify() ? 1 : 0}&audio=${canAudio() ? 1 : 0}${window.pywebview ? "&app=1" : ""}`);
+    if (r.goto) openFromNotification(r.goto);
     const ids = r.ids || [];
     if (Q.known === null) Q.known = new Set(pendingQ().map((q) => q.id));
     const fresh = ids.filter((i) => !Q.known.has(i));
@@ -2390,7 +2413,7 @@ async function poll(force = false, background = false) {
       if (Q.settledSeen) for (const x of settled) if (!Q.settledSeen.has(x.id) && Q.current?.id !== x.id)
         toast(`“${x.subject || x.id}” (${whoAsks(x)}): answered in the IDE` + (x.withdrawn_answer ? `: ${x.withdrawn_answer}` : ""));
       Q.settledSeen = new Set(settled.map((x) => x.id));
-      if (S.wantQuestion && ids.length) { S.wantQuestion = false; openQuestions(); }
+      if (S.wantQuestion && ids.length) { const w = S.wantQuestion; S.wantQuestion = false; openQuestions(w); }
       if (snap.startup && !S.startupShown) showStartup(snap.startup);
       if (RD.open && S.byId.has(RD.open) && !$("#detail").contains(document.activeElement)) {
         const id = RD.open;
@@ -2979,11 +3002,11 @@ $("#ob-join-go").addEventListener("click", async () => {
 });
 
 showTab(DEEP.get("tab") || localStorage.getItem("mmbox-console-tab") || "messages");
-if (DEEP.get("msg")) { const id = DEEP.get("msg"); const t = setInterval(() => { if (S.byId.has(id)) { clearInterval(t); openMessage(id); } }, 300); }
+if (DEEP.get("msg")) openWhenListed(DEEP.get("msg"));
 if (DEEP.get("box")) { const id = DEEP.get("box"); const t = setInterval(() => { if (S.boxes.has(id)) { clearInterval(t); openBoxCard(id); } }, 300); }
 if (!token) { $("#sync").textContent = "no token: open the URL the console printed"; $("#sync").classList.add("err"); }
 else {
-  S.wantQuestion = DEEP.get("question") === "next";
+  S.wantQuestion = DEEP.get("question") === "next" ? true : DEEP.get("question") || false;  // next, or the id of one
   S.wantHeld = DEEP.get("view") === "held";
   poll(); setInterval(() => document.visibilityState === "visible" && poll(), 5000);
   setInterval(pollPending, 4000);
