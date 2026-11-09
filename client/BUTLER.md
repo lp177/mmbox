@@ -1,7 +1,7 @@
-# Project boxes and the butler (design, not implemented yet)
+# Project boxes and the butler (design and as built)
 
-Status: design of 2026-11-08, validated by lp177 (decisions below). Step 1 shipped (551cbbc, d07f5d4); steps 2 and 3
-implemented (client/mmbox_daemon.py, the console's Butler tab): see "As built" at the end. Builds on PROTOCOL.md.
+Status: design of 2026-11-08, validated by lp177 (decisions below). Steps 1 to 3 built (project boxes; the
+daemon, client/mmbox_daemon.py; the console's Butler tab): see "As built" and "The daemon" at the end. Builds on PROTOCOL.md.
 
 Decisions: sessions the butler starts run in a detached tmux session, in the agent's no-prompt mode; a project is
 the name of the folder its session runs in; step 1 (project boxes) comes first.

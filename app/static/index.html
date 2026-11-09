@@ -144,6 +144,13 @@
         </div>
         <section id="held-banner" class="held-banner" aria-labelledby="held-title" hidden></section>
         <div class="list-head">
+          <input type="checkbox" class="check" id="sel-all" aria-label="Select every message shown" title="Select every message shown (x: one message, Shift+click: a range)">
+          <div id="batch" class="batch" role="toolbar" aria-label="Selected messages" hidden>
+            <span id="batch-n" class="batch-n" aria-live="polite"></span>
+            <button class="btn small ripple" type="button" id="batch-move" title="Hand the selected messages that wait unread in a box of this computer to another of its boxes">Move to…</button>
+            <button class="btn small danger ripple" type="button" id="batch-delete" title="Delete the selected messages from this computer (Delete)">Delete</button>
+            <button class="btn small text ripple" type="button" id="batch-clear">Clear</button>
+          </div>
           <p id="list-count" class="dim" role="status" aria-live="polite"></p>
           <button class="btn small ripple" type="button" id="new-session-btn" hidden title="Start a session on this computer or project (its butler starts it)">New session…</button>
           <p id="scope" class="scope"></p>
@@ -187,6 +194,7 @@
           <button id="reader-back" class="btn icon ripple" type="button" aria-label="Back to the list" title="Back to the list (Esc)"></button>
           <span id="reader-pos" class="dim reader-pos"></span>
           <span class="spacer"></span>
+          <button id="reader-delete" class="btn icon ripple" type="button" aria-label="Delete this thread" title="Delete this thread from this computer (Shift+Delete; Delete: this message alone)"></button>
           <button id="reader-prev" class="btn icon ripple" type="button" aria-label="Previous message" title="Previous message (k)"></button>
           <button id="reader-next" class="btn icon ripple" type="button" aria-label="Next message" title="Next message (j)"></button>
         </div>
@@ -369,6 +377,21 @@
             <button id="t-apply" class="btn filled ripple" type="button">Apply</button>
           </div>
         </section>
+        <section class="card" aria-labelledby="set-done">
+          <h3 id="set-done">When a session's work is done</h3>
+          <p class="help" id="on-done-help">A session that finished its work sends its recap to this console, where it stays until you delete it. Then, for every session of this computer (the butler always keeps listening):</p>
+          <fieldset class="segmented" aria-describedby="on-done-help">
+            <legend class="sr">What a session does after its recap</legend>
+            <label><input type="radio" name="on-done" value="close"> <span>Close its box, stop listening</span></label>
+            <label><input type="radio" name="on-done" value="listen"> <span>Keep listening</span></label>
+          </fieldset>
+          <p class="help" id="on-done-src"></p>
+        </section>
+        <section class="card" aria-labelledby="set-debug">
+          <h3 id="set-debug">Debug</h3>
+          <label class="switch-row"><input type="checkbox" role="switch" id="d-all" class="switch" aria-describedby="d-all-help"> <span>Keep every message in the list</span></label>
+          <p class="help" id="d-all-help">Off: the list keeps only what is useful: the messages still waiting to be read, those waiting for your decision, and everything written to this console (questions, recaps), which stays until you delete it. A message leaves the list once a session took it. On: every message seen stays, consumed ones included.</p>
+        </section>
         <section class="card" aria-labelledby="set-purge">
           <h3 id="set-purge">Purge</h3>
           <p class="help" id="p-keep-help">The purge (Memory view) removes from this computer every message that no longer waits in a box: the boxes' logs, their attached files, the console's copy. What an open session sent, received or saw within this delay stays, so that it can still answer it. 24 hours by default.</p>
@@ -526,6 +549,22 @@
       <div class="actions">
         <button class="btn ripple" value="cancel" autofocus type="submit">Cancel</button>
         <button class="btn filled danger ripple" value="ok" type="submit" id="confirm-ok">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- the list's batch action: move the selected messages to another box of this computer -->
+  <dialog id="move-dialog" aria-labelledby="move-title" aria-describedby="move-text" closedby="any">
+    <form method="dialog" class="dialog-body">
+      <h2 id="move-title">Move to another box</h2>
+      <p id="move-text"></p>
+      <div class="field select">
+        <select id="move-to"></select>
+        <label for="move-to">Box of this computer</label>
+      </div>
+      <div class="actions">
+        <button class="btn ripple" value="cancel" type="submit">Cancel</button>
+        <button class="btn filled ripple" value="ok" type="submit" id="move-ok">Move</button>
       </div>
     </form>
   </dialog>
@@ -796,6 +835,18 @@
       </div>
       <hr>
       <button type="button" role="menuitem" class="pause-item" data-range="clear">Clear<span class="hint">resets the counter to zero</span></button>
+    </div>
+  </div>
+
+  <!-- A message's menu (the open message, a message of its thread) -->
+  <div id="msg-menu" class="menu" popover="auto">
+    <div role="menu" aria-labelledby="msg-menu-title">
+      <p id="msg-menu-title" class="menu-title"></p>
+      <button type="button" role="menuitem" class="pause-item danger" data-mact="delete">Delete this message<span class="hint">from this computer</span></button>
+      <button type="button" role="menuitem" class="pause-item danger" data-mact="thread" id="msg-menu-thread">Delete the whole thread<span class="hint" id="msg-menu-thread-n"></span></button>
+      <hr>
+      <button type="button" role="menuitem" class="pause-item" data-mact="open" id="msg-menu-open">Open</button>
+      <button type="button" role="menuitem" class="pause-item" data-mact="copy">Copy the id</button>
     </div>
   </div>
 

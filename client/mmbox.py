@@ -79,12 +79,18 @@ UA = os.environ.get("MMBOX_USER_AGENT") or "mmbox"
 B32 = "0123456789abcdefghjkmnpqrstvwxyz"  # Crockford base32, lowercase: path-safe, no I/L/O/U
 RIGHTS = ("execute", "ask", "archive")
 KINDS = ("task", "request", "info", "reply", "ack", "revoke", "introduce", "ping", "pong", "forward", "notice", "transport",
-         "retire", "link", "question", "answer")  # question / answer: between a box and the operator's console only
+         "retire", "link", "question", "answer", "recap")  # question / answer / recap: between a box and the operator's
+# console only (a recap: what a session did, sent by `done` when its work is over; the console keeps it until deleted)
 CAPS = ["transport", "retire", "chan", "link", "attach"]  # what this client understands (tool kinds, reading channels,
 # files attached to a message): a peer sends them only to those that list them
 SEND_KINDS = KINDS[:5]  # the others are sent by their own commands (revoke, introduce) or by the tool itself
 PAIR_TTL = 600
-EXIT_TIMEOUT, EXIT_PAIR, EXIT_GONE, EXIT_TWICE, EXIT_DETACHED = 3, 4, 5, 6, 7
+EXIT_TIMEOUT, EXIT_PAIR, EXIT_GONE, EXIT_TWICE, EXIT_DETACHED, EXIT_DONE = 3, 4, 5, 6, 7, 8
+# what a session does once its work is over (`done`), for the whole computer (`tune --on-done`, the console's Settings):
+# "close": its recap to the operator, then its box closed and its listener stopped (exit 8); "listen": the recap, then
+# it keeps listening. The butler's box never closes.
+ON_DONE = ("close", "listen")
+ON_DONE_DEFAULT = "close"
 # Ephemeral channels (see "ephemeral channels" below): what a session may post there (`lock`: the lock tool's events).
 CHAN_KINDS = ("info", "request")
 CHAN_TTL_S = int(os.environ.get("MMBOX_CHAN_TTL_S", "60"))  # how long a post stays on the channels by default
@@ -3727,7 +3733,7 @@ def close_session(y: Me, project: str, why: str, say) -> Me:
 
 def reopen_session(y: Me, project: str) -> Me:
     """A closed session box used again: open, introduced again to its peers (those told it closed take it back)."""
-    y.local.update("config.json", lambda c: [c.pop(k, None) for k in ("closed_at", "closed_reason")])
+    y.local.update("config.json", lambda c: [c.pop(k, None) for k in ("closed_at", "closed_reason", "done_at")])
     y = load_me(y.local.profile)
     print(f"SESSION BOX: {y.label} ({y.id}) was closed; open again", file=sys.stderr)
     if y.conf.get("parent") and y.conf["parent"] != y.local.profile and load_me(y.conf["parent"]):
@@ -4307,6 +4313,11 @@ def cmd_start(a, local: Local):
           f"run_in_background): it returns only when something arrives for this session (a message of the session box "
           f"or the machine box, a channel post), stops by itself when this agent session ends, and runs the relay round "
           f"meanwhile; start it again at once each time it returns, then handle what it printed")
+    if Me(local).role != "butler":
+        print(f"WHEN YOUR WORK IS DONE (the user's task finished, nothing left waiting on you): "
+              f"`{client_command(local.profile, 'done --recap "<what you did, what changed, what is left>"')}`: the "
+              f"recap goes to the operator console; then this computer says ({on_done()} now) whether the box closes "
+              f"and the listener stops (do not start it again) or it keeps listening")
 
 
 def enable_gateway(me: Me, url: str, project: str, announce: bool = True) -> None:
@@ -4936,6 +4947,8 @@ def cmd_tune(a, local: Local):
             if v <= 0 or (k == "relay_after_s" and v < 30) or (k == "expire_hours" and v > 24 * 7):
                 die(f"--{k.replace('_', '-')}: out of range (relay after 30 s at least; backlog within 7 days)")
             new[k] = v
+    if a.on_done:
+        new["on_done"] = a.on_done
     if a.reset:
         m.local.update("config.json", lambda c: c.pop("tuning", None))
     elif new:
@@ -4943,12 +4956,29 @@ def cmd_tune(a, local: Local):
     cur = apply_tuning()
     t = (load_me(MACHINE_PROFILE).conf.get("tuning") or {})
     if a.json:
-        print(json.dumps({"effective": cur, "set": t, "env": {k: os.environ.get(e) for k, (e, _, _) in TUNABLE.items()
-                                                              if os.environ.get(e)}}))
+        print(json.dumps({"effective": {**cur, "on_done": on_done()}, "set": t,
+                          "env": {k: os.environ.get(e) for k, (e, _, _) in TUNABLE.items() if os.environ.get(e)}
+                          | ({"on_done": os.environ["MMBOX_ON_DONE"]} if os.environ.get("MMBOX_ON_DONE") else {})}))
         return
     for k, (env, _, text) in TUNABLE.items():
         print(f"{k}: {cur[k]:g}" + (" (set here)" if k in t else " (default)") + (f" [env {env} wins]" if os.environ.get(env) else "")
               + f" - {text}")
+    print(f"on_done: {on_done()}" + (" (set here)" if "on_done" in t else " (default)")
+          + (" [env MMBOX_ON_DONE wins]" if os.environ.get("MMBOX_ON_DONE") else "")
+          + " - once its work is over (`done`), a session sends its recap to the operator, then closes its box "
+            "(close) or keeps listening (listen)")
+
+
+def on_done() -> str:
+    """What a session of this computer does once its work is over: MMBOX_ON_DONE, else `tune --on-done`, else close."""
+    v = (os.environ.get("MMBOX_ON_DONE") or "").strip().lower()
+    if v not in ON_DONE:
+        try:
+            v = ((json.loads((base_dir() / MACHINE_PROFILE / "config.json").read_text(encoding="utf-8")) or {})
+                 .get("tuning") or {}).get("on_done")
+        except (OSError, ValueError):
+            v = None
+    return v if v in ON_DONE else ON_DONE_DEFAULT
 
 
 QUESTION_MAX_OPTIONS = 12
@@ -5128,6 +5158,79 @@ def cmd_question(a, local: Local):
             return
         last = f"{u}: {r.get('_error')} {r.get('error', '')}"
     die(f"the question could not be put: {last}")
+
+
+def operator_targets(me: "Me", server: str | None = None) -> list[tuple[str, dict]]:
+    """The services of this box whose operator's console it may write to (its key pinned here, `questions` on)."""
+    urls = gw_urls(me)
+    if server:
+        found = server_find(server)
+        urls = [(found[1]["url"] if found else server).rstrip("/")]
+    targets = [(u, operator_pin(u)) for u in urls]
+    return [(u, c) for u, c in targets if c and "questions" in gateway(u).features()]
+
+
+def done_text(profile: str) -> str:
+    return (f"STOP LISTENING: this session's work is done and its box `{profile}` is closed: its listener stops by itself "
+            f"(exit {EXIT_DONE}); do NOT start it again. What still reaches the box goes to the machine box (the butler, "
+            f"another session). If the user gives this session new work that uses the mailbox, start it again first: "
+            f"`{client_command(profile, 'start --session ' + profile)}`, then listen.")
+
+
+def cmd_done(a, local: Local):
+    """This session's work is over: its recap (what it did, what is left) goes to the operator's console, which keeps
+    it until the user deletes it; then, as this computer says (`tune --on-done`, the console's Settings), its box closes
+    and its listener stops (exit 8: not started again), or it keeps listening. The butler's box only sends the recap."""
+    me = Me(local)
+    if me.role in ("machine", "project"):
+        die("a shared box has no work of its own to end: run it with this session's profile")
+    recap = (a.recap or "").strip()
+    if not recap:
+        die("--recap: what this session did, for the user (the outcome, what changed, what is left)")
+    project = me.project(None)
+    mode = "listen" if me.role == "butler" else on_done()
+    subject = (a.subject or recap.splitlines()[0])[:200]
+    qs = open_questions(local)
+    sent, last = None, None
+    for u, c in operator_targets(me, a.server):
+        op = operator_peer(u, c["id"])
+        msg_id = now().strftime("%Y%m%dT%H%M%SZ") + "-" + rand_b32(6)
+        payload = {"v": VERSION, "id": msg_id, "from": me.id, "from_user": me.user, "label": me.label, "agent": me.agent,
+                   "to": op["id"], "ts": iso(), "kind": "recap", "subject": subject, "body": recap[:16000],
+                   "reply_expected": False, "then": mode, "open_questions": [q["id"] for q in qs],
+                   "project": project, "host": host_facts(me.local),
+                   **({"work": me.conf["work_project"]} if me.conf.get("work_project") else {}),
+                   **{k: me.conf[k] for k in ("title", "activity", "provider", "model") if me.conf.get(k)}}
+        r = gateway(u).send(me, op["id"], envelope(me, op, payload, msg_id))
+        if r.get("ok"):
+            me.local.append_log({"dir": "out", "id": msg_id, "peer": op["id"], "status": "sent", "at": iso(),
+                                 "payload": payload, "via": "gateway", "gateway": u, "entry": r["entry"], "to": op["id"]})
+            sent = (u, msg_id, op)
+            break
+        last = f"{u}: {r.get('_error')} {r.get('error', '')}"
+    out = {"recap": sent[1] if sent else None, "server": sent[0] if sent else None, "then": mode,
+           "error": None if sent else (last or "no operator console on the services of this box")}
+    if not a.json:
+        if sent:
+            print(f"RECAP {sent[1]} sent to the operator console ({sent[2]['label']}) through {sent[0]}: kept there "
+                  f"until the user deletes it")
+        else:
+            print(f"RECAP NOT SENT ({out['error']}): give the user this recap in the chat instead", file=sys.stderr)
+        if qs:
+            print(f"note: {len(qs)} question(s) of this box still wait in the console"
+                  + (": their answers will go to the machine box" if mode == "close" else ""), file=sys.stderr)
+    if mode == "close":
+        close_session(me, project, "work done" + (" (recap sent to the operator)" if sent else ""),
+                      (lambda t: None) if a.json else print)
+        me.local.update("config.json", lambda c: c.update(done_at=iso()))
+        out["closed"] = True
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+    elif mode == "close":
+        print(done_text(local.profile))
+    else:
+        print("KEEP LISTENING: this computer keeps a session listening once its work is done (`tune --on-done listen`"
+              + (", and the butler always does" if me.role == "butler" else "") + "): leave the listener running")
 
 
 def cmd_rights(a, local: Local):
@@ -6525,6 +6628,48 @@ def cmd_giveback(a, local: Local):
     print(f"GIVEN BACK: {a.id} put in {dest.label} as {fid}; this session's listener leaves it to the others")
 
 
+def cmd_move(a, local: Local):
+    """`move <ids…> --to <box>`: messages waiting unread in this box handed to another box of this computer (a
+    session, a project box, the machine box, the butler) as a `forward` that keeps their first sender, its rights and
+    its date, the way the relay passes on what a silent session leaves. The operator's console moves them in batches.
+    What is taken already, or does not verify, stays."""
+    me = Me(local)
+    project = me.project(a.project)
+    want = (a.to or "").strip()
+    dest = None
+    for n in local_profiles():
+        y = load_me(n)
+        if y and want in (n, y.id, y.label) and not y.closed_at:
+            dest = y
+            break
+    if not dest:
+        die(f"--to {want}: no open box of this computer by that profile, id or label")
+    if dest.id == me.id:
+        die("--to: another box than the one the messages wait in")
+    ypeers = peers_load(me.local)
+    if dest.id not in ypeers:
+        die(f"{dest.label} is not a peer of {me.label} (another pairing space): a message can only move between "
+            f"boxes that know each other")
+    store = Store(local)
+    _, waiting = untaken(me, store, project, 0, forwards=True)
+    ids = set(a.ids)
+    sel = [w for w in waiting if w["msg_id"] in ids]
+    why = a.why or "moved there by the operator"
+    lines = []
+    done = forward_to_machine(me, dest, ypeers[dest.id], me, ypeers, sel, why, why, store, project, lines.append,
+                              dest_name=dest.label)
+    moved = {d[0]: d[3] for d in done}
+    out = {"moved": [{"id": i, "as": f} for i, f in moved.items()], "to": dest.id, "to_label": dest.label,
+           "not_moved": sorted(ids - set(moved))}
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    for i, f in moved.items():
+        print(f"MOVED: {i} to {dest.label} as {f}")
+    if out["not_moved"]:
+        print(f"not moved (taken already, gone, a tool's own message, or does not verify): {', '.join(out['not_moved'])}")
+
+
 def cmd_inbox(a, local: Local):
     me = Me(local)
     if a.all:  # consumed messages are no longer in the store: the local log keeps them
@@ -7197,6 +7342,8 @@ def wait_loop(me: Me, project: str, timeout: float, on_items, forever: bool = Fa
             wake.clear()
             if agent_gone(agent):
                 continue
+            if me.role not in SHARED_ROLES and (me.local.load("config.json", {}) or {}).get("done_at"):
+                return EXIT_DONE  # `done` closed this box: its work is over, nothing more is taken here
             if client_updated():  # the same process goes on with the new client: nobody has to be told to restart it
                 if not os.environ.get("MMBOX_UPDATED_NOTE"):  # said once per listener, however many updates follow
                     print("mmbox: the client was updated: this listener goes on with the new version (same process)",
@@ -7262,12 +7409,17 @@ def cmd_wait(a, local: Local):
         print_items(items, a.json)
         handed.extend(i["id"] for i in items if i["status"] not in SILENT)
 
+    if me.closed_at and me.conf.get("done_at"):
+        print(done_text(local.profile), flush=True)
+        sys.exit(EXIT_DONE)
     if me.role != "machine":  # a new listener of this session: what the previous one handed over reached the agent
         local.update("state.json", lambda st: st.pop("handover", None))
     code = wait_loop(me, project, timeout, hand_over, machine=not a.no_machine,
                      relay_every=0 if a.no_relay else RELAY_EVERY_S)
     if code == EXIT_TIMEOUT:
         print(f"nothing new in {timeout if timeout > 0 else NO_AGENT_CAP_S:.0f} s")
+    if code == EXIT_DONE:
+        print(done_text(local.profile), flush=True)
     if code in (0, EXIT_TIMEOUT) and me.role != "machine":
         if handed:  # until the next `wait` of this session starts: the hook and `start` remind an agent that never came back
             local.update("state.json", lambda st: st.__setitem__("handover", {
@@ -7374,6 +7526,10 @@ def listener_text(name: str, conf: dict, event: str) -> str | None:
     if conf.get("closed_at"):
         if event == "Stop":
             return None  # an old session resumed: told when the user writes, never holding its turn
+        if conf.get("done_at"):
+            return (f"mmbox: this session ended its mailbox work ({conf['done_at']}, `done`: recap sent, box `{name}` "
+                    f"closed). Only if the user gives it new work that uses the mailbox: `mmbox.py start --session "
+                    f"{name} …` again, then listen.")
         return (f"mmbox: this session's box `{name}` was closed ({conf.get('closed_reason') or 'unused'}). If this "
                 f"session still uses the mailbox, run `mmbox.py start --session {name} …` again, then listen.")
     text = (f"mmbox: no listener serves this session's box `{name}` (a usage limit, a reload of the editor or a "
@@ -8232,6 +8388,9 @@ def main():
     x.add_argument("--relay-after-s", type=float, help=TUNABLE["relay_after_s"][2])
     x.add_argument("--relay-busy-s", type=float, help=TUNABLE["relay_busy_s"][2])
     x.add_argument("--expire-hours", type=float, help=TUNABLE["expire_hours"][2])
+    x.add_argument("--on-done", choices=ON_DONE, help="once its work is over (`done`), a session sends its recap to the "
+                                                      "operator, then closes its box (close, the default) or keeps "
+                                                      "listening (listen); the butler always listens")
     x.add_argument("--reset", action="store_true", help="back to the defaults")
     x.add_argument("--json", action="store_true")
     x = sub("boxes", cmd_boxes, "the active boxes of each service (machine, project, listening, waiting): no message sent")
@@ -8249,6 +8408,20 @@ def main():
     x.add_argument("--answer", metavar="TEXT", help="with --withdraw: the answer the user gave in the chat, shown in "
                                                     "the console instead of the question and kept in its history")
     x.add_argument("--open", action="store_true", help="the questions of this box still waiting in the console")
+    x.add_argument("--json", action="store_true")
+    x = sub("move", cmd_move, "messages waiting unread in this box handed to another box of this computer (kept: their "
+                              "first sender, its rights, its date)")
+    x.add_argument("ids", nargs="+", help="message ids")
+    x.add_argument("--to", required=True, help="the box: profile, id or label (an open box of this computer)")
+    x.add_argument("--why", help="the reason, shown in the forward's header")
+    x.add_argument("--project")
+    x.add_argument("--json", action="store_true")
+    x = sub("done", cmd_done, "this session's work is over: its recap to the operator's console, then its box closed and "
+                              "its listener stopped, or it keeps listening (`tune --on-done`)")
+    x.add_argument("--recap", help="what this session did, for the user: the outcome, what changed (commits, deploys, "
+                                   "files), what is left or needs a decision (a few sentences to a short list)")
+    x.add_argument("--subject", help="a short title (default: the first line of --recap)")
+    x.add_argument("--server", help="one service (name or URL)")
     x.add_argument("--json", action="store_true")
     x = sub("rights", cmd_rights, "how this computer handles what a box sends: execute, ask, archive (or follow)")
     x.add_argument("target", nargs="?", help="a peer (alias, id): a remote machine and its sessions, one box; `local`: "
@@ -8290,7 +8463,9 @@ def main():
     live = not passive and local.path("identity.json").is_file()
     if live:
         conf = local.load("config.json", {}) or {}
-        if conf.get("closed_at") and a.cmd != "start" and (y := load_me(a.profile)):
+        if conf.get("closed_at") and a.cmd not in ("start", "done") and not (conf.get("done_at") and a.cmd == "wait") \
+                and not (a.cmd == "backlog" and a.bcmd == "purge") and a.cmd != "move" \
+                and (y := load_me(a.profile)):  # a purge or a move: housekeeping, not the session coming back
             reopen_session(y, getattr(a, "project", None) or conf.get("project") or "")  # its session is back
         stamp(local)
     try:

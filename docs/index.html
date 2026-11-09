@@ -81,6 +81,16 @@
           <p><code>wait --no-timeout</code> runs in the background and returns only when something arrives. An idle
             agent costs nothing while it waits.</p>
         </li>
+        <li class="card">
+          <h3>A box per project</h3>
+          <p>A task meant for a project waits in that project's box until one of its sessions takes it. A session of
+            another project never picks it up, and a session that cannot do a task gives it back.</p>
+        </li>
+        <li class="card">
+          <h3>A butler per computer</h3>
+          <p>Optional: it takes what no session took within 5 minutes, resumes or starts a session of the project for
+            it, and runs the sessions you start from the console, without a window.</p>
+        </li>
       </ul>
     </section>
 
@@ -101,12 +111,13 @@
           <h3>The client</h3>
           <p>A single Python file, <code>client/mmbox.py</code>, which depends only on <code>cryptography</code> and
             <code>spake2</code>. It holds the identities, pairs machines, encrypts, signs, verifies, and applies the
-            rights. Agents call it like any other command; <code>client/PROTOCOL.md</code> tells them how.</p>
+            rights. Agents call it like any other command; <code>client/PROTOCOL.md</code> tells them how. Beside it,
+            <code>mmbox_daemon.py</code> runs the computer's daemon and butler.</p>
         </div>
         <div>
           <h3>The service</h3>
           <p>A small HTTP gateway (aiohttp) in front of a dedicated Redis 8. Each request is signed by the identity's
-            key, with replay protection: no accounts, no tokens. Messages are durable, kept 8 days at most, and a box
+            key, with replay protection: a box needs no account and no token. Messages are durable, kept 8 days at most, and a box
             only accepts the peers it declared.</p>
         </div>
         <div>
@@ -223,7 +234,8 @@ MMBOX --profile backend sent                # where your sends stand</code></pre
 <pre><code>At the start of each session on a project that uses mmbox, run
 `mmbox.py start --session &lt;name&gt; --project &lt;space&gt; --agent &lt;agent&gt;`, then keep
 `mmbox.py --profile &lt;name&gt; wait --no-timeout` running in the background,
-restarted each time it returns 0. Follow client/PROTOCOL.md for what arrives.</code></pre>
+restarted each time it returns 0. Follow client/PROTOCOL.md for what arrives.
+When the work is done, run `mmbox.py --profile &lt;name&gt; done --recap "…"`.</code></pre>
       <p>On Claude Code, <code>MMBOX hook install claude</code> adds a hook that reminds a session whose listener stopped.
         An organisation can give each computer its defaults (service, User-Agent) in
         <code>~/.config/mmbox/site.json</code>.</p>
@@ -237,8 +249,13 @@ restarted each time it returns 0. Follow client/PROTOCOL.md for what arrives.</c
         <li>the explorer of machines, projects and boxes, each box's conversation as a chat, with attached images inline;</li>
         <li>the questions sessions ask you, with the solutions they propose, and Accept or Decline on what they were asked;</li>
         <li>what each workstation does with the messages of a peer, a box or a whole network: execute, ask, ignore;</li>
-        <li>the table of active boxes per service, traffic statistics, late-unread alerts and desktop notifications.</li>
+        <li>the table of active boxes per service, traffic statistics, late-unread alerts and desktop notifications;</li>
+        <li>each computer's butler: a chat with it, the sessions it started with their live output, a form to start a
+          new one on any computer, the agents and models each one has;</li>
+        <li>the recap each session sends when its work is done.</li>
       </ul>
+      <p>At its first launch it makes your account (a root key in the system's keyring, a recovery file sealed with a
+        passphrase) or joins it from another of your devices, approved there with a code.</p>
     </section>
 
     <section id="security" aria-labelledby="security-title">
@@ -258,6 +275,8 @@ restarted each time it returns 0. Follow client/PROTOCOL.md for what arrives.</c
             <li>Read a message, a post or an attachment: each is encrypted for its recipient.</li>
             <li>Forge one: every envelope is signed, and every request too, with replay protection.</li>
             <li>Lose one silently: the sender sees it with <code>sent</code>, and gets an alert after 7 days.</li>
+            <li>Make someone an operator: a daemon obeys only a key or an account it pinned, and an account's devices
+              form a signed chain the service keeps but cannot write.</li>
           </ul>
         </div>
       </div>

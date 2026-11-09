@@ -1,9 +1,9 @@
-# Accounts, devices and the operator (design, not implemented yet)
+# Accounts, devices and the operator (design; steps 1 and 2 built)
 
 Status: design of 2026-11-08 from lp177's decisions. No SSO: an identity provider (Authentik, tried that day and
-removed) protected nothing that matters here and was slow; the authentication is the keys. Replaces the single
-operator key (`MMBOX_OPERATORS`, the key pinned by `collector enable --fingerprint`, `mmbox_console.py --export-key`)
-once built. Builds on PROTOCOL.md and BUTLER.md.
+removed) protected nothing that matters here and was slow; the authentication is the keys. Steps 1 and 2 and the
+onboarding are built (see "As built" at the end); step 3, which replaces the single operator key (`MMBOX_OPERATORS`, the
+key pinned by `collector enable --fingerprint`, `mmbox_console.py --export-key`), and step 4 are not yet. Builds on PROTOCOL.md and BUTLER.md.
 
 ## Decisions
 
@@ -38,7 +38,8 @@ without prompts: running code). So the trust stays in keys the service does not 
 
 ## A new device
 
-1. The new console (or `mmbox.py account join <account id>`) makes its device key and posts a join request to the
+1. The new console (a `mmbox.py account` command is not built: the console's `--account-*` options and its Settings
+   do it) makes its device key and posts a join request to the
    service (its public keys, label, host) with a 6-digit code it shows.
 2. Every console of the account that is open gets it in its tray and its header: "Approve <label> on <host>, code
    123456?". The user checks the code matches and approves: that console signs the `add` link; the new device belongs.

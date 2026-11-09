@@ -509,6 +509,52 @@ class Questions:
             self.save()
 
 
+class Recaps:
+    """What the sessions wrote to this console when their work was over (`mmbox.py done`), taken from the operator's
+    box on each service and kept in recaps.json for good: only the operator's own deletion removes one."""
+    FIELDS = ("kind", "subject", "body", "ts", "from", "from_user", "label", "agent", "title", "activity", "work",
+              "project", "host", "provider", "model", "then", "open_questions")
+
+    def __init__(self, home: Path):
+        self.path = home / "recaps.json"
+        self.lock = threading.RLock()
+        try:
+            self.items: dict[str, dict] = json.loads(self.path.read_text(encoding="utf-8")).get("items") or {}
+        except (OSError, ValueError, AttributeError):
+            self.items = {}
+
+    def save(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"items": self.items}, ensure_ascii=False), encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+
+    def add(self, url: str, sender: str, p: dict, card: dict) -> dict | None:
+        """The recap kept (None: already there, or not one)."""
+        with self.lock:
+            mid = str(p.get("id") or "")
+            if not mid or mid in self.items or p.get("from") != sender:
+                return None
+            r = {k: p[k] for k in self.FIELDS if p.get(k) not in (None, "")}
+            r["body"] = str(r.get("body") or "")[:16000]
+            r.update(id=mid, server=url, fingerprint=card.get("fingerprint"), received_at=time.time(), to=p.get("to"))
+            self.items[mid] = r
+            self.save()
+            return r
+
+    def all(self) -> list[dict]:
+        with self.lock:
+            return list(self.items.values())
+
+    def remove(self, ids) -> int:
+        with self.lock:
+            gone = [i for i in ids if self.items.pop(i, None) is not None]
+            if gone:
+                self.save()
+            return len(gone)
+
+
 def desktop_session() -> bool:
     """A Linux graphical session with a session bus: where the notification area and the notifications are."""
     return os.name != "nt" and sys.platform != "darwin" and bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS")) \
@@ -528,6 +574,9 @@ class AppWindow:
     def __init__(self, webview, url: str, shown: bool, home: Path):
         self.wv, self.home = webview, home
         self.can_hide, self.quitting, self.visible = False, False, shown
+        self.left_front = 0.0  # when the window last lost the focus (monotonic): a click on the panel may take it
+        self.activation_token = None  # Wayland: the token the panel gives just before its click (xdg-activation)
+        self._watched = False
         self.on_change = lambda: None  # the icon's menu follows the window
         webview.settings["ALLOW_DOWNLOADS"] = True  # the attached files: a save dialog
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
@@ -561,10 +610,69 @@ class AppWindow:
         self.hide()
         return False
 
-    def show(self, question: bool = False, held: bool = False) -> None:
-        def run():
+    def _gtk_window(self):
+        try:
+            from webview.platforms.gtk import BrowserView
+            return BrowserView.instances[self.win.uid].window
+        except Exception:
+            return None
+
+    def _watch(self, w) -> None:
+        """When the window loses the focus: a click on the icon may take it from the window just before Activate."""
+        if not self._watched:
+            self._watched = True
+            w.connect("notify::is-active", lambda w, _p: None if w.is_active() else setattr(self, "left_front", time.monotonic()))
+
+    def _present(self) -> bool:
+        """In the GTK loop: shown, out of the task bar and in front with the focus. A bare present() is refused by
+        the window manager's focus stealing prevention (KWin: no user time, and an unmapped window keeps the time of
+        its last use, so it maps behind the others): the X server's time now counts as the user's action; on Wayland,
+        the panel's activation token. If it still is not active a moment later, it is raised by force."""
+        w = self._gtk_window()
+        if w is None:  # not built yet: pywebview shows it
             self.win.show()
-            self.win.restore()  # out of the task bar, in front
+            self.win.restore()
+            return False
+        from gi.repository import Gdk, GLib
+        self._watch(w)
+        w.realize()
+        gw, t = w.get_window(), 0
+        try:
+            import gi
+            gi.require_version("GdkX11", "3.0")
+            from gi.repository import GdkX11
+            if isinstance(gw, GdkX11.X11Window):
+                t = GdkX11.x11_get_server_time(gw)
+                gw.set_user_time(t)  # mapped as if the user had just acted on it: in front, not behind
+        except (ImportError, AttributeError, TypeError, ValueError):
+            pass
+        if self.activation_token:
+            w.set_startup_id(self.activation_token)
+            self.activation_token = None
+        w.show_all()
+        w.deiconify()
+        w.present_with_time(t or Gdk.CURRENT_TIME)
+
+        def insist():
+            if w.get_visible() and not w.is_active():
+                w.set_keep_above(True)  # above every window for an instant: in front whatever the policy
+                w.present_with_time(t or Gdk.CURRENT_TIME)
+                if gw is not None:
+                    gw.focus(t or Gdk.CURRENT_TIME)
+                GLib.timeout_add(150, lambda: w.set_keep_above(False) and False)
+            return False
+        GLib.timeout_add(250, insist)
+        return False
+
+    def show(self, question: bool = False, held: bool = False) -> None:
+        """Opened (created the first time) and put in front, whether it was hidden, minimized or behind others."""
+        def run():
+            if desktop_session() and self._gtk_window() is not None:
+                from gi.repository import GLib
+                GLib.idle_add(self._present)
+            else:
+                self.win.show()
+                self.win.restore()  # out of the task bar, in front
             if question:
                 self.win.evaluate_js(self.JS_QUESTION)
             elif held:
@@ -576,13 +684,20 @@ class AppWindow:
     def on_screen(self) -> bool:
         """Shown and not minimized. Called in the GTK loop on Linux, where the window itself says it."""
         try:
-            from webview.platforms.gtk import BrowserView
             from gi.repository import Gdk
-            w = BrowserView.instances[self.win.uid].window
+            w = self._gtk_window()
             gw = w.get_window()
             return w.get_visible() and not (gw and gw.get_state() & Gdk.WindowState.ICONIFIED)
         except Exception:
             return self.visible
+
+    def in_front(self) -> bool:
+        """On screen and the active window (or it was until the click on the icon, a moment ago)."""
+        w = self._gtk_window()
+        if w is None:
+            return False
+        self._watch(w)
+        return self.on_screen() and (w.is_active() or time.monotonic() - self.left_front < 0.6)
 
     def hide(self) -> None:
         self.visible = False
@@ -611,6 +726,7 @@ SNI_XML = """<node><interface name="org.kde.StatusNotifierItem">
  <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
  <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
  <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+ <method name="ProvideXdgActivationToken"><arg name="token" type="s" direction="in"/></method>
  <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
  <signal name="NewTitle"/><signal name="NewIcon"/><signal name="NewAttentionIcon"/><signal name="NewToolTip"/>
  <signal name="NewStatus"><arg name="status" type="s"/></signal>
@@ -670,6 +786,8 @@ class SniTray:
             self.d.toggle()
         elif method == "SecondaryActivate":  # the middle button: the questions when some wait
             self.d.open(question=bool(self.d.pending_n))
+        elif method == "ProvideXdgActivationToken" and self.d.app:  # Wayland: sent just before Activate
+            self.d.app.activation_token = params.unpack()[0] or None
         inv.return_value(None)
 
     def _get(self, bus, sender, path, iface, prop):
@@ -833,8 +951,9 @@ class Desktop:
         return False
 
     def toggle(self) -> None:
-        """The icon's click: the window folds back when it is on screen, else it opens."""
-        if self.app and self.app.can_hide and self.app.on_screen():
+        """The icon's click: no window yet, or hidden, minimized or behind other windows: it opens in front; already in
+        front: it folds back into the notification area (the console keeps running)."""
+        if self.app and self.app.can_hide and self.app.in_front():
             self.app.hide()
         else:
             self.open()
@@ -952,6 +1071,25 @@ class Desktop:
         try:
             self.held_note.show()
             self.held_shown = ids
+        except Exception as e:
+            log(f"notification: {e}")
+        return False
+
+    def recap(self, r: dict) -> None:
+        if self.ok:
+            self.GLib.idle_add(self._recap, r)
+
+    def _recap(self, r):
+        """A session's work is over: one notification, not resident (the recap stays in the list)."""
+        who = r.get("title") or r.get("label") or r.get("from") or "a session"
+        host = (r.get("host") or {}).get("hostname")
+        try:
+            note = self.Notify.Notification.new(f"mmbox: {who}" + (f" on {host}" if host else "") + " is done",
+                                                str(r.get("subject") or "")[:200], str(self.icons / "mmbox-console.svg"))
+            note.set_hint("desktop-entry", self.GLib.Variant.new_string("mmbox-console"))
+            note.add_action("default", "Show", lambda *_: self.open())
+            note.show()
+            self._recap_note = note  # kept, or its action is lost with the object
         except Exception as e:
             log(f"notification: {e}")
         return False
@@ -1242,6 +1380,7 @@ class State:
         self.last_open = float(self.console_state.get("last_seen") or 0)
         self._seen_saved = 0.0
         self.questions = Questions(op.home)
+        self.recaps = Recaps(op.home)
         self.archive = Archive(op.home)
         self.purged: set = self.archive.purged()
         self.clients: dict[str, float] = {}  # when a browser tab last said it shows notifications / plays the sound
@@ -1299,7 +1438,8 @@ class State:
             name = lambda i: (lambda b: " on ".join(x for x in (b.get("title") or b.get("label") or i, b.get("hostname")) if x))(boxes.get(i) or {})  # noqa: E731
             out = [{**{k: m.get(k) for k in ("id", "from", "to", "kind", "subject", "tier")}, "to_name": name(m.get("to")),
                     "held": {**m["held"], "age_s": (now_ms - m["held"]["since"]) / 1000}}
-                   for m in self.messages.values() if m.get("held") and now_ms - m["held"]["since"] >= HELD_AFTER_S * 1000]
+                   for m in self.messages.values() if m.get("held") and not m["held"].get("ack")
+                   and now_ms - m["held"]["since"] >= HELD_AFTER_S * 1000]
         return sorted(out, key=lambda m: m["held"]["since"])
 
     def waiting_ids(self) -> set:
@@ -1338,6 +1478,10 @@ class State:
         self._usage = (time.time(), out)
         return out
 
+    def debug_all(self) -> bool:
+        """Debug mode (Settings): the list keeps every message seen, consumed ones included. Off: only the useful ones."""
+        return bool(self.console_state.get("debug_all"))
+
     def purge_keep_s(self) -> float:
         """How much of the open boxes' finished messages the purge keeps (Settings; 24 h by default)."""
         try:
@@ -1364,13 +1508,17 @@ class State:
             rel = {m.get("from"), m.get("to"), m.get("read_by"), (m.get("taken_by") or {}).get("id"),
                    *(m.get("to_boxes") or []), *(m.get("seen_by") or [])}
             return bool(rel & open_ids)
+        def to_operator(m):
+            return m.get("kind") in ("question", "recap") or m.get("to") == self.op.id or bool(m.get("to_operator"))
+
         def still_waiting(m):
             # "sent" by a box that is no longer open: its copy in the recipient's box is delivered without the
             # sender's log, and a deleted sender can no longer ask the service whether it was consumed
             st = m.get("state")
             return st in WAITING and not (st == "sent" and m.get("from") not in open_ids)
         waiting = {i for i, m in msgs.items() if still_waiting(m)}
-        gone = {i for i, m in msgs.items() if i not in waiting and not recent_open(m)}
+        # what was written to the operator (questions, recaps) never perishes: only its own deletion removes it
+        gone = {i for i, m in msgs.items() if i not in waiting and not recent_open(m) and not to_operator(m)}
         return {"keep_s": keep_s, "cut": cut, "msgs": msgs, "waiting": waiting, "gone": gone, "open": open_ids}
 
     def local_usage(self) -> dict:
@@ -1548,6 +1696,191 @@ class State:
         return {"ok": True, "out": f"{y.label}: {len(gone)} message(s) purged ({entries} log entries, {folders} attached "
                                    f"file folder(s), {n_arch} console cop(ies)); what still waits, and what an open box "
                                    f"handled within {fmt_delay(plan['keep_s'])}, kept."}
+
+    def _patch_snapshot(self, fn) -> None:
+        """The published snapshot changed at once (fn: a light message -> it, changed, or None to drop it), under a
+        new version, so that the page's next poll does not bring back the old state before the refresh rebuilds it."""
+        with self.lock:
+            snap = self.snapshot
+            if not snap.get("messages"):
+                return
+            msgs = [x for m in snap["messages"] if (x := fn(m)) is not None]
+            self.snapshot = {**snap, "messages": msgs, "version": snap.get("version", 0) + 1}
+            self.digest = ""  # the next refresh publishes, even if it finds what it had before
+
+    def delete_messages(self, ids) -> dict:
+        """The open message's menu (one message) or the reader's bin (its whole thread): these messages gone from this
+        computer for good - every local box's log, their attached files, the console's copy - with a marker for each
+        so that a collector's events do not bring them back. What still waits in a box, or in an outbox, stays: its
+        recipient has not taken it yet, and the list would show it again anyway."""
+        ids = {str(i) for i in ids or [] if i}
+        if not ids:
+            return {"ok": False, "err": "no message named"}
+        with self.lock:
+            msgs = {i: self.messages.get(i) for i in ids}
+        waiting = {i for i, m in msgs.items() if m and m.get("state") in WAITING}
+        # what still waits unread in a box of this computer is taken out of that box first, unread
+        unboxed, unbox_err = self._unbox(msgs, waiting)
+        waiting -= unboxed
+        outbox = set()
+        profiles = [y for n in M.local_profiles() if (y := M.load_me(n))]
+        for y in profiles:
+            outbox |= {i.get("msg_id") for i in (y.local.load("state.json", {}) or {}).get("outbox") or []}
+        gone = ids - waiting - outbox
+        entries = folders = 0
+        errors = list(unbox_err)
+        if gone:
+            for y in profiles:
+                try:
+                    r, f = self._purge_log(y, lambda e, mid: mid in gone)
+                except OSError as ex:
+                    errors.append(f"{y.local.profile}: {ex}")
+                    continue
+                entries, folders = entries + r, folders + f
+            n_arch = self.archive.drop(gone)
+            self.recaps.remove(gone)
+            # the console's copies of their attached files, unless a message that stays has the same file
+            with self.lock:
+                kept = {str(a.get("sha256") or "") for mid, m in self.messages.items() if mid not in gone
+                        for a in (m or {}).get("attachments") or []}
+            shas = {str(a.get("sha256") or "") for m in msgs.values() for a in (m or {}).get("attachments") or []}
+            folder = self.op.home / "attachments"
+            for sha in shas - kept - {""}:
+                f = folder / sha
+                if f.is_file():
+                    f.unlink(missing_ok=True)
+                    folders += 1
+            self.archive.mark_purged(gone, max(self.days * 86400, self.conv_default_ttl(), self.purge_keep_s()) + 86400)
+            self.purged = self.archive.purged()
+            self.logs = LogCache()
+            self._usage = (0.0, {})
+            with self.lock:  # gone from the list at once, not at the next refresh
+                self.messages = {i: m for i, m in self.messages.items() if i not in gone}
+            self._patch_snapshot(lambda m: None if m.get("id") in gone else m)
+            log(f"delete: {len(gone)} message(s), {entries} log entries, {n_arch} console cop(ies)"
+                + (f"; errors: {'; '.join(errors)}" if errors else ""))
+            threading.Thread(target=self.refresh, daemon=True).start()
+        kept_n = len(ids) - len(gone)
+        out = (f"{len(gone)} message(s) deleted from this computer" if gone else "Nothing deleted") \
+            + (f", {len(unboxed)} of them taken out of their box unread" if unboxed else "") \
+            + (f"; {kept_n} kept: still waiting in another computer's box or in its sender's outbox" if kept_n else "") + "."
+        return {"ok": not errors, "out": out, "deleted": sorted(gone), "kept": sorted(ids - gone),
+                "err": "; ".join(errors) or None}
+
+    def move_messages(self, ids, to: str) -> dict:
+        """The list's batch action: these messages, waiting unread in boxes of this computer, handed to another open box
+        of this computer (`mmbox.py move`: a forward keeping their first sender, its rights and its date). The others
+        (taken already, in another computer's box, in an outbox) stay where they are."""
+        ids = {str(i) for i in ids or [] if i}
+        dest = next((y for n in M.local_profiles() if (y := M.load_me(n)) and y.id == to and not y.closed_at), None)
+        if not dest:
+            return {"ok": False, "err": "the destination must be an open box of this computer"}
+        with self.lock:
+            msgs = {i: self.messages.get(i) or {} for i in ids}
+        groups: dict[str, list] = {}
+        for i, m in msgs.items():
+            prof = next((s.split(":", 1)[1] for s in m.get("sources") or [] if s.startswith("waiting:")), None)
+            if m.get("state") == "unread" and prof and prof != dest.local.profile:
+                groups.setdefault(prof, []).append(i)
+        moved, errors = set(), []
+        for prof, part in groups.items():
+            r = run_client(["--profile", prof, "move", *part, "--to", dest.local.profile, "--json"], timeout=180)
+            line = next((x for x in reversed((r.get("out") or "").splitlines()) if x.startswith("{")), "")
+            try:
+                moved |= {d.get("id") for d in json.loads(line).get("moved") or []}
+            except ValueError:
+                errors.append(f"{prof}: {(r.get('err') or r.get('out') or '?').strip().splitlines()[-1:]}")
+        kept = ids - moved
+        if moved:
+            log(f"move: {len(moved)} message(s) to {dest.label}")
+            threading.Thread(target=self.refresh, daemon=True).start()
+        out = (f"{len(moved)} message(s) moved to {dest.label}" if moved else "Nothing moved") \
+            + (f"; {len(kept)} kept where they are: only a message still waiting unread in a box of this computer moves"
+               if kept else "") + "."
+        return {"ok": bool(moved) or not errors, "out": out, "moved": sorted(moved), "kept": sorted(kept),
+                "err": "; ".join(errors) or None}
+
+    def _unbox(self, msgs: dict, ids: set) -> tuple[set, list]:
+        """These messages, waiting unread (or taken, not consumed) in a box of this computer, taken out of it unread:
+        `backlog purge` of that box (their senders told; the tool's own notices quietly); what the client does not
+        handle (not from one of its peers, does not open) is removed by the box's own keys (/done). What waits in
+        another computer's box, or in an outbox, is not this computer's to remove."""
+        quiet_kinds = set(M.QUIET_KINDS) | {"introduce"}
+        groups: dict[str, list] = {}
+        for i in ids:
+            m = msgs.get(i) or {}
+            if m.get("state") not in ("unread", "taken"):
+                continue
+            prof = next((s.split(":", 1)[1] for s in m.get("sources") or [] if s.startswith("waiting:")), None)
+            if prof:
+                groups.setdefault(prof, []).append(m)
+        done, errors = set(), []
+        for prof, ms in groups.items():
+            for quiet in (True, False):
+                part = [m["id"] for m in ms if (m.get("kind") in quiet_kinds) == quiet]
+                if not part:
+                    continue
+                r = run_client(["--profile", prof, "backlog", "purge", "--box", "all", "--json"]
+                               + (["--quiet"] if quiet else []) + part, timeout=180)
+                out, items = r.get("out") or "", []
+                for k in [0] + [j + 1 for j, c in enumerate(out) if c == "\n"]:  # the JSON list, after any note
+                    if out.startswith("[", k):
+                        try:
+                            items = json.loads(out[k:])
+                            break
+                        except ValueError:
+                            continue
+                done |= {it.get("id") for it in items if isinstance(it, dict) and it.get("status") == "purged"}
+            y = M.load_me(prof)
+            for m in ms:
+                if m["id"] in done:
+                    continue
+                if not y or not m.get("entry"):
+                    errors.append(f"{m['id']}: not taken out of {prof}")
+                    continue
+                for u in m.get("servers") or []:
+                    d = call(u, y, "/done", {"box": y.id, "entries": [m["entry"]], "handled": {m["entry"]: "deleted"}})
+                    if d.get("ok"):
+                        done.add(m["id"])
+                        break
+                else:
+                    errors.append(f"{m['id']}: not taken out of {prof}")
+        if done:
+            log(f"delete: {len(done)} waiting message(s) taken out of their box unread")
+        return done, errors
+
+    def held_ack(self, ids, on: bool) -> dict:
+        """The held alert: these messages marked handled (out of the button, the panel, the explorer's badges, the
+        tray and its notification) or put back in it. They stay queued by their senders; a mark goes with its message."""
+        ids = {str(i) for i in ids or [] if i}
+        if not ids:
+            return {"ok": False, "err": "no message named"}
+        now = int(time.time() * 1000)
+        with self.lock:
+            acks = dict(self.console_state.get("held_ack") or {})
+            for i in ids:
+                if on:
+                    acks[i] = now
+                else:
+                    acks.pop(i, None)
+            # a mark outlives its message by the list's horizon at most
+            live = {i for i, m in self.messages.items() if m.get("held")}
+            acks = {i: t for i, t in acks.items() if i in live or now - t < self.days * 86400e3}
+            self.console_state["held_ack"] = acks
+            for i in ids:  # at once, not at the next refresh
+                m = self.messages.get(i)
+                if m and m.get("held"):
+                    m["held"] = {k: v for k, v in m["held"].items() if k != "ack"} | ({"ack": now} if on else {})
+
+        def mark(m):
+            if m.get("id") not in ids or not m.get("held"):
+                return m
+            return {**m, "held": {k: v for k, v in m["held"].items() if k != "ack"} | ({"ack": now} if on else {})}
+        self._patch_snapshot(mark)
+        self.save_console_state()
+        threading.Thread(target=self.refresh, daemon=True).start()
+        n = len(ids)
+        return {"ok": True, "out": f"{n} held message(s) " + ("marked handled" if on else "back in the alert")}
 
     def box_command(self, bid: str, what: str) -> dict:
         """A box's menu: empty what waits in it (purged, senders told), close a session box, delete a project box (or
@@ -1956,6 +2289,9 @@ class State:
                         why = f"does not verify: {ex}"
                 if payload and payload.get("kind") == "question":
                     self.questions.add(u, sender, payload, card, known=sender in peers)
+                elif payload and payload.get("kind") == "recap":  # a session's work is over: kept until deleted
+                    if (rc := self.recaps.add(u, sender, payload, card)) and self.desktop:
+                        self.desktop.recap({**rc, "label": rc.get("label") or card.get("label")})
                 elif payload and payload.get("kind") == "op_result":  # a daemon's answer to an op this console sent
                     res = getattr(self, "op_results", {})
                     res[str(payload.get("re") or payload.get("id"))] = {"from": sender, "label": card.get("label"), "server": u,
@@ -2079,7 +2415,10 @@ class State:
     def tuning(self) -> dict:
         eff = M.apply_tuning()
         t = (M.Local(M.MACHINE_PROFILE).load("config.json", {}) or {}).get("tuning") or {}
-        return {"effective": eff, "set": t, "env": {k: os.environ.get(e) for k, (e, _, _) in M.TUNABLE.items() if os.environ.get(e)},
+        on_done = M.on_done() if hasattr(M, "on_done") else None  # an older client: no such setting
+        return {"effective": {**eff, **({"on_done": on_done} if on_done else {})}, "set": t,
+                "env": {k: os.environ.get(e) for k, (e, _, _) in M.TUNABLE.items() if os.environ.get(e)}
+                | ({"on_done": os.environ["MMBOX_ON_DONE"]} if os.environ.get("MMBOX_ON_DONE") else {}),
                 "help": {k: v[2] for k, v in M.TUNABLE.items()}}
 
     def check_startup(self, servers: list[dict]) -> None:
@@ -2693,6 +3032,20 @@ class State:
                     activity.append({"id": f"{u}#{ev['entry']}", "ev": kind, "box": ev.get("box"), "t": t, "server": u,
                                      "reason": ev.get("reason")})
 
+        # 4. the recaps the sessions sent this console when their work was over (kept until the operator deletes them)
+        recap_ids = set()
+        for rc in self.recaps.all():
+            m = msg(rc["id"], ts=rc.get("ts"), frm=rc.get("from"), to=rc.get("to") or self.op.id)
+            from_payload(m, rc, "full")
+            m["state"], m["to_operator"] = "delivered", True
+            m["recap"] = {"then": rc.get("then"), "received_at": rc.get("received_at"),
+                          "open_questions": rc.get("open_questions") or []}
+            if rc.get("server") and rc["server"] not in m["servers"]:
+                m["servers"].append(rc["server"])
+            if "recap" not in m["sources"]:
+                m["sources"].append("recap")
+            recap_ids.add(rc["id"])
+
         # stranded: still in a box that closed (on this computer, or by what a collector saw last) and is not active now
         active_now = {b["id"] for b in boxes.values() if b.get("active") and "table" in b.get("sources", [])}
         closed_here = {y.id for y in profiles.values() if y.closed_at}
@@ -2710,6 +3063,9 @@ class State:
                 m.pop("held", None)
                 continue
             m["held"] = m.get("held") or {"since": _ms(m.get("ts")) or int(time.time() * 1000)}
+            ack = (self.console_state.get("held_ack") or {}).get(m["id"])
+            if ack:  # the operator marked it handled: still queued, no longer in the alert
+                m["held"] = {**m["held"], "ack": ack}
 
         # labels and the relations of each message to the boxes
         for m in msgs.values():
@@ -2723,8 +3079,24 @@ class State:
             k = m.get("kind")
             m["tier"] = tier_of(m)
         purged = self.purged  # what the purge removed stays gone, unless it waits in a box again
-        for mid in [i for i, m in msgs.items() if i in purged and m.get("state") not in WAITING]:
+        for mid in [i for i, m in msgs.items() if i in purged and m.get("state") not in WAITING and i not in recap_ids]:
             del msgs[mid]
+        if not self.debug_all():  # only the useful messages: what still waits, what waits for the user, the operator's
+            open_ids = {i for i, b in boxes.items() if b.get("active") or (b.get("local") and not b.get("closed_at"))}
+            decided = set(self.questions.decisions)
+            pending_q = {q.get("re") for q in self.questions.pending() if q.get("re")}
+
+            def useful(m):
+                if m["id"] in recap_ids or m.get("kind") in ("question", "recap") or m.get("to") == self.op.id:
+                    return True  # written to the operator: kept until the operator deletes it
+                if m.get("broadcast"):
+                    return False
+                st = m.get("state")
+                if st in WAITING and not (st == "sent" and m.get("from") not in open_ids):
+                    return True  # still in a box (or queued by its sender); "sent" by a box gone: done
+                return (m.get("handled") == "ask" and m["id"] not in decided) or m["id"] in pending_q
+            for mid in [i for i, m in msgs.items() if not useful(m)]:
+                del msgs[mid]
         for m in msgs.values():  # answered: a later message of the thread, from another box than the asker
             o = msgs.get(m.get("re") or "")
             if o and not o.get("broadcast") and m.get("from") and m["from"] != o.get("from") \
@@ -2760,7 +3132,7 @@ class State:
                 "notify": self.notify_settings(), "sounds": SOUNDS,
                 "custom_sound": (self.console_state.get("custom_sound") or None),
                 "pinned": self.archive.pinned(), "conv_ttl": self.archive.overrides(),
-                "purge_keep_s": self.purge_keep_s()}
+                "purge_keep_s": self.purge_keep_s(), "debug_all": self.debug_all()}
         d = hashlib.sha256(json.dumps(snap, sort_keys=True, default=str).encode()).hexdigest()
         if d != self.digest:
             self.digest = d
@@ -2799,8 +3171,10 @@ def tier_of(m: dict) -> int:
         return 3
     if k is None:
         return 3
-    if k in ("task", "request", "reply", "info", "question", "answer"):
+    if k in ("task", "request", "reply", "info", "question", "answer", "recap"):
         return 1
+    if k == "forward" and ((m.get("forwarded") or {}).get("kind") or "") in ("task", "request", "reply", "info"):
+        return 1  # a message passed on (relayed, given back, moved by the operator): as essential as what it carries
     return 2
 
 
@@ -2928,10 +3302,20 @@ def act(state: State, body: dict) -> dict:
             return {"ok": False, "err": "level: off, meta, subject or full"}
         threading.Thread(target=state.refresh, daemon=True).start()
         return r
+    if a == "debug_all":  # Settings: keep every message in the list (debug), or only the useful ones
+        state.console_state["debug_all"] = bool(body.get("on"))
+        state.save_console_state()
+        state.digest = ""
+        threading.Thread(target=state.refresh, daemon=True).start()
+        return {"ok": True, "debug_all": state.debug_all()}
     if a == "tune":
         args = ["tune"]
         if body.get("reset"):
             args.append("--reset")
+        if body.get("on_done") not in (None, ""):
+            if body["on_done"] not in M.ON_DONE:
+                return {"ok": False, "err": "on_done: " + " or ".join(M.ON_DONE)}
+            args += ["--on-done", body["on_done"]]
         for k in M.TUNABLE:
             v = body.get(k)
             if v not in (None, ""):
@@ -2955,6 +3339,21 @@ def act(state: State, body: dict) -> dict:
         state.save_console_state()
         state._usage = (0.0, {})
         return {"ok": True, "purge_keep_s": v}
+    if a == "held_ack":  # the held alert: a message (or all of a recipient's) marked handled, or back in the alert
+        ids = body.get("ids")
+        if not isinstance(ids, list) or len(ids) > 5000:
+            return {"ok": False, "err": "ids: a list of message ids"}
+        return state.held_ack(ids, body.get("on", True) is not False)
+    if a == "move_messages":  # the list's batch action: waiting messages handed to another box of this computer
+        ids = body.get("ids")
+        if not isinstance(ids, list) or len(ids) > 5000:
+            return {"ok": False, "err": "ids: a list of message ids"}
+        return state.move_messages(ids, str(body.get("to") or ""))
+    if a == "delete_messages":  # the open message: itself (its menu) or its whole thread (the reader's bin)
+        ids = body.get("ids")
+        if not isinstance(ids, list) or len(ids) > 5000:
+            return {"ok": False, "err": "ids: a list of message ids"}
+        return state.delete_messages(ids)
     if a == "box_purge":  # a box's menu: its history, from this computer
         return state.purge_box(str(body.get("id") or ""))
     if a in ("box_empty", "box_close", "box_delete"):  # a box's menu: what waits in it, closing, deleting

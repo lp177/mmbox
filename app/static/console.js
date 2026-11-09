@@ -76,7 +76,7 @@ async function action(body) {
 const S = {
   snap: null, version: 0, boxes: new Map(), servers: new Map(), msgs: [], byId: new Map(),
   node: { type: "all", key: null }, selected: null, limit: 300, expanded: new Set(["machines", "servers"]),
-  freshLate: new Set(), startupShown: false,
+  freshLate: new Set(), startupShown: false, checked: new Set(),  // checked: the list's selection (batch actions)
 };
 const FKEY = "mmbox-console-filters";
 const F = Object.assign({ view: "all", dir: "both", tier: "1", period: "604800", sort: "desc", group: "none", source: "all", search: "", treeActive: false, boxActive: true,
@@ -127,11 +127,15 @@ const boxLabel = (id) => { const b = boxOf(id); return b.label || b.alias || id;
 // the state of a direct message in words: who took it (the session behind a machine box when known), answered
 // held: its sender keeps it queued and the service refuses it (the recipient does not accept the sender yet)
 const HELD_AFTER = 300e3, HELD_RETRY = 1800e3;  // mmbox_console.py: HELD_AFTER_S, HELD_RETRY_S
-const isHeld = (m) => !m.broadcast && m.state === "queued" && !!m.held && Date.now() - m.held.since >= HELD_AFTER;
+const isHeld = (m) => !m.broadcast && m.state === "queued" && !!m.held && !m.held.ack && Date.now() - m.held.since >= HELD_AFTER;
+// held, but the operator marked it handled: still queued by its sender, out of the alert
+const heldAcked = (m) => !m.broadcast && m.state === "queued" && !!m.held?.ack;
 const heldAge = (m) => ago((Date.now() - m.held.since) / 1000).replace(" ago", "");
 const heldSilent = (m) => !!m.held && !m.held.local && Date.now() - (m.held.last || m.held.since) > HELD_RETRY;
 function stateText(m) {
+  if (m.recap) return m.recap.then === "listen" ? "recap · still listening" : "recap · box closed";
   if (isHeld(m)) return "held " + heldAge(m);
+  if (heldAcked(m)) return `held ${heldAge(m)} (handled)`;
   if (m.broadcast) return STATE_TXT[m.state] || m.state || "";
   if ((m.answers || []).length) return "answered";
   if (m.state !== "read") return STATE_TXT[m.state] || m.state || "";
@@ -945,9 +949,11 @@ const isForward = (m) => m.kind === "forward" || !!m.forwarded;
 function msgRow(m) {
   const unread = isUnread(m);
   const late = isLate(m);
-  return h("div", { class: "msg ripple" + (unread ? " unread" : "") + (late ? " late" + (S.freshLate.has(m.id) ? " fresh-late" : "") : "") + (isForward(m) ? " forward" : "") + (isHeld(m) ? " held" : ""),
+  return h("div", { class: "msg ripple" + (S.checked.has(m.id) ? " checked" : "") + (unread ? " unread" : "") + (late ? " late" + (S.freshLate.has(m.id) ? " fresh-late" : "") : "") + (isForward(m) ? " forward" : "") + (isHeld(m) ? " held" : ""),
     title: late ? `unread for ${ago((Date.now() - tsOf(m)) / 1000).replace(" ago", "")}` : null, role: "option", id: "m-" + m.id, tabindex: "-1",
     "aria-selected": String(S.selected === m.id), dataset: { id: m.id } },
+    h("input", { type: "checkbox", class: "check msg-check", tabindex: "-1", checked: S.checked.has(m.id),
+      "aria-label": "Select " + (m.subject || m.id), title: "Select (x; Shift+click: a range)" }),
     h("span", { class: "state" }, h("span", { class: "dot " + (unread ? "listening" : ["queued", "dropped", "stranded"].includes(m.state) ? "closed" : "") })),
     h("span", { class: "line1" }, m.kind ? h("span", { class: "chip " + m.kind }, m.kind) : h("span", { class: "chip" }, "?"),
       stateChip(m), h("span", { class: "route" }, route(m)),
@@ -992,8 +998,11 @@ function renderList() {
   (sel || $(".msg", list))?.setAttribute("tabindex", "0");
   if (hadFocus) (sel || list).focus({ preventScroll: true });  // a refresh does not take the keyboard away
   if (RD.open && RD.from === "list") readerNav();
+  syncChecks();
 }
 $("#list").addEventListener("click", (e) => {
+  const cb = e.target.closest(".msg-check");
+  if (cb) { checkRow(cb.closest(".msg").dataset.id, cb.checked, e.shiftKey); return; }
   const row = e.target.closest(".msg");
   if (row) openMessage(row.dataset.id);
 });
@@ -1007,10 +1016,80 @@ $("#list").addEventListener("keydown", (e) => {
   else if (e.key === "Home") i = 0;
   else if (e.key === "End") i = rows.length - 1;
   else if (e.key === "Enter" || e.key === " ") { openMessage(cur.dataset.id); e.preventDefault(); return; }
+  else if (e.key === "x" && !e.ctrlKey && !e.metaKey && !e.altKey) { checkRow(cur.dataset.id, !S.checked.has(cur.dataset.id), e.shiftKey); e.preventDefault(); return; }
+  else if (e.key === "Delete" && S.checked.size) { e.preventDefault(); batchDelete(); return; }
+  else if (e.key === "Escape" && S.checked.size) { e.preventDefault(); S.checked.clear(); syncChecks(); return; }
   else return;
   e.preventDefault();
   rows.forEach((r) => (r.tabIndex = -1));
   S.selected = rows[i].dataset.id; markRow(S.selected); rows[i].focus();
+});
+
+// ---------------------------------------------------------------- selection and batch actions (the list)
+// A checkbox at the start of each row, one in the header that selects every message shown (indeterminate when some
+// are); Shift+click or Shift+x selects a range, x one row, Delete deletes the selection, Escape clears it.
+const SEL = { last: null };
+const shownIds = () => $$(".msg", $("#list")).map((r) => r.dataset.id);
+function syncChecks() {
+  const ids = shownIds(), shown = new Set(ids);
+  for (const id of [...S.checked]) if (!shown.has(id)) S.checked.delete(id);  // what the filters hide is not acted upon
+  const n = S.checked.size, all = $("#sel-all");
+  all.checked = n > 0 && n === ids.length;
+  all.indeterminate = n > 0 && n < ids.length;
+  all.disabled = !ids.length;
+  $("#batch").hidden = !n;
+  $("#batch-n").textContent = `${n} selected`;
+  for (const r of $$(".msg", $("#list"))) {
+    const on = S.checked.has(r.dataset.id);
+    r.classList.toggle("checked", on);
+    const c = $(".msg-check", r);
+    if (c && c.checked !== on) c.checked = on;
+  }
+}
+function checkRow(id, on, range) {
+  const ids = shownIds();
+  const a = range && SEL.last ? ids.indexOf(SEL.last) : -1, b = ids.indexOf(id);
+  for (const x of a >= 0 && b >= 0 ? ids.slice(Math.min(a, b), Math.max(a, b) + 1) : [id]) on ? S.checked.add(x) : S.checked.delete(x);
+  SEL.last = id;
+  syncChecks();
+}
+$("#sel-all").addEventListener("change", (e) => {
+  const ids = shownIds();
+  if (e.target.checked) ids.forEach((i) => S.checked.add(i)); else S.checked.clear();
+  SEL.last = null;
+  syncChecks();
+});
+$("#batch-clear").addEventListener("click", () => { S.checked.clear(); syncChecks(); $("#sel-all").focus(); });
+async function batchDelete() {
+  if (!S.checked.size) return;
+  await deleteMessages([...S.checked], "batch");
+}
+$("#batch-delete").addEventListener("click", batchDelete);
+const localWaiting = (m) => m && m.state === "unread" && (m.sources || []).some((s) => s.startsWith("waiting:"));
+$("#batch-move").addEventListener("click", async () => {
+  const ids = [...S.checked], movable = ids.filter((i) => localWaiting(S.byId.get(i)));
+  const boxes = [...S.boxes.values()].filter((b) => b.local && !b.closed_at && !b.retired_at)
+    .sort((a, b) => (a.role === "session") - (b.role === "session") || boxName(a.id).localeCompare(boxName(b.id)));
+  const ROLE = { machine: "machine box", project: "project box", butler: "butler", session: "session" };
+  $("#move-to").replaceChildren(...boxes.map((b) => h("option", { value: b.id }, `${boxName(b.id)} · ${ROLE[b.role] || b.role || "session"}${b.work ? " · " + b.work : ""}`)));
+  $("#move-text").textContent = !movable.length
+    ? `None of the ${ids.length} selected message(s) waits unread in a box of this computer: only those move (taken ones were read already; another computer's box is its own).`
+    : `${movable.length} of the ${ids.length} selected message(s) wait unread in a box of this computer: each goes to the box chosen below, with its first sender, its rights and its date, and leaves the box it waits in.`
+      + (movable.length < ids.length ? ` The ${ids.length - movable.length} other(s) stay where they are.` : "");
+  $("#move-ok").disabled = !movable.length || !boxes.length;
+  const dlg = $("#move-dialog");
+  dlg.returnValue = "";
+  dlg.showModal();
+  dlg.addEventListener("close", async () => {
+    if (dlg.returnValue !== "ok") return;
+    const to = $("#move-to").value;
+    const r = await action({ action: "move_messages", ids: movable, to }).catch((x) => ({ ok: false, err: x.message }));
+    if (!r.ok && !(r.moved || []).length) { showOutput("Move", r); return; }
+    for (const i of r.moved || []) S.checked.delete(i);
+    syncChecks();
+    r.ok ? toast(r.out || "Moved") : showOutput("Move", r);
+    setTimeout(() => poll(true), 800);
+  }, { once: true });
 });
 
 // ---------------------------------------------------------------- the message
@@ -1291,11 +1370,20 @@ function renderDetail(m, partial) {
     h("p", { class: "held-help" }, `${boxName(m.from)} keeps it and sends it again by itself. The service refuses it`
       + (m.held.why === "full" ? " because the recipient's box is full" : " because the recipient does not list the sender yet: no client of its computer has run since the sender's box was introduced to it")
       + ". It leaves as soon as a session of that computer runs" + (m.held.why === "full" ? " and empties its box" : "") + "; if the recipient's box closes meanwhile, it goes to its machine box. Nothing to send again."
-      + (heldSilent(m) ? ` Its sender has not retried since ${fmtFull.format(new Date(m.held.last || m.held.since))}: its computer may be off too.` : ""))) : null;
+      + (heldSilent(m) ? ` Its sender has not retried since ${fmtFull.format(new Date(m.held.last || m.held.since))}: its computer may be off too.` : "")),
+    h("div", { class: "held-actions" }, h("button", { class: "btn small ripple", type: "button", title: "Out of the alert; its sender still keeps it and sends it again by itself",
+      onclick: () => heldAck([m.id]) }, "Mark handled"))) : heldAcked(m) ? h("div", { class: "notice held-acked" },
+    `Held for ${heldAge(m)}, marked handled ${when(m.held.ack)}: out of the alert. ${boxName(m.from)} still keeps it and sends it again by itself. `,
+    h("button", { class: "btn small text ripple", type: "button", onclick: () => heldAck([m.id], false) }, "Alert again")) : null;
+  const rc = m.recap;
+  const recapBlock = rc ? h("div", { class: "notice" }, h("strong", {}, `${m.sender_title || boxName(m.from)} finished its work`), h("br"),
+    (rc.then === "listen" ? "It keeps listening for messages." : "Its box closed and it stopped listening: what still reaches it goes to its machine box.")
+    + (rc.open_questions?.length ? ` ${rc.open_questions.length} of its questions were still open.` : "")
+    + " This recap stays here until you delete it (⋮ menu).") : null;
   const actBlock = m.sender_activity ? h("div", { class: "activity" }, h("strong", {}, `Activity of ${m.sender_title || boxName(m.from)} when sending`), m.sender_activity) : null;
   const body = typeof m.body === "string" ? m.body : m.preview;
   d.replaceChildren(h("div", { class: "detail" },
-    h("h2", {}, m.subject || (m.lock ? `Lock ${m.lock.name}` : "(no subject)")), chips, heldBlock, meta, fwBlock, actBlock,
+    h("div", { class: "detail-title" }, h("h2", {}, m.subject || (m.lock ? `Lock ${m.lock.name}` : "(no subject)")), msgMenuBtn(m)), chips, heldBlock, recapBlock, meta, fwBlock, actBlock,
     body ? h("pre", { class: "body", tabindex: "0", "aria-label": "Message body" }, body + (partial && m.body_len > (m.preview || "").length ? "…" : ""))
       : h("p", { class: "notice" }, m.level === "meta" || m.level === "subject"
         ? "The content is not sent to the collector at this annotation level (a setting of the sending computer)."
@@ -1303,13 +1391,121 @@ function renderDetail(m, partial) {
     m.attachments?.length ? [h("h3", { class: "dim att-head" }, `Attachments (${m.attachments.length})`), attachmentsBlock(m, "detail")] : null,
     decisionBlock(m),
     thread.length ? [h("h3", { class: "dim" }, "Same thread"), h("ul", { class: "thread" }, thread.sort((a, b) => tsOf(a) - tsOf(b)).map((x) =>
-      h("li", {}, h("button", { type: "button", onclick: () => openMessage(x.id) }, `${when(tsOf(x))} · ${boxName(x.from)}: ${x.subject || x.id}`))))] : null,
+      h("li", {}, h("button", { type: "button", onclick: () => openMessage(x.id) }, `${when(tsOf(x))} · ${boxName(x.from)}: ${x.subject || x.id}`), msgMenuBtn(x))))] : null,
     h("div", { class: "actions" },
       replyTarget(m) ? h("button", { class: "btn filled ripple reply-btn", type: "button", onclick: () => openReply(RP.id === m.id && RP.msg ? RP.msg : m) },
         m.broadcast ? "Reply to the author" : replyTarget(m).to === m.from ? "Reply" : "Write again") : null,
       h("button", { class: "btn ripple", type: "button", onclick: () => navigator.clipboard?.writeText(m.id).then(() => toast("Id copied")) }, "Copy the id")),
     h("details", { class: "raw" }, h("summary", {}, "Raw data"), h("pre", {}, JSON.stringify(m, null, 1)))));
 }
+
+// ---------------------------------------------------------------- a message's menu (⋮) and deleting messages from this computer
+// The open message and each message of its thread have a ⋮ menu: delete it, delete its whole thread, open it, copy its
+// id. The reader's bin deletes the open message's whole thread. Delete: the message, Shift+Delete: the thread.
+function threadOf(id) {
+  const kids = new Map();
+  for (const x of S.msgs) if (x.re) { if (!kids.has(x.re)) kids.set(x.re, []); kids.get(x.re).push(x.id); }
+  const seen = new Set([id]), todo = [id];
+  while (todo.length) {
+    const cur = todo.pop(), m = S.byId.get(cur);
+    for (const n of [m?.re, ...(kids.get(cur) || [])]) if (n && !seen.has(n) && S.byId.has(n)) { seen.add(n); todo.push(n); }
+  }
+  return [...seen];
+}
+function msgMenuBtn(m) {
+  return h("button", { class: "btn icon ripple msg-menu-btn", type: "button", "aria-haspopup": "menu", "aria-expanded": "false",
+    "aria-label": `More for ${m.subject || m.id}`, title: "Delete, copy the id", dataset: { mid: m.id } }, svg(ICON.more));
+}
+function confirmAsk(title, text, okLabel) {
+  const dlg = $("#confirm");
+  $("#confirm-title").textContent = title; $("#confirm-text").textContent = text;
+  $("#confirm-ok").textContent = okLabel;
+  dlg.returnValue = "";
+  return new Promise((done) => { dlg.addEventListener("close", () => done(dlg.returnValue === "ok"), { once: true }); dlg.showModal(); });
+}
+async function deleteMessages(ids, mode) {
+  const thread = mode === true || mode === "thread", batch = mode === "batch";
+  ids = [...new Set(ids)].filter(Boolean);
+  if (!ids.length) return;
+  const one = S.byId.get(ids[0]) || (RP.msg?.id === ids[0] ? RP.msg : null);
+  const here = (i) => (S.byId.get(i)?.sources || []).some((s) => s.startsWith("waiting:"));
+  const unboxed = ids.filter((i) => ["unread", "taken"].includes(S.byId.get(i)?.state) && here(i)).length;
+  const waiting = ids.filter((i) => ["queued", "sent", "unread", "taken"].includes(S.byId.get(i)?.state) && !here(i)).length;
+  const title = thread ? `Delete this thread (${ids.length} message${ids.length > 1 ? "s" : ""})?`
+    : batch && ids.length > 1 ? `Delete the ${ids.length} selected messages?` : `Delete “${one?.subject || ids[0]}”?`;
+  const text = (thread ? "Every message of this thread goes" : batch && ids.length > 1 ? "These messages go" : "This message goes") + " from this computer for good: the boxes' logs, "
+    + "their attached files and the console's copy. The other computers keep theirs."
+    + (!unboxed ? "" : ids.length === 1 ? " It still waits unread in a box of this computer: it is taken out of it, unread, and its sender is told."
+      : ` ${unboxed} of them still wait${unboxed > 1 ? "" : "s"} unread in a box of this computer: taken out of it, unread, their senders told.`)
+    + (!waiting ? "" : ids.length === 1 ? " It waits in another computer's box, or in its sender's outbox: it stays until taken."
+      : ` ${waiting} of them wait${waiting > 1 ? "" : "s"} in another computer's box or an outbox: ${waiting > 1 ? "they stay" : "it stays"} until taken.`);
+  if (!(await confirmAsk(title, text, "Delete"))) return;
+  const r = await action({ action: "delete_messages", ids }).catch((x) => ({ ok: false, err: x.message }));
+  if (!r.ok && !(r.deleted || []).length) { showOutput("Delete", r); return; }
+  const gone = new Set(r.deleted || []);
+  const seq = readerSeq(), i = seq.indexOf(RD.open);
+  S.msgs = S.msgs.filter((m) => !gone.has(m.id)); for (const x of gone) { S.byId.delete(x); S.checked.delete(x); }
+  if (RD.open && gone.has(RD.open)) {  // one message: the next of the list that stays; a thread: back to the list
+    const next = seq.slice(i + 1).find((x) => !gone.has(x)) || seq.slice(0, Math.max(0, i)).reverse().find((x) => !gone.has(x));
+    if (next && !thread) openMessage(next); else closeReader();
+  } else if (RD.open) renderDetail(RP.msg?.id === RD.open ? RP.msg : S.byId.get(RD.open), false);
+  renderTree(); renderList(); renderHeld();
+  r.ok ? toast(r.out || "Deleted") : showOutput("Delete", r);
+  setTimeout(() => poll(true), 800);
+}
+const MM = { el: $("#msg-menu"), id: null, btn: null, fromPointer: false };
+const mmItems = () => $$('[role="menuitem"]', MM.el).filter((b) => !b.hidden && !b.disabled);
+function openMsgMenu(btn, fromPointer) {
+  const id = btn.dataset.mid, m = S.byId.get(id) || (RP.msg?.id === id ? RP.msg : null);
+  if (MM.el.matches(":popover-open")) MM.el.hidePopover();
+  Object.assign(MM, { id, btn, fromPointer });
+  const n = S.byId.has(id) ? threadOf(id).length : 1;
+  $("#msg-menu-title").textContent = m?.subject || id;
+  $("#msg-menu-thread").hidden = n < 2;
+  $("#msg-menu-thread-n").textContent = `${n} messages`;
+  $("#msg-menu-open").hidden = RD.open === id;
+  try { MM.el.showPopover({ source: btn }); } catch { MM.el.showPopover(); }
+}
+MM.el.addEventListener("toggle", (e) => {
+  const open = e.newState === "open";
+  MM.btn?.setAttribute("aria-expanded", String(open));
+  if (open) {
+    const b = MM.btn.getBoundingClientRect(), r = MM.el.getBoundingClientRect();
+    MM.el.style.left = Math.max(8, Math.min(b.right - r.width, window.innerWidth - r.width - 8)) + "px";
+    MM.el.style.top = (b.bottom + 4 + r.height > window.innerHeight - 8 ? Math.max(8, b.top - r.height - 4) : b.bottom + 4) + "px";
+    mmItems()[0]?.focus({ focusVisible: !MM.fromPointer });
+  } else if (MM.btn?.isConnected && (MM.el.contains(document.activeElement) || document.activeElement === document.body)) MM.btn.focus();
+});
+MM.el.addEventListener("keydown", (e) => {
+  const items = mmItems(), i = items.indexOf(document.activeElement);
+  if (e.key === "Tab") { MM.el.hidePopover(); return; }
+  const j = e.key === "ArrowDown" ? (i + 1) % items.length : e.key === "ArrowUp" ? (i - 1 + items.length) % items.length : e.key === "Home" ? 0 : e.key === "End" ? items.length - 1 : -1;
+  if (j < 0) return;
+  e.preventDefault(); items[j].focus();
+});
+MM.el.addEventListener("pointermove", (e) => { const it = e.target.closest('[role="menuitem"]'); if (it && document.activeElement !== it) it.focus({ focusVisible: false }); });
+MM.el.addEventListener("click", (e) => {
+  const it = e.target.closest("[data-mact]"), id = MM.id;
+  if (!it || !id) return;
+  MM.el.hidePopover();
+  ({ delete: () => deleteMessages([id], false), thread: () => deleteMessages(threadOf(id), true), open: () => openMessage(id),
+    copy: () => navigator.clipboard?.writeText(id).then(() => toast("Id copied")) })[it.dataset.mact]?.();
+});
+$("#detail").addEventListener("click", (e) => { const b = e.target.closest(".msg-menu-btn"); if (b) openMsgMenu(b, e.detail !== 0); });
+$("#reader-delete").append(svg(ICON.trash));
+$("#reader-delete").addEventListener("click", () => RD.open && deleteMessages(S.byId.has(RD.open) ? threadOf(RD.open) : [RD.open], true));
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Delete" || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || $("#view-messages").hidden || document.querySelector("dialog[open]")) return;
+  if (!RD.open) {  // the list: Delete deletes the checked messages (focus on a row, a checkbox, the batch bar)
+    if (!S.checked.size || e.target.closest?.('textarea, select, [contenteditable], [role="menu"], #tree, input:not(.check)')) return;
+    e.preventDefault();
+    batchDelete();
+    return;
+  }
+  if (e.target.closest?.('input, textarea, select, [contenteditable], [role="menu"], #tree')) return;
+  e.preventDefault();
+  deleteMessages(e.shiftKey && S.byId.has(RD.open) ? threadOf(RD.open) : [RD.open], e.shiftKey);
+});
 
 // ---------------------------------------------------------------- a message its box asked its user about (`ask` rights)
 const DC = { notes: new Map() };
@@ -1728,12 +1924,33 @@ function renderHeld() {
         h("span", { class: "held-to" }, h("strong", {}, recipientName(g.to))),
         h("span", { class: "dim" }, ` — ${g.msgs.length} message${g.msgs.length > 1 ? "s" : ""} for ${heldAge(oldest)}, from ${[...g.from].map(boxName).join(", ")}`
           + (silent ? "; their sender has not retried for 30 min (its computer may be off too)" : "")),
-        h("button", { class: "btn small text ripple", type: "button", onclick: () => showHeld(g.to) }, "Show"));
+        h("button", { class: "btn small text ripple", type: "button", onclick: () => showHeld(g.to) }, "Show"),
+        h("button", { class: "btn small text ripple", type: "button", title: "Out of the alert; its sender still keeps it and sends it again by itself",
+          onclick: () => heldAck(g.msgs.map((m) => m.id)) }, g.msgs.length > 1 ? `Mark the ${g.msgs.length} handled` : "Mark handled"),
+        g.msgs.length > 1 ? h("ul", { class: "held-sub" }, g.msgs.sort((a, b) => a.held.since - b.held.since).map((m) =>
+          h("li", {},
+            h("span", { class: "held-subj" }, `${m.subject || m.kind || m.id}`),
+            h("span", { class: "dim" }, ` — for ${heldAge(m)}, from ${boxName(m.from)}`),
+            h("button", { class: "btn small text ripple", type: "button", onclick: () => openMessage(m.id) }, "Open"),
+            h("button", { class: "btn small text ripple", type: "button", onclick: () => heldAck([m.id]) }, "Mark handled")))) : null);
     })),
     h("div", { class: "held-actions" },
       h("button", { class: "btn small ripple", type: "button", onclick: () => showHeld() }, "Show them all"),
       h("button", { class: "btn small text ripple", type: "button", title: "The button above stays; the panel comes back with the next held message",
         onclick: () => { for (const m of list) heldHidden.add(m.id); try { localStorage.setItem(HKEY, JSON.stringify([...heldHidden].slice(-3000))); } catch { /* */ } renderHeld(); } }, "Hide until a new one")));
+}
+// the operator marks held messages handled (out of the alert) or puts them back in it; the sender still keeps them
+async function heldAck(ids, on = true) {
+  const r = await action({ action: "held_ack", ids, on }).catch((x) => ({ ok: false, err: x.message }));
+  if (!r.ok) { toast("Failed: " + (r.err || "?"), true); return; }
+  const now = Date.now();
+  for (const id of ids) { const m = S.byId.get(id); if (m?.held) m.held = on ? { ...m.held, ack: now } : (({ ack, ...x }) => x)(m.held); }
+  S.heldN = S.msgs.filter(isHeld).length;
+  renderHeld(); renderTree(); renderList(); heldSignals();
+  if (RD.open && ids.includes(RD.open)) renderDetail(S.byId.get(RD.open), false);
+  const n = ids.length;
+  toast(on ? (n === 1 ? "Marked handled: out of the alert" : `${n} messages marked handled`) : (n === 1 ? "Back in the alert" : `${n} messages back in the alert`));
+  setTimeout(() => poll(true), 600);
 }
 function heldSignals() {
   const list = S.msgs.filter(isHeld);
@@ -1788,6 +2005,11 @@ function renderSettings() {
     $("#t-env").textContent = Object.keys(t.env || {}).length ? "An environment variable overrides: " + Object.keys(t.env).join(", ") : "";
   }
   renderPurgeKeep();
+  const od = t?.effective?.on_done;
+  for (const r of document.querySelectorAll('input[name="on-done"]')) { r.disabled = !od; if (od && document.activeElement !== r) r.checked = r.value === od; }
+  $("#on-done-src").textContent = !od ? "The mmbox client of this computer predates this setting: update it."
+    : t.env?.on_done ? "The environment variable MMBOX_ON_DONE overrides it." : t.set?.on_done ? "" : "Default value.";
+  if (document.activeElement !== $("#d-all")) $("#d-all").checked = !!S.snap?.debug_all;
   const cols = (S.snap?.servers || []).filter((s) => s.operator && s.col_conf);
   $("#col-settings").replaceChildren(...cols.map((s) => {
     const c = s.col_conf, id = "keep-" + s.name;
@@ -1817,6 +2039,17 @@ $("#t-apply").addEventListener("click", async (e) => {
   const r = await action({ action: "tune", relay_after_s: $("#t-relay").value, relay_busy_s: $("#t-busy").value, expire_hours: $("#t-expire").value });
   busy(btn, false);
   r.ok ? toast("Delays saved for this computer") : showOutput("Delays", r);
+  poll(true);
+});
+for (const r of document.querySelectorAll('input[name="on-done"]')) r.addEventListener("change", async (e) => {
+  if (!e.target.checked) return;
+  const r2 = await action({ action: "tune", on_done: e.target.value });
+  r2.ok ? toast(e.target.value === "close" ? "A session that is done closes its box" : "A session that is done keeps listening") : showOutput("When a session's work is done", r2);
+  poll(true);
+});
+$("#d-all").addEventListener("change", async (e) => {
+  const r = await action({ action: "debug_all", on: e.target.checked });
+  r.ok ? toast(r.debug_all ? "Every message stays in the list" : "Only the useful messages in the list") : toast("Failed: " + (r.err || "?"), true);
   poll(true);
 });
 // the purge's kept delay for open sessions: a number and its unit, shown in the largest unit that divides it

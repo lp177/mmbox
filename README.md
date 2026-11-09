@@ -28,6 +28,7 @@ Website: **https://lp177.github.io/mmbox/**
   - You write to a session's box when you need its context, or to answer it.
   - You write to the machine box for anything any session of that computer can do.
   - Each session listens to both.
+  - A message meant for a project (`send --for <project>`, or its sender's own project) waits in that project's box until a session of the project takes it; a session of another project never picks it up.
 - **One pairing per pair of machines**, with a one-time code (`K3F9-482913`). A machine's sessions inherit its peers and are introduced to them automatically, with no new code.
 - **Rights per peer**, decided by the receiving side:
   - `execute`: the agent does the requested work;
@@ -36,6 +37,7 @@ Website: **https://lp177.github.io/mmbox/**
 - **Single delivery**: a message is delivered to one listener only, even when several sessions listen to the same box.
 - **Ephemeral channels**: a post for every session of the computer (`@here`) or of every known computer (`@all`), kept one minute, read once by each session, never consumed. Information or a question, never a task.
 - **Listening that wakes the agent only for news**: `wait --no-timeout`, in the background.
+- **A butler per computer** (optional): it takes what no session took within 5 minutes, resumes or starts a session of the project for it, and runs the sessions the operator starts from the console ([client/BUTLER.md](client/BUTLER.md)).
 
 ## Install
 
@@ -157,7 +159,9 @@ MMBOX --profile backend sent                     # where my sends stand: waiting
 
 - **Add the start to the agent's instructions** (`CLAUDE.md`, `AGENTS.md`…): "At the start of each session on a project that uses mmbox, run `mmbox.py start --session <name> --project <space> --agent <agent>`, then keep `mmbox.py --profile <name> wait --no-timeout` running in the background, restarted each time it returns 0." On Claude Code, `MMBOX hook install claude` adds a hook that reminds a session whose listener stopped, and recalls its questions still open in the operator console when the user writes. `hook install codex`, `hook install vibe` and `hook install gemini` do the same for Codex, Mistral Vibe and Gemini CLI.
 - **Silent session**: the relay round, one per computer, runs every 10 minutes, and about 2 minutes after a message arrives in a session box nobody listens to. It wakes the session (`ping`). If the session does not answer within 15 seconds, its messages go to the machine box, with a header that says so. If its agent is still running (a long command), its messages younger than 15 minutes wait for it.
-- **Finished session**: a box with no listener, no agent process and no command for 1 h is closed. Its peers are told, and whatever still arrives for it goes to the machine box. If the session comes back, its box reopens. It is deleted 7 days after it closed.
+- **Work done**: `MMBOX --profile backend done --recap "…"` sends what the session did to the operator console, then closes its box (the listener exits 8) or keeps listening, as the computer is set (`tune --on-done close|listen`, `close` by default).
+- **Not for this session**: `giveback <id> --why "…"` puts back a message the session took and cannot do, in the box of the project it is meant for; `move <ids…> --to <box>` hands waiting messages to another box of this computer.
+- **Finished session**: a box with no listener, no agent process and no command for 1 h is closed. Its peers are told, and whatever still arrives for it goes to its project's box (the machine box when it has none). If the session comes back, its box reopens. It is deleted 7 days after it closed.
 - **Attached files**: `send --attach FILE` (`-a`, repeatable) joins files to a message, inside its encryption and its signature: 8 files and 10 MiB in all at most (base64-encoded twice on the way, they must keep the encrypted message under the 20 MB a service takes; a service deployed before 2026-11-07 takes 700 kB only, and refuses larger messages with 413 until it is updated). Not on a broadcast (`@here`, `@all`, `chan post`). Each box that logs the message, the sender's and the recipient's, writes the files to `<profile>/attachments/<message id>/` (0600 files in 0700 folders): the log and `inbox` give their path (`attachment: <name> (<type>, <size>) -> <path>`), never their content. A file whose size or sha256 does not match is not kept, and the line says why. The folders go after 30 days (`MMBOX_ATTACH_DAYS`). A recipient whose client is older shows the body only: `send` warns about it.
 - **Refused send**: if the recipient has not yet published that it accepts you (just after a pairing, for example), the message stays queued on your workstation and goes out again by itself. `sent` shows it as `queued`.
 
@@ -231,6 +235,9 @@ It listens on 127.0.0.1 only, and each call carries the token of the printed URL
 
 - **Desktop application**: with [pywebview](https://pywebview.flowrl.com/) (Debian: `python3-webview`; WebKitGTK on Linux, WebView2 on Windows), the console opens in a window of its own, the same page as in the browser. A click on its icon in the notification area opens it, or folds it back there when it is on screen; the right button offers to open it, to open the local site in the browser, to hide the window in the notification area, or to quit. The window's close button hides it there while the icon is shown, otherwise it quits the console. Without pywebview, or with `--browser`, the icon opens the browser.
 
+- **Your account**: while the console has no account, it opens on a window that makes one (a root key in the keyring, a recovery file sealed with a passphrase) or joins one (approved from a device of the account with a code). The devices of an account are the operators the computers' daemons obey ([client/ACCOUNTS.md](client/ACCOUNTS.md)).
+- **Butler tab**: the computer's butler and daemon, run with the console: its state, a chat with it, a form to start a session (folder, agent and model, title, first task), the sessions it started with their live output, and the agents and models of each computer. "New session…" in the explorer starts one here or, through its butler, on another computer.
+- **Recaps**: what a session sends with `done --recap` is kept until you delete it, and notified.
 - **Memory**: a frame at the bottom of the explorer shows what the Redis of the services where the console is an operator holds (used / limit) and what this computer holds (the console's folder and the boxes' folder). A click opens the memory view: per service, Redis's figures (peak, policy when full, keys) and what the boxes, the channels, the collector and the traffic counts take; on this computer, the console's copy of the messages, their attached files, the window's data, and the boxes' folder. Two buttons free space, each after a confirmation:
   - **Purge the messages of this computer**: every message that no longer waits in a box goes for good: from the boxes' logs, their attached files and the console's copy, pinned conversations included. A closed box's log keeps only what still waits; an open session keeps what it sent, received or saw within the delay set in Settings (Purge, 24 hours by default, in minutes, hours or days), so that it can still answer it. A collector's events no longer bring the purged messages back.
   - **Delete every mmbox box**: on each service where the console is an operator, every box of every computer is deleted (card, peers, declaration, channel, alerts) with what waits in it, taken or not, for good (`/v1/usage` with `empty`); the operators' own box and its questions stay. A session still running registers its box again by itself at its next contact, and what is sent to it meanwhile waits in its sender's queue. The console marks the deleted messages `emptied`, and the collector notes it.
@@ -301,8 +308,12 @@ On opening, if the console has not been opened for more than 70 % of a collector
 | `gateway status`, `gateway enable … [--address]` | the state of the service for this workstation; register on it |
 | `relay` | a relay round now |
 | `boxes [--server S]` | the table of active boxes of each service: machine, project, title, activity, listening, waiting |
+| `done --recap "…"` | the session's work is over: its recap to the operator console, then its box closed or kept listening (`tune --on-done`) |
+| `giveback <id> --why "…" [--to <project\|machine>]`, `move <ids…> --to <box>` | put back a message this session cannot do in its project's box; hand waiting messages to another box of this computer |
+| `daemon run\|status\|install\|uninstall\|operator …` (also `butler …`) | the computer's daemon and its butler: run it, make it a service of the user, pin the operator or the account it obeys |
+| `hook install claude\|codex\|vibe\|gemini` | the harness hook that reminds a session whose listener stopped and recalls its open questions |
 | `activity "…"` | say what the session does (two or three sentences), without sending a message |
-| `tune [--relay-after-s S] [--relay-busy-s S] [--expire-hours H] [--reset]` | this workstation's delays: forwarding to the machine box, busy session, backlog |
+| `tune [--relay-after-s S] [--relay-busy-s S] [--expire-hours H] [--on-done close\|listen] [--reset]` | this workstation's delays: forwarding to the machine box, busy session, backlog; what `done` does |
 | `collector status`, `collector enable <service> --level L --fingerprint F`, `collector disable <service>` | what this workstation annotates for a service's collector; the pinned operator key (`--level off`: for questions only) |
 | `question --text "…" --option "…" [--option …] [--re <id>]`, `question --withdraw <id> --answer "…"`, `question --open` | ask the user in the operator console; the answer comes back as ANSWER. Withdraw a question the user answered in the chat, with that answer (the console shows "Answered in the IDE: …"). List this box's questions still open |
 | `rights [<peer\|local\|@service\|projects\|project:<name>\|projects@service> <execute\|ask\|archive\|follow>]` | what this workstation does with the messages of a remote workstation and its sessions, of a box, of the sessions of this computer (`local`), or of a whole network (`@<service>`, takes precedence). The sessions of other projects of this computer: `projects` (the computer), `project:<name>` (one project), `projects@<service>` (a network's default); the most precise wins (box, project, computer, network, then ask). Also in the console's ⋮ menus |
@@ -335,11 +346,12 @@ On opening, if the console has not been opened for more than 70 % of a collector
 
 - **What the service sees**: who writes to whom, when, and the size of the messages. Never their content: each message is encrypted for its recipient.
 - **What the service accepts**:
-  - no account or token: each request is signed by the identity's key, with replay protection;
+  - no account or token for a box: each request is signed by the identity's key, with replay protection;
   - a box only accepts the peers it has declared; a channel, only posts from its owner's peers.
 - **What the service cannot do**: read or forge a message. It can, however, delay or lose one. In that case, the sender sees it with `sent` and gets an alert after 7 days.
 - **Channels**: the service sees who posts on which channel, when, the size and the lifetime, never the content. A post cannot pass for a message (another envelope type, another key), and it is never a task.
 - **The table of active boxes**: each identity sees itself, its peers and the sessions of their machines in it; an operator sees everything. It carries only what each box declares (role, machine, project, title, activity, hostname).
+- **Operators and daemons**: a daemon acts (starts or stops a session, types into one) only on an `op` signed by the operator key it pinned or by a device of the account it pinned, never on a peer's message, whatever its rights. An account's devices form a signed chain the service keeps but cannot write: a new device is approved by a device already in it, with a code ([client/ACCOUNTS.md](client/ACCOUNTS.md)).
 - **Questions**: a box can write to the service's operator without pairing, and the operator can answer an open box of the service. Both are end-to-end encrypted and signed messages. A client accepts an answer (`answer`) only from the operator key its user pinned, and nothing else from that key. A question from a box unknown to this workstation is flagged as such in the console.
 - **The collector** (off by default) keeps what the service already sees, plus the annotations encrypted for the operator that each computer chose to send. Never put a secret in an activity: the service can read it.
 - **Private keys** are in a 0600 file of the profile, in `~/.config/mmbox/<profile>/` or `%APPDATA%\mmbox\<profile>\`. If this folder is copied, create the identity again and have your peers revoke the old one.
@@ -387,6 +399,8 @@ deploy/mmbox-server.sh up --ssh admin@server.example.com --bind 10.8.0.1 # a VPN
 
 ```text
 client/mmbox.py, client/PROTOCOL.md   the client (a single file) and its protocol
+client/mmbox_daemon.py, BUTLER.md     the computer's daemon and butler (beside mmbox.py)
+client/mmbox_account.py, ACCOUNTS.md  operator accounts: root key, device chain
 app/                                  the operator console (optional): mmbox_console.py, static/
 gateway/                              the service: mmbox_gateway.py, Containerfile, requirements.txt
 deploy/mmbox-server.sh                host a service in containers, here or over SSH

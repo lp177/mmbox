@@ -41,7 +41,8 @@ Keys (all under mmbox:, the only prefix the gateway's Redis user may touch):
                         key (never readable by the service). Read by the operators only (MMBOX_OPERATORS)
 
 Nothing grows without end: card, links and box of an identity expire after IDLE_TTL without any request from it (it
-registers again on its next one); an entry older than KEEP_MS is cut from its box at the next send; a box holds
+registers again on its next one); an entry older than KEEP_MS is cut from its box at the next send (never from an
+operator's box: questions and recaps wait for its console); a box holds
 MAX_ENTRIES entries at most (the sender then falls back to memories); /v1/close removes a closed session's box. A
 channel keeps CHAN_MAX_TTL_S of entries at most, MAX_CHAN_ENTRIES at most, and disappears CHAN_MAX_TTL_S + 60 s after its last post.
 
@@ -579,15 +580,18 @@ async def send(request: web.Request) -> web.Response:
             raise _http(404, "no such box on this service (removed, or expired)")
         if (_loads(await r.get(f"mmbox:box:{to}")) or {}).get("closed_ms"):
             raise _http(410, "this box closed: write to its machine box")
-    elif not await is_operator(r, to) and not await r.hexists(f"mmbox:links:{to}", me):
+    to_op = not me_op and await is_operator(r, to)
+    if not me_op and not to_op and not await r.hexists(f"mmbox:links:{to}", me):
         await refused(r, me, to, env, data, "not_listed")
         raise _http(403, "the recipient does not list the sender among its peers (not paired, or its links are not synced)")
     box = f"mmbox:in:{to}"
     if await r.xlen(box) >= MAX_ENTRIES:
         await refused(r, me, to, env, data, "full")
         raise _http(429, f"the recipient's box is full ({MAX_ENTRIES} entries waiting): the sender keeps it queued")
-    minid = f"{int(time.time() * 1000) - KEEP_MS}-0"  # what nobody took within the clients' keep time goes
-    entry = await r.xadd(box, {"from": me, "env": raw}, minid=minid, approximate=True)
+    # what nobody took within the clients' keep time goes; an operator's box keeps everything (questions, the sessions'
+    # recaps) until its console takes it, however long it was away
+    minid = None if to_op else f"{int(time.time() * 1000) - KEEP_MS}-0"
+    entry = await r.xadd(box, {"from": me, "env": raw}, minid=minid, approximate=minid is not None)
     await r.expire(box, IDLE_TTL)
     if not await r.exists(f"mmbox:watch:{to}"):  # nobody listens there: the other sessions of its computer are told
         m = await r.get(f"mmbox:machine:{to}")
