@@ -121,7 +121,77 @@ def load_client(path: Path):
     spec = importlib.util.spec_from_file_location("mmbox_client", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    cache_identities(mod)
     return mod
+
+
+def cache_identities(mod) -> None:
+    """The client's load_me, each profile read once while its files do not change. Its peers_load lists every other
+    profile of the computer (local_siblings), so a refresh loaded each identity (files, keys) once per profile and per
+    lookup: tens of thousands of times with a hundred boxes, seconds of CPU at each refresh. Each caller gets its
+    own copy of the profile's settings (callers change them before saving)."""
+    if not hasattr(mod, "load_me") or not hasattr(mod, "Local"):
+        return
+    import copy
+    orig, cache, lock = mod.load_me, {}, threading.Lock()
+
+    def stamp(local, name):
+        try:
+            st = local.path(name).stat()
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def load_me(profile):
+        try:
+            local = mod.Local(profile)
+            key = (stamp(local, "identity.json"), stamp(local, "config.json"))
+        except Exception:
+            return orig(profile)
+        with lock:
+            hit = cache.get(profile)
+        if hit is None or hit[0] != key:
+            hit = (key, orig(profile))
+            with lock:
+                cache[profile] = hit
+        me = hit[1]
+        if me is None:
+            return None
+        c = copy.copy(me)
+        c.conf = copy.deepcopy(me.conf)
+        return c
+    mod.load_me = load_me
+
+    if not all(hasattr(mod, f) for f in ("local_siblings", "local_profiles", "local_rights_conf", "other_project_conf")):
+        return
+    orig_sib, sib, gen = mod.local_siblings, {}, {"at": 0.0, "key": None}
+
+    def generation():
+        """The files of every profile (identity, settings), looked at most once a second."""
+        now = time.monotonic()
+        with lock:
+            if now - gen["at"] < 1.0:
+                return gen["key"]
+        key = tuple((n, stamp(mod.Local(n), "identity.json"), stamp(mod.Local(n), "config.json")) for n in mod.local_profiles())
+        with lock:
+            gen.update(at=now, key=key)
+        return key
+
+    def local_siblings(local):
+        """The same list for each profile while no profile changed (it read every profile for each one of them)."""
+        try:
+            key = (local.profile, generation(),
+                   json.dumps([mod.local_rights_conf(), mod.other_project_conf()], sort_keys=True, default=str))
+        except Exception:
+            return orig_sib(local)
+        with lock:
+            hit = sib.get(local.profile)
+        if hit is None or hit[0] != key:
+            hit = (key, orig_sib(local))
+            with lock:
+                sib[local.profile] = hit
+        return {pid: dict(q) for pid, q in hit[1].items()}  # callers change the entries (alias)
+    mod.local_siblings = local_siblings
 
 
 NOWIN = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: what the console runs never opens a window on Windows
@@ -2707,8 +2777,6 @@ class State:
                 errors.append("rights of the machine box unreadable")
         self.rights = rights
 
-        # the questions boxes put to this console
-        errors += self.fetch_questions(servers, peers)
 
         # the tables of active boxes
         def boxes_of(srv):
@@ -2722,7 +2790,6 @@ class State:
             if not signer:
                 return {"error": "no box of this computer on this service"}
             return call(u, signer, "/boxes", {})
-        tables = parallel({s["url"]: (lambda s=s: boxes_of(s)) for s in servers})
 
         # the traffic of each network (messages and posts per minute, 7 days kept by the service)
         def stats_of(srv):
@@ -2732,20 +2799,6 @@ class State:
             signer = self.op if srv["operator"] else next(
                 (b for b in ([machine] if machine else []) + list(profiles.values()) if b and u in M.gw_urls(b) and not b.closed_at), None)
             return call(u, signer, "/stats", {}) if signer else None
-        cleared = self.console_state.get("stats_clear") or {}
-        for u, r in parallel({s["url"]: (lambda s=s: stats_of(s)) for s in servers}).items():
-            srv = next(s for s in servers if s["url"] == u)
-            if not r or not r.get("ok"):
-                srv["stats"] = None
-                continue
-            now_ms, since = r["now_ms"], int(cleared.get(u) or 0)
-            win = {}
-            for w in STATS_WINDOWS:
-                lo = now_ms - w * 1000  # a span the window starts in counts; after a clear, only the spans that follow it
-                rows = [b for b in r.get("buckets") or [] if b[0] + (b[4] if len(b) > 4 else 60000) > lo and b[0] >= since]
-                win[str(w)] = {"messages": sum(b[1] for b in rows), "posts": sum(b[2] for b in rows), "bytes": sum(b[3] for b in rows)}
-            srv["stats"] = {"windows": win, "cleared_ms": since or None, "keep_s": r.get("keep_s"),
-                            "oldest_ms": (r.get("buckets") or [[None]])[0][0]}
 
         # the collectors this console reads
         def col_of(srv):
@@ -2764,9 +2817,43 @@ class State:
                     break
                 body = {"since": st["cursor"], "count": 5000}
             return {"ok": True}
-        col_res = parallel({s["url"]: (lambda s=s: col_of(s)) for s in servers})
+
+        def col_conf_of(srv):  # each collector's retention, for the settings
+            if srv["operator"] and srv["ok"] and "collector" in srv["features"]:
+                return call(srv["url"], self.op, "/col/config", {})
+            return None
+
+        # every question to the services at once: they do not depend on each other, and a distant service takes
+        # a second or more for each (their sum was most of a refresh, and of the start screen's wait)
+        jobs = {"questions": lambda: self.fetch_questions(servers, peers)}
         for s in servers:
-            r = col_res.get(s["url"])
+            for kind, fn in (("boxes", boxes_of), ("stats", stats_of), ("col", col_of), ("col_conf", col_conf_of)):
+                jobs[(kind, s["url"])] = (lambda fn=fn, s=s: fn(s))
+        first = self.startup is None and not getattr(self, "_startup_done", False)
+        if first:
+            self._startup_done = True
+            jobs["startup"] = lambda: self.check_startup(servers)
+        done = parallel(jobs)
+        errors += done.get("questions") or []
+        if first and "startup" not in done:
+            errors.append("startup check: no answer")
+        tables = {s["url"]: done.get(("boxes", s["url"])) for s in servers}
+        cleared = self.console_state.get("stats_clear") or {}
+        for srv in servers:
+            u, r = srv["url"], done.get(("stats", srv["url"]))
+            if not r or not r.get("ok"):
+                srv["stats"] = None
+                continue
+            now_ms, since = r["now_ms"], int(cleared.get(u) or 0)
+            win = {}
+            for w in STATS_WINDOWS:
+                lo = now_ms - w * 1000  # a span the window starts in counts; after a clear, only the spans that follow it
+                rows = [b for b in r.get("buckets") or [] if b[0] + (b[4] if len(b) > 4 else 60000) > lo and b[0] >= since]
+                win[str(w)] = {"messages": sum(b[1] for b in rows), "posts": sum(b[2] for b in rows), "bytes": sum(b[3] for b in rows)}
+            srv["stats"] = {"windows": win, "cleared_ms": since or None, "keep_s": r.get("keep_s"),
+                            "oldest_ms": (r.get("buckets") or [[None]])[0][0]}
+        for s in servers:
+            r = done.get(("col", s["url"]))
             s["col_read"] = None if r is None else ("ok" if r.get("ok") else f"{r.get('_error')} {r.get('error', '')}")
 
         # what waits unread in the boxes of this computer (read, never taken)
@@ -2804,15 +2891,9 @@ class State:
         self.check_delivery(profiles, servers)
 
         for srv in servers:  # each collector's retention, for the settings
-            if srv["operator"] and srv["ok"] and "collector" in srv["features"]:
-                r = call(srv["url"], self.op, "/col/config", {})
+            r = done.get(("col_conf", srv["url"]))
+            if r is not None:
                 srv["col_conf"] = {k: r.get(k) for k in ("keep_days", "hold_until_ms", "count", "oldest_ms")} if r.get("ok") else None
-        if self.startup is None and not getattr(self, "_startup_done", False):
-            self._startup_done = True
-            try:
-                self.check_startup(servers)
-            except Exception as e:
-                errors.append(f"startup check: {e}")
         with self.lock:
             self._build(servers, tables, profiles, peers, waiting, errors)
 

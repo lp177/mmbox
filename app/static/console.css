@@ -67,15 +67,17 @@ svg { width: 20px; height: 20px; fill: currentColor; flex: none; }
 /* ---------- the app's own title bar (its window, Settings > Window): window buttons in the app bar, edges to resize */
 body.own-titlebar .appbar { -webkit-user-select: none; user-select: none; cursor: default; }
 body.own-titlebar .appbar img { -webkit-user-drag: none; }
-.wincontrols { display: flex; align-items: center; gap: 2px; margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--line); }
+/* above the start screen too (.splash, z-index 9999): the window can be moved, resized and closed while it loads */
+.wincontrols { display: flex; align-items: center; gap: 2px; margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--line); position: relative; z-index: 10000; }
 .btn.icon.win-btn { width: 36px; min-height: 36px; }
 .win-btn svg { width: 18px; height: 18px; }
 .win-btn.win-close:hover, .win-btn.win-close:focus-visible { background: var(--err); color: #3a0b07; }
 .win-btn.win-close:active { background: #e46a60; color: #3a0b07; }
 body.own-titlebar:not(.maximized)::after {
-  content: ""; position: fixed; inset: 0; border: 1px solid var(--line-strong); pointer-events: none; z-index: 30;
+  content: ""; position: fixed; inset: 0; border: 1px solid var(--line-strong); pointer-events: none; z-index: 10001;
 }
-.win-edges > div { position: fixed; z-index: 31; }
+.win-edges > div { position: fixed; z-index: 10001; }
+body.own-titlebar .splash { -webkit-user-select: none; user-select: none; }
 .win-edges > [data-edge="n"] { top: 0; left: 10px; right: 10px; height: 4px; cursor: ns-resize; }
 .win-edges > [data-edge="s"] { bottom: 0; left: 10px; right: 10px; height: 4px; cursor: ns-resize; }
 .win-edges > [data-edge="e"] { right: 0; top: 10px; bottom: 10px; width: 4px; cursor: ew-resize; }

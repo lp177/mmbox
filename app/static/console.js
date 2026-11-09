@@ -3029,10 +3029,11 @@ const winOp = (op, edge) => action({ action: "window", op, ...(edge ? { edge } :
 $("#win-min").addEventListener("click", () => winOp("minimize"));
 $("#win-max").addEventListener("click", () => winOp("maximize"));
 $("#win-close").addEventListener("click", () => winOp("close"));
-// the app bar moves the window: from a drag (a few pixels, so that a double click stays one), outside its controls
-const NODRAG = "button, a, input, select, textarea, label, [role=tab], [tabindex]";
-$(".appbar").addEventListener("pointerdown", (e) => {
-  if (!WIN.titlebar || e.button !== 0 || e.target.closest(NODRAG)) return;
+// the app bar, and the start screen while it is there, move the window: from a drag (a few pixels, so that a double
+// click stays one), outside the bar's controls
+const DRAG = ".appbar, #splash", NODRAG = "button, a, input, select, textarea, label, [role=tab], [tabindex]";
+document.addEventListener("pointerdown", (e) => {
+  if (!WIN.titlebar || e.button !== 0 || !e.target.closest(DRAG) || e.target.closest(NODRAG)) return;
   const x0 = e.screenX, y0 = e.screenY;
   const stop = () => { removeEventListener("pointermove", move); removeEventListener("pointerup", stop); };
   const move = (m) => {
@@ -3042,7 +3043,9 @@ $(".appbar").addEventListener("pointerdown", (e) => {
   };
   addEventListener("pointermove", move); addEventListener("pointerup", stop);
 });
-$(".appbar").addEventListener("dblclick", (e) => { if (WIN.titlebar && !e.target.closest(NODRAG)) winOp("maximize"); });
+document.addEventListener("dblclick", (e) => {
+  if (WIN.titlebar && e.target.closest(DRAG) && !e.target.closest(NODRAG)) winOp("maximize");
+});
 for (const d of $$("#win-edges > div")) d.addEventListener("pointerdown", (e) => {
   if (e.button === 0) { e.preventDefault(); winOp("resize", d.dataset.edge); }
 });
