@@ -568,8 +568,14 @@ class AppWindow:
     pywebview's own calls wait for the window, so they run in a short thread of their own."""
 
 
-    def __init__(self, webview, url: str, shown: bool, home: Path):
+    def __init__(self, webview, url: str, shown: bool, home: Path, own_titlebar: bool = True):
         self.wv, self.home = webview, home
+        # the title bar drawn by the page (Settings, on by default) instead of the system's: GTK only, where the
+        # window can lose and get back its decorations at once, and the window manager moves and resizes it
+        self.titlebar_ok = desktop_session()
+        self.own_titlebar = own_titlebar and self.titlebar_ok
+        self.maximized = False
+        self._press = None  # the webview's last press of the left button (a copy), for its release after a drag
         self.can_hide, self.quitting, self.visible = False, False, shown
         self.left_front = 0.0  # when the window last lost the focus (monotonic): a click on the panel may take it
         self.activation_token = None  # Wayland: the token the panel gives just before its click (xdg-activation)
@@ -592,9 +598,112 @@ class AppWindow:
                 width, height = max(1100, int(geo.width * 0.7)), max(760, int(geo.height * 0.8))
             except Exception as e:
                 log(f"window: {type(e).__name__}: {e}")
-        self.win = webview.create_window("mmbox", url, width=width, height=height, min_size=(760, 520),
-                                         hidden=not shown, background_color="#121212", text_select=True)
+        self.win = webview.create_window("mmbox", url + "&app=1", width=width, height=height, min_size=(760, 520),
+                                         hidden=not shown, background_color="#121212", text_select=True,
+                                         frameless=self.own_titlebar, easy_drag=False)
         self.win.events.closing += self._closing
+        for ev in (self.win.events.maximized, self.win.events.restored, self.win.events.shown):
+            ev += self._frame_changed
+
+    # ---- the page's own title bar: its buttons, its drag area and the window's edges call these (POST "window")
+
+    def frame(self) -> dict:
+        """What the page draws: its own title bar or not, and the window maximized (the restore button then)."""
+        return {"titlebar": self.own_titlebar, "titlebar_ok": self.titlebar_ok, "maximized": self.maximized}
+
+    def _frame_changed(self, *_a) -> None:
+        """Maximized or restored by the window manager (a double click, a shortcut, a drag to the screen's top): the
+        state read in the GTK loop, then the page told at once."""
+        if not self.titlebar_ok:
+            return
+        from gi.repository import Gdk, GLib
+
+        def run():
+            try:
+                self._hook_press()
+                gw = self._gtk_window().get_window()
+                self.maximized = bool(gw and gw.get_state() & (Gdk.WindowState.MAXIMIZED | Gdk.WindowState.FULLSCREEN))
+            except Exception:
+                pass
+            self._run_js(f"typeof setWindowFrame === 'function' && setWindowFrame({json.dumps(self.frame())})")
+            return False
+        GLib.idle_add(run)
+
+    def _hook_press(self) -> None:
+        """Once, in the GTK loop: the webview's presses of the left button are kept (a copy, before WebKit has them)."""
+        if self._press is not None:
+            return
+        from webview.platforms.gtk import BrowserView
+        self._press = False
+
+        def keep(_wv, ev):
+            if ev.button == 1:
+                self._press = ev.copy()
+            return False
+        BrowserView.instances[self.win.uid].webview.connect("button-press-event", keep)
+
+    def _release_page(self) -> None:
+        """The window manager now has the pointer and its button's release: the page never gets it and would keep
+        the button down (its next click lost). It gets a release made from the press that started the drag."""
+        try:
+            from gi.repository import Gdk
+            from webview.platforms.gtk import BrowserView
+            ev = self._press
+            if ev:
+                self._press = False
+                ev.type = Gdk.EventType.BUTTON_RELEASE
+                ev.state |= Gdk.ModifierType.BUTTON1_MASK
+                BrowserView.instances[self.win.uid].webview.event(ev)
+        except Exception as e:
+            log(f"window: {type(e).__name__}: {e}")
+
+    def set_titlebar(self, own: bool) -> None:
+        """Settings: the page's title bar (the system's one removed at once) or the system's."""
+        self.own_titlebar = bool(own) and self.titlebar_ok
+        w = self._gtk_window()
+        if w is not None:
+            from gi.repository import GLib
+            GLib.idle_add(lambda: w.set_decorated(not self.own_titlebar) or self._frame_changed() or False)
+
+    EDGES = {"n": "NORTH", "s": "SOUTH", "e": "EAST", "w": "WEST",
+             "ne": "NORTH_EAST", "nw": "NORTH_WEST", "se": "SOUTH_EAST", "sw": "SOUTH_WEST"}
+
+    def window_op(self, op: str, edge: str = "") -> dict:
+        """A button of the page's title bar (minimize, maximize: or restore, close), or the window moved or resized
+        by the window manager from the pointer, while its button is still down (a click already over does nothing)."""
+        if op not in ("minimize", "maximize", "close", "move", "resize") or (op == "resize" and edge not in self.EDGES):
+            return {"ok": False, "err": "op: minimize, maximize, close, move or resize (edge n, s, e, w, ne, nw, se, sw)"}
+        w = self._gtk_window()
+        if w is None:
+            if op == "close":
+                self.hide() if self.can_hide else self.quit()
+            return {"ok": op == "close"}
+        from gi.repository import Gdk, GLib
+
+        def run():
+            try:
+                if op == "minimize":
+                    w.iconify()
+                elif op == "maximize":
+                    w.unmaximize() if w.is_maximized() else w.maximize()
+                elif op == "close":
+                    w.close()  # as the system's button: _closing hides it in the notification area, or quits
+                else:
+                    ptr = Gdk.Display.get_default().get_default_seat().get_pointer()
+                    _s, x, y = ptr.get_position()
+                    gw = w.get_window()
+                    held = gw is not None and gw.get_device_position(ptr)[3] & Gdk.ModifierType.BUTTON1_MASK
+                    if held and op == "move":
+                        w.begin_move_drag(1, x, y, Gdk.CURRENT_TIME)
+                    elif held:
+                        w.begin_resize_drag(getattr(Gdk.WindowEdge, self.EDGES[edge]), 1, x, y, Gdk.CURRENT_TIME)
+                    if held:
+                        self._release_page()
+            except Exception as e:
+                log(f"window {op}: {type(e).__name__}: {e}")
+            return False
+        GLib.idle_add(run)
+        return {"ok": True}
 
     @staticmethod
     def _bg(fn, *a) -> None:
@@ -1522,6 +1631,10 @@ class State:
     def debug_all(self) -> bool:
         """Debug mode (Settings): the list keeps every message seen, consumed ones included. Off: only the useful ones."""
         return bool(self.console_state.get("debug_all"))
+
+    def own_titlebar(self) -> bool:
+        """The app's window draws its own title bar (Settings; on by default) instead of the system's."""
+        return self.console_state.get("own_titlebar") is not False
 
     def purge_keep_s(self) -> float:
         """How much of the open boxes' finished messages the purge keeps (Settings; 24 h by default)."""
@@ -3349,6 +3462,16 @@ def act(state: State, body: dict) -> dict:
         state.digest = ""
         threading.Thread(target=state.refresh, daemon=True).start()
         return {"ok": True, "debug_all": state.debug_all()}
+    if a == "titlebar":  # Settings: the app's own title bar, or the system's
+        state.console_state["own_titlebar"] = bool(body.get("on"))
+        state.save_console_state()
+        app = getattr(Handler, "app", None)
+        if app:
+            app.set_titlebar(state.own_titlebar())
+        return {"ok": True, "titlebar": state.own_titlebar(), "window": app.frame() if app else None}
+    if a == "window":  # the page's title bar: its buttons, its drag area, the window's edges
+        app = getattr(Handler, "app", None)
+        return app.window_op(s("op"), s("edge")) if app else {"ok": False, "err": "no window of its own (browser)"}
     if a == "tune":
         args = ["tune"]
         if body.get("reset"):
@@ -3620,6 +3743,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(st.account_state())
             if u.path == "/api/butler":  # the Butler tab: its state, inventory, started sessions, chat
                 return self._json(st.butler_state())
+            if u.path == "/api/window":  # the window's page at its loading: its own title bar or not, maximized
+                app = getattr(Handler, "app", None)
+                return self._json({"window": app.frame() if app else None, "titlebar": st.own_titlebar()})
             if u.path == "/api/show":  # a second launch of the app: this window to the front
                 if getattr(Handler, "app", None):
                     Handler.app.show()
@@ -3810,7 +3936,7 @@ def main():
         q = urllib.parse.quote
         return url + (f"&msg={q(msg, safe='')}" if msg else f"&question={q(question, safe='') if isinstance(question, str) else 'next'}"
                       if question else "&view=held" if held else "")
-    app = None if a.browser else app_window(url, a.open or a.no_tray, op.home)
+    app = None if a.browser else app_window(url, a.open or a.no_tray, op.home, state.own_titlebar())
     Handler.app = app
     instance = op.home / "instance.json"  # for a second launch: bring this window to the front instead
     try:
@@ -4100,7 +4226,7 @@ def show_running(home: Path, port: int) -> bool:
         return False
 
 
-def app_window(url: str, shown: bool, home: Path) -> AppWindow | None:
+def app_window(url: str, shown: bool, home: Path, own_titlebar: bool = True) -> AppWindow | None:
     """The console's own window (pywebview), or None: the browser then, as before."""
     if os.name != "nt" and sys.platform != "darwin" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return None  # no graphical session: a server, an SSH session
@@ -4117,7 +4243,7 @@ def app_window(url: str, shown: bool, home: Path) -> AppWindow | None:
     except (ImportError, ValueError) as e:
         log(f"no window of its own ({e}): install pywebview (Debian: python3-webview); the browser opens the console")
         return None
-    return AppWindow(webview, url, shown, home)
+    return AppWindow(webview, url, shown, home, own_titlebar)
 
 
 if __name__ == "__main__":

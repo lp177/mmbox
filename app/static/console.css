@@ -63,6 +63,27 @@ svg { width: 20px; height: 20px; fill: currentColor; flex: none; }
 .tab:hover { background: rgb(255 255 255 / 0.04); color: var(--text); }
 .appbar-end { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .sync { color: var(--text-3); font-size: 12px; }
+
+/* ---------- the app's own title bar (its window, Settings > Window): window buttons in the app bar, edges to resize */
+body.own-titlebar .appbar { -webkit-user-select: none; user-select: none; cursor: default; }
+body.own-titlebar .appbar img { -webkit-user-drag: none; }
+.wincontrols { display: flex; align-items: center; gap: 2px; margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--line); }
+.btn.icon.win-btn { width: 36px; min-height: 36px; }
+.win-btn svg { width: 18px; height: 18px; }
+.win-btn.win-close:hover, .win-btn.win-close:focus-visible { background: var(--err); color: #3a0b07; }
+.win-btn.win-close:active { background: #e46a60; color: #3a0b07; }
+body.own-titlebar:not(.maximized)::after {
+  content: ""; position: fixed; inset: 0; border: 1px solid var(--line-strong); pointer-events: none; z-index: 30;
+}
+.win-edges > div { position: fixed; z-index: 31; }
+.win-edges > [data-edge="n"] { top: 0; left: 10px; right: 10px; height: 4px; cursor: ns-resize; }
+.win-edges > [data-edge="s"] { bottom: 0; left: 10px; right: 10px; height: 4px; cursor: ns-resize; }
+.win-edges > [data-edge="e"] { right: 0; top: 10px; bottom: 10px; width: 4px; cursor: ew-resize; }
+.win-edges > [data-edge="w"] { left: 0; top: 10px; bottom: 10px; width: 4px; cursor: ew-resize; }
+.win-edges > [data-edge="nw"] { top: 0; left: 0; width: 10px; height: 10px; cursor: nwse-resize; }
+.win-edges > [data-edge="se"] { bottom: 0; right: 0; width: 10px; height: 10px; cursor: nwse-resize; }
+.win-edges > [data-edge="ne"] { top: 0; right: 0; width: 10px; height: 10px; cursor: nesw-resize; }
+.win-edges > [data-edge="sw"] { bottom: 0; left: 0; width: 10px; height: 10px; cursor: nesw-resize; }
 .sync.err { color: var(--err); }
 
 /* ---------- buttons, with the ripple */

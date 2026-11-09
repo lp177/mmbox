@@ -3001,6 +3001,59 @@ $("#ob-join-go").addEventListener("click", async () => {
   const t = setInterval(async () => { await loadAccount(); if (AC.data?.account) { clearInterval(t); toast(`This console is now a device of ${AC.data.account}`); $("#onboard").close(); } }, 5000);
 });
 
+// ---------------------------------------------------------------- the app's own title bar (its window; Settings > Window)
+const APP = (() => {  // the console's own window (#…&app=1), kept over a reload of the page
+  if (DEEP.get("app") === "1") sessionStorage.setItem("mmbox-console-app", "1");
+  return sessionStorage.getItem("mmbox-console-app") === "1";
+})();
+const WIN = { titlebar: false, ok: false, maximized: false };
+const WICON = {
+  max: "M18 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2Zm0 14H6V6h12v12Z",
+  restore: "M4 8h2v10a2 2 0 0 0 2 2h10v2H8a4 4 0 0 1-4-4V8Zm6-6h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm0 2v10h10V4H10Z",
+};
+// called by the window too (maximized or restored by the window manager)
+function setWindowFrame(f) {
+  if (!f) return;
+  WIN.titlebar = !!f.titlebar; WIN.ok = !!f.titlebar_ok; WIN.maximized = !!f.maximized;
+  document.body.classList.toggle("own-titlebar", WIN.titlebar);
+  document.body.classList.toggle("maximized", WIN.maximized);
+  $("#wincontrols").hidden = !WIN.titlebar;
+  $("#win-edges").hidden = !WIN.titlebar || WIN.maximized;
+  const b = $("#win-max"), label = WIN.maximized ? "Restore" : "Maximize";
+  b.setAttribute("aria-label", label); b.title = label;
+  b.querySelector("path").setAttribute("d", WIN.maximized ? WICON.restore : WICON.max);
+  $("#set-window-card").hidden = !WIN.ok;
+  if (document.activeElement !== $("#w-titlebar")) $("#w-titlebar").checked = WIN.titlebar;
+}
+const winOp = (op, edge) => action({ action: "window", op, ...(edge ? { edge } : {}) }).catch(() => {});
+$("#win-min").addEventListener("click", () => winOp("minimize"));
+$("#win-max").addEventListener("click", () => winOp("maximize"));
+$("#win-close").addEventListener("click", () => winOp("close"));
+// the app bar moves the window: from a drag (a few pixels, so that a double click stays one), outside its controls
+const NODRAG = "button, a, input, select, textarea, label, [role=tab], [tabindex]";
+$(".appbar").addEventListener("pointerdown", (e) => {
+  if (!WIN.titlebar || e.button !== 0 || e.target.closest(NODRAG)) return;
+  const x0 = e.screenX, y0 = e.screenY;
+  const stop = () => { removeEventListener("pointermove", move); removeEventListener("pointerup", stop); };
+  const move = (m) => {
+    if (!(m.buttons & 1)) return stop();
+    if (Math.hypot(m.screenX - x0, m.screenY - y0) < 4) return;
+    stop(); winOp("move");
+  };
+  addEventListener("pointermove", move); addEventListener("pointerup", stop);
+});
+$(".appbar").addEventListener("dblclick", (e) => { if (WIN.titlebar && !e.target.closest(NODRAG)) winOp("maximize"); });
+for (const d of $$("#win-edges > div")) d.addEventListener("pointerdown", (e) => {
+  if (e.button === 0) { e.preventDefault(); winOp("resize", d.dataset.edge); }
+});
+$("#w-titlebar").addEventListener("change", async (e) => {
+  const r = await action({ action: "titlebar", on: e.target.checked });
+  if (!r.ok) { toast("Failed: " + (r.err || "?"), true); return; }
+  if (r.window) setWindowFrame(r.window);
+  toast(r.titlebar ? "The app's own title bar" : "The system's title bar");
+});
+if (APP && token) api("/api/window").then((r) => setWindowFrame(r.window)).catch(() => {});
+
 showTab(DEEP.get("tab") || localStorage.getItem("mmbox-console-tab") || "messages");
 if (DEEP.get("msg")) openWhenListed(DEEP.get("msg"));
 if (DEEP.get("box")) { const id = DEEP.get("box"); const t = setInterval(() => { if (S.boxes.has(id)) { clearInterval(t); openBoxCard(id); } }, 300); }
