@@ -841,11 +841,13 @@ class AppWindow:
         GLib.timeout_add(250, insist)
         return False
 
-    def show(self, question: bool | str = False, held: bool = False, msg: str | None = None) -> None:
+    def show(self, question: bool | str = False, held: bool = False, msg: str | None = None, late: bool = False) -> None:
         """Opened (created the first time) and put in front, whether it was hidden, minimized or behind others; then
         what a notification's click is about: one message (`msg`), the questions (`question`: True, or the id of the
-        one to show first) or the held messages. The page opens it at once, or as soon as its next poll has it."""
-        target = {"msg": msg} if msg else {"question": question} if question else {"held": True} if held else None
+        one to show first), the held messages or the late unread ones. The page opens it at once, or as soon as its
+        next poll has it."""
+        target = ({"msg": msg} if msg else {"question": question} if question else {"held": True} if held
+                  else {"late": True} if late else None)
         if target:
             self.goto_n += 1
             self.goto = {**target, "n": self.goto_n, "until": time.time() + 20}
@@ -1165,10 +1167,11 @@ class Desktop:
         else:
             self.open()
 
-    def open(self, question: bool | str = False, held: bool = False, msg: str | None = None) -> None:
-        """The console in front, on what is asked: one message, the questions (or one of them), the held messages."""
+    def open(self, question: bool | str = False, held: bool = False, msg: str | None = None, late: bool = False) -> None:
+        """The console in front, on what is asked: one message, the questions (or one of them), the held messages, the
+        late unread ones (the window only: the browser opens on the list)."""
         if self.app:
-            self.app.show(question=question, held=held, msg=msg)
+            self.app.show(question=question, held=held, msg=msg, late=late)
         else:
             self._browser(self.url_of(question, held, msg))
 
@@ -1294,6 +1297,27 @@ class Desktop:
     def recap(self, r: dict) -> None:
         if self.ok:
             self.GLib.idle_add(self._recap, r)
+
+    def alert(self, title: str, body: str, msg: str | None = None, late: bool = False) -> None:
+        if self.ok:
+            self.GLib.idle_add(self._alert, title, body, msg, late)
+
+    def _alert(self, title, body, msg, late):
+        """The page's own alerts (a message unread too long, one forwarded to a machine box) when it runs in the
+        console's window, whose WebKit refuses the browser's notifications: shown by the system, not resident."""
+        key = msg or ("late" if late else title)
+        try:
+            note = self.Notify.Notification.new(title, body[:300], str(self.icons / "mmbox-console.svg"))
+            note.set_hint("desktop-entry", self.GLib.Variant.new_string("mmbox-console"))
+            note.add_action("default", "Show", lambda *_: self.open(msg=msg, late=late))
+            note.connect("closed", lambda *_: self.recap_notes.pop(key, None))
+            note.show()
+            self.recap_notes[key] = note  # kept until closed, or its action is lost with the object
+            for old in list(self.recap_notes)[:-20]:
+                self.recap_notes.pop(old, None)
+        except Exception as e:
+            log(f"notification: {e}")
+        return False
 
     def _recap(self, r):
         """A session's work is over: one notification, not resident (the recap stays in the list)."""
@@ -3680,6 +3704,12 @@ def act(state: State, body: dict) -> dict:
         r = run_client(["server", a, srv["name"]])
         threading.Thread(target=state.refresh, daemon=True).start()
         return r
+    if a == "alert":  # the window's page: its alert shown by the system (its WebKit has no browser notifications)
+        if not (state.desktop and state.desktop.ok):
+            return {"ok": False, "err": "no system notifications on this computer"}
+        mid = s("msg") or None
+        state.desktop.alert(s("title")[:200] or "mmbox", s("body"), msg=mid, late=bool(body.get("late")))
+        return {"ok": True}
     if a == "notify":  # how a new question is announced: persistent notification, red dot, sound
         cur = state.notify_settings()
         for k in ("popup", "badge", "audio"):

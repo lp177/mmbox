@@ -815,8 +815,15 @@ function openViewer(m, i, url, opener) {
 // ---------------------------------------------------------------- a box's conversation, as a chat
 const CH = { box: null, data: null, version: -1, senders: null, loading: false };
 const fmtDays = (s) => { const d = s / 86400; return d >= 1 ? `${+d.toFixed(d < 10 ? 1 : 0)} d` : `${Math.round(s / 3600)} h`; };
+// a message or a box's conversation opened from another tab (Boxes, Activity, Butler…): the back arrow returns there
+const TAB_NAME = { boxes: "Boxes", servers: "Servers", activity: "Activity", butler: "Butler", settings: "Settings" };
+const currentTab = () => ($$(".tab").find((t) => t.getAttribute("aria-selected") === "true")?.id || "tab-messages").slice(4);
+const NAV = { tab: null, box: null };  // the box conversation gotoBox opened from another tab, and that tab
 async function renderChat(force = false) {
   const box = S.node.key;
+  const cb = $("#chat-back"), back = NAV.tab && NAV.box === box ? NAV.tab : null;
+  cb.hidden = !back;
+  if (back) { cb.setAttribute("aria-label", `Back to ${TAB_NAME[back]}`); cb.title = `Back to ${TAB_NAME[back]}`; }
   if (CH.box !== box) { attRelease("chat"); Object.assign(CH, { box, data: null, version: -1, senders: null, stick: true }); $("#chat-text").value = ""; $("#chat-error").textContent = ""; }
   drawChatHead();
   if (CH.loading || (!force && CH.version === S.version && CH.data)) return;
@@ -1093,6 +1100,9 @@ $("#batch-move").addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------- the message
+// the project a box or a message is about: its work project; its space only when it differs ("mmbox · space ready")
+const otherSpace = (x) => x.work && x.project && x.project.toLowerCase() !== x.work.toLowerCase() ? x.project : null;
+const projectText = (x) => x.work ? [x.work, otherSpace(x) && `space ${x.project}`].filter(Boolean).join(" · ") : x.project ? `space ${x.project}` : "";
 function boxRef(id) {
   if (!id) return "—";
   const b = boxOf(id);
@@ -1114,7 +1124,7 @@ function openBoxCard(id) {
       h("dt", {}, "Id"), h("dd", { class: "mono" }, id),
       h("dt", {}, "Role"), h("dd", {}, b.role === "machine" ? "machine box" : isProjectBox(b) ? "project box (every session of the project reads it; never closed)" : "session"),
       h("dt", {}, "Machine"), h("dd", {}, machineName(machineKey(b))),
-      h("dt", {}, "Project"), h("dd", {}, [b.work, b.project && `space ${b.project}`].filter(Boolean).join(" · ") || "—"),
+      h("dt", {}, "Project"), h("dd", {}, projectText(b) || "—"),
       h("dt", {}, "State"), h("dd", {}, st, b.idle_s !== undefined ? ` · ${ago(b.idle_s)}` : ""),
       b.opened_ms ? [h("dt", {}, "Opened"), h("dd", {}, fmtFull.format(new Date(b.opened_ms)))] : null,
       h("dt", {}, "Unread"), h("dd", {}, String(mine)),
@@ -1135,7 +1145,10 @@ function openBoxCard(id) {
   dlg.showModal();
 }
 function gotoBox(id) {
+  const from = $("#view-messages").hidden && TAB_NAME[currentTab()] ? currentTab() : null;
   showTab("messages");
+  Object.assign(NAV, { tab: from, box: from ? id : null });
+  RD.tab = null;
   const b = boxOf(id);
   const mk = machineKey(b);
   S.expanded.add("machines"); S.expanded.add("m" + mk);
@@ -1147,7 +1160,7 @@ function gotoBox(id) {
 }
 // ---------------------------------------------------------------- the open message takes the place of the list (or of the
 // conversation), as in a mail client; the list stays laid out underneath, so the back button finds it where it was.
-const RD = { open: null, from: "list", msg: null };
+const RD = { open: null, from: "list", msg: null, tab: null };  // tab: the view the message was opened from, when not this one
 function markRow(id) {
   for (const r of $$(".msg", $("#list"))) { const on = r.dataset.id === id; r.setAttribute("aria-selected", String(on)); r.tabIndex = on ? 0 : -1; }
 }
@@ -1172,6 +1185,9 @@ function closeReader(focus = true) {
   $(".list-pane").inert = false;
   $("#reader").hidden = true;
   attRelease("detail"); AT.detail = null;
+  const back = RD.tab;
+  RD.tab = null;
+  if (back && focus) { showTab(back); $("#tab-" + back).focus(); return; }  // opened from another tab: back there
   if (!focus) return;
   const el = S.selected && (RD.from === "chat" ? $(`#chat-log .bubble[data-id="${CSS.escape(S.selected)}"]`) : $("#m-" + CSS.escape(S.selected)));
   if (el) {
@@ -1184,7 +1200,10 @@ function closeReader(focus = true) {
 }
 async function openMessage(id) {
   if (!id) return;
-  if ($("#view-messages").hidden) showTab("messages");
+  if ($("#view-messages").hidden) {
+    if (!RD.open) RD.tab = TAB_NAME[currentTab()] ? currentTab() : null;
+    showTab("messages");
+  }
   const changed = RD.open !== id;
   if (changed) saveDraft();
   if (!RD.open) RD.from = S.node.type === "box" && !$("#chat").hidden ? "chat" : "list";
@@ -1193,7 +1212,7 @@ async function openMessage(id) {
   $("#view-messages").classList.add("reading");
   $(".list-pane").inert = true;
   $("#reader").hidden = false;
-  const back = RD.from === "chat" ? "Back to the conversation" : "Back to the list";
+  const back = RD.tab ? `Back to ${TAB_NAME[RD.tab]}` : RD.from === "chat" ? "Back to the conversation" : "Back to the list";
   $("#reader-back").setAttribute("aria-label", back); $("#reader-back").title = back + " (Esc)";
   const light = S.byId.get(id) || (CH.data?.messages || []).find((m) => m.id === id);
   if (changed) { $("#reader-scroll").scrollTop = 0; renderDetail(light, true); resetReply(light); }
@@ -1208,6 +1227,8 @@ $("#reader-back").append(svg(ICON.back));
 $("#reader-prev").append(svg(ICON.up));
 $("#reader-next").append(svg(ICON.down));
 $("#reader-back").addEventListener("click", () => closeReader());
+$("#chat-back").append(svg(ICON.back));
+$("#chat-back").addEventListener("click", () => { const t = NAV.tab; NAV.tab = NAV.box = null; $("#chat-back").hidden = true; if (t) { showTab(t); $("#tab-" + t).focus(); } });
 $("#reader-prev").addEventListener("click", () => readerStep(-1));
 $("#reader-next").addEventListener("click", () => readerStep(1));
 document.addEventListener("keydown", (e) => {
@@ -1321,7 +1342,21 @@ $("#reply-form").addEventListener("submit", async (e) => {
   setTimeout(() => poll(true), 800);
 });
 
+// the reader's bar says at a glance who wrote the open message and to whom: "from: alice  to: bob"
+function renderWho(m) {
+  const el = $("#reader-who");
+  if (!m) { el.replaceChildren(); return; }
+  const ref = (id) => id ? h("button", { class: "boxref", type: "button", title: `${recipientName(id)} · ${id}`, onclick: () => openBoxCard(id) }, boxName(id)) : h("span", { class: "who-v" }, "?");
+  const field = (k, ...v) => h("span", { class: "who" }, h("span", { class: "who-k" }, k + ":"), ...v);
+  const to = m.broadcast
+    ? field("to", h("span", { class: "who-v", title: (m.to_boxes || []).map(boxName).join(", ") || null },
+      m.scope === "network" ? "everyone (whole network)" : "every session of this computer"))
+    : field("to", ref(m.to));
+  el.replaceChildren(field("from", ref(m.from)), to,
+    m.via_machine ? field("via", h("span", { class: "who-v" }, "machine box")) : null);
+}
 function renderDetail(m, partial) {
+  renderWho(m);
   const d = $("#detail");
   if (AT.detail !== (m?.id ?? null)) { attRelease("detail"); AT.detail = m?.id ?? null; }
   if (!m) { d.replaceChildren(h("p", { class: "empty" }, "Loading…")); return; }
@@ -1353,7 +1388,7 @@ function renderDetail(m, partial) {
       const a = S.byId.get(id);
       return [i ? ", " : null, h("button", { class: "boxref", type: "button", onclick: () => openMessage(id) }, a ? `${when(tsOf(a))} by ${boxName(a.from)}` : id)];
     }))] : null,
-    m.work || m.project ? [h("dt", {}, "Project"), h("dd", {}, [m.work, m.project && `space ${m.project}`].filter(Boolean).join(" · "))] : null,
+    m.work || m.project ? [h("dt", {}, "Project"), h("dd", {}, projectText(m))] : null,
     m.topic ? [h("dt", {}, "Topic"), h("dd", {}, m.topic)] : null,
     m.re ? [h("dt", {}, "In reply to"), h("dd", {}, S.byId.get(m.re) ? h("button", { class: "boxref", type: "button", onclick: () => openMessage(m.re) }, S.byId.get(m.re).subject || m.re) : h("span", { class: "mono" }, m.re))] : null,
     h("dt", {}, "Id"), h("dd", { class: "mono" }, m.id),
@@ -1572,7 +1607,9 @@ function renderBoxes() {
   const rows = [...S.boxes.values()].filter((b) => (!F.boxActive || isActive(b)) && (!q || [b.title, b.label, b.id, b.work, b.hostname, b.alias, b.profile, b.activity].join(" ").toLowerCase().includes(q)))
     .sort((a, b) => machineName(machineKey(a)).localeCompare(machineName(machineKey(b))) || (a.role !== "machine") - (b.role !== "machine") || (a.work || "").localeCompare(b.work || "") || (a.label || "").localeCompare(b.label || ""));
   $("#boxes-caption").textContent = `${rows.length} box(es) · state: listening, active (open on a service), closed`;
-  $("#boxes-body").replaceChildren(...rows.map((b) => h("tr", {},
+  $("#boxes-body").replaceChildren(...rows.map((b) => h("tr", { class: BS.checked.has(b.id) ? "checked" : null, dataset: { id: b.id } },
+    h("td", { class: "check-col" }, h("input", { type: "checkbox", class: "check box-check", checked: BS.checked.has(b.id),
+      "aria-label": "Select " + boxName(b.id), title: "Select (Shift+click: a range)" })),
     h("td", {}, h("span", { class: "dot " + (b.closed_at || b.retired_at ? "closed" : b.listening || b.listening_here ? "listening" : b.active ? "active" : ""), title: b.closed_at ? "closed" : b.listening ? "listening" : b.active ? "active" : "unknown" })),
     h("td", {}, (S.snap?.pinned || []).includes(b.id) ? h("button", { class: "pin-btn on ripple", type: "button", "aria-label": `Unpin the conversation with ${boxName(b.id)}`,
         title: "Pinned conversation: click to unpin", onclick: () => setPin(b.id, false) }, svg(ICON.pin)) : null,
@@ -1582,12 +1619,97 @@ function renderBoxes() {
       b.declared === false ? h("span", { class: "chip", title: "older client: declares neither machine nor project" }, "not declared") : null,
       h("div", { class: "mono" }, b.id), b.activity ? h("div", { class: "dim" }, b.activity) : null),
     h("td", {}, machineName(machineKey(b))),
-    h("td", {}, b.work || h("span", { class: "dim" }, "—"), b.project ? h("div", { class: "dim" }, "space " + b.project) : null),
+    h("td", { title: b.project && b.project !== b.work ? `space ${b.project}` : null }, b.work || h("span", { class: "dim" }, "—")),
     h("td", {}, (b.servers || []).map((u) => (S.servers.get(u) || {}).name || u).join(", ") || "—"),
     h("td", {}, b.waiting ? h("span", { class: "badge" }, b.waiting) : "0"),
     h("td", {}, b.listening ? "listening" : b.idle_s !== undefined ? ago(b.idle_s) : b.closed_at ? "closed " + fmtShort.format(new Date(Date.parse(b.closed_at))) : "—"),
     h("td", {}, h("button", { class: "btn small ripple", type: "button", onclick: () => openCompose({ to: b.id }) }, "Write")))));
+  syncBoxChecks();
 }
+// ---------------------------------------------------------------- the Boxes table: selection and batch actions, as the
+// message list's: a checkbox per row, one in the bar that selects every box shown (indeterminate when some are),
+// Shift+click a range, Escape clears; the actions of a box's menu (this computer's boxes), each on the boxes it fits.
+const BS = { checked: new Set(), last: null };
+const shownBoxIds = () => $$("#boxes-body tr").map((r) => r.dataset.id);
+const BOX_BATCH = {  // which selected boxes an action fits: the client acts with the box's own keys, so this computer's only
+  empty: (b) => b.local,
+  purge: (b) => b.local,
+  close: (b) => b.local && b.role === "session" && !b.closed_at,
+  delete: (b) => b.local && (isProjectBox(b) || (b.role === "session" && !!b.closed_at)),
+};
+function syncBoxChecks() {
+  const ids = shownBoxIds(), shown = new Set(ids);
+  for (const id of [...BS.checked]) if (!shown.has(id)) BS.checked.delete(id);  // what the search or the switch hides is not acted upon
+  const n = BS.checked.size, all = $("#b-sel-all");
+  all.checked = n > 0 && n === ids.length;
+  all.indeterminate = n > 0 && n < ids.length;
+  all.disabled = !ids.length;
+  $("#b-batch").hidden = !n;
+  $("#b-batch-n").textContent = `${n} selected`;
+  const sel = [...BS.checked].map((id) => S.boxes.get(id)).filter(Boolean);
+  for (const btn of $$("#b-batch [data-box]")) {
+    const fit = sel.filter(BOX_BATCH[btn.dataset.box]).length;
+    btn.disabled = !fit;
+    btn.dataset.fit = fit && fit < n ? String(fit) : "";
+  }
+  for (const r of $$("#boxes-body tr")) {
+    const on = BS.checked.has(r.dataset.id);
+    r.classList.toggle("checked", on);
+    const c = $(".box-check", r);
+    if (c && c.checked !== on) c.checked = on;
+  }
+}
+function checkBoxRow(id, on, range) {
+  const ids = shownBoxIds();
+  const a = range && BS.last ? ids.indexOf(BS.last) : -1, b = ids.indexOf(id);
+  for (const x of a >= 0 && b >= 0 ? ids.slice(Math.min(a, b), Math.max(a, b) + 1) : [id]) on ? BS.checked.add(x) : BS.checked.delete(x);
+  BS.last = id;
+  syncBoxChecks();
+}
+$("#boxes-body").addEventListener("click", (e) => {
+  const cb = e.target.closest(".box-check");
+  if (cb) checkBoxRow(cb.closest("tr").dataset.id, cb.checked, e.shiftKey);
+});
+$("#b-sel-all").addEventListener("change", (e) => {
+  if (e.target.checked) shownBoxIds().forEach((i) => BS.checked.add(i)); else BS.checked.clear();
+  BS.last = null;
+  syncBoxChecks();
+});
+$("#b-batch-clear").addEventListener("click", () => { BS.checked.clear(); syncBoxChecks(); $("#b-sel-all").focus(); });
+$("#view-boxes").addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || !BS.checked.size || e.target.matches("input[type=search]") || document.querySelector("dialog[open]")) return;
+  e.preventDefault(); BS.checked.clear(); syncBoxChecks();
+});
+const BOX_BATCH_TXT = {
+  empty: ["Empty what waits in", "Every message still waiting in these boxes is purged without being handled; each sender is told. Their logs keep them, marked purged.", "Empty", "box_empty"],
+  purge: ["Purge the history of", "What no longer waits among their messages goes from this computer for good: their logs, their attached files and the console's copy. What still waits, and what an open box handled within the kept delay (Settings), stays.", "Purge", "box_purge"],
+  close: ["Close", "Their remote peers are told; what still reaches each one goes to its project's box (else the machine box). A session opens its box again if it comes back.", "Close", "box_close"],
+  delete: ["Delete", "What still waits in a closed session box goes to its project's box (else the machine box), its folder archived without its keys; a project box hands what waits to the machine box and opens again by itself when its project needs it.", "Delete", "box_delete"],
+};
+$("#b-batch").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-box]");
+  if (!btn || btn.disabled) return;
+  const kind = btn.dataset.box, sel = [...BS.checked].map((id) => S.boxes.get(id)).filter(Boolean);
+  const fit = sel.filter(BOX_BATCH[kind]);
+  if (!fit.length) return;
+  const [verb, text, okLabel, act] = BOX_BATCH_TXT[kind];
+  const noun = kind === "close" ? "session box(es)" : "box(es)";
+  const left = sel.length - fit.length;
+  const skip = left ? ` The ${left} other selected box(es) stay as they are: ${kind === "close" ? "only an open session box of this computer closes"
+    : kind === "delete" ? "only a project box or a closed session box of this computer is deleted" : "only this computer's own boxes are acted upon"}.` : "";
+  confirmRun(`${verb} ${fit.length} ${noun}?`, `${fit.map((b) => boxName(b.id)).join(", ")}. ${text}${skip}`, async () => {
+    const outs = [];
+    let ok = true;
+    for (const b of fit) {  // one at a time: each runs the client under that box's lock
+      const r = await action({ action: act, id: b.id }).catch((x) => ({ ok: false, err: x.message }));
+      ok = ok && !!r.ok;
+      outs.push(`${r.ok ? "✓" : "✗"} ${boxName(b.id)}: ` + ([r.out, r.err].filter(Boolean).join(" ").trim() || (r.ok ? "done" : "failed")));
+      if (r.ok && (kind === "close" || kind === "delete")) BS.checked.delete(b.id);
+    }
+    syncBoxChecks();
+    return { ok, out: outs.join("\n") };
+  }, { okLabel });
+});
 function renderServers() {
   const snap = S.snap;
   if (!snap) return;
@@ -1668,7 +1790,7 @@ function confirmRun(title, text, body, { okLabel = "Confirm", after } = {}) {
     if (dlg.returnValue !== "ok") return;
     dlg.returnValue = "";
     toast("Running…");
-    const r = await action(body);
+    const r = typeof body === "function" ? await body() : await action(body);  // a function: several actions in a row (a batch)
     showOutput(title, r);
     poll(true);
     after?.(r);
@@ -1778,7 +1900,7 @@ function showTab(name) {
   if (name === "settings" && token) { loadButlerSettings(); loadAccount(); }
   localStorage.setItem("mmbox-console-tab", name);
 }
-$(".tabs").addEventListener("click", (e) => { const t = e.target.closest(".tab"); if (t) showTab(t.id.slice(4)); });
+$(".tabs").addEventListener("click", (e) => { const t = e.target.closest(".tab"); if (t) { RD.tab = NAV.tab = NAV.box = null; showTab(t.id.slice(4)); } });
 $(".tabs").addEventListener("keydown", (e) => {
   const tabs = $$(".tab"), i = tabs.indexOf(document.activeElement);
   if (i < 0) return;
@@ -1831,8 +1953,14 @@ function remember(key) {
   notified.add(key);
   localStorage.setItem(NKEY, JSON.stringify([...notified].slice(-3000)));
 }
+// in the console's own window (#…&app=1) WebKit refuses the browser's notifications: the console shows them by the system
+const IN_APP = DEEP.get("app") === "1" || sessionStorage.getItem("mmbox-console-app") === "1";
+const webNotify = () => "Notification" in window && Notification.permission === "granted";
 function notify(title, body, tag) {
-  if (F.desktop && "Notification" in window && Notification.permission === "granted") {
+  if (F.desktop && IN_APP) {
+    const id = tag.replace(/^(late|fw):/, "");
+    action({ action: "alert", title, body, ...(tag === "late:summary" ? { late: true } : { msg: id }) }).catch(() => {});
+  } else if (F.desktop && webNotify()) {
     const n = new Notification(title, { body: body.slice(0, 300), tag, silent: false });
     n.onclick = () => { window.focus(); n.close(); if (tag === "late:summary") showLate(); else openWhenListed(tag.replace(/^(late|fw):/, "")); };
   }
@@ -1853,6 +1981,7 @@ function openFromNotification(t) {
   if ($("#question").open && !t.question) $("#question").close();  // the modal question would hide the message
   if (t.msg) openWhenListed(t.msg);
   else if (t.held) showHeld();
+  else if (t.late) showLate();
   else if (t.question) {
     if (pendingQ().length) openQuestions(t.question);
     else { S.wantQuestion = t.question; poll(true); }
@@ -2120,13 +2249,16 @@ $("#t-reset").addEventListener("click", async (e) => {
   poll(true);
 });
 $("#n-desktop").addEventListener("change", async (e) => {
-  if (e.target.checked && "Notification" in window && Notification.permission !== "granted") {
-    const p = await Notification.requestPermission();
+  if (e.target.checked && IN_APP) {
+    const r = await api("/api/pending").catch(() => ({}));
+    if (!r.desktop) { e.target.checked = false; toast("No system notifications on this computer (libnotify missing)", true); }
+  } else if (e.target.checked && !webNotify()) {
+    const p = "Notification" in window ? await Notification.requestPermission() : "denied";
     if (p !== "granted") { e.target.checked = false; toast("Notifications refused by the browser", true); }
   }
   F.desktop = e.target.checked; saveF();
 });
-$("#n-desktop").checked = F.desktop && "Notification" in window && Notification.permission === "granted";
+$("#n-desktop").checked = F.desktop && (IN_APP || webNotify());
 $("#n-forward").checked = F.notifyForward;
 $("#n-forward").addEventListener("change", (e) => { F.notifyForward = e.target.checked; saveF(); });
 $("#n-late").value = F.lateMin;

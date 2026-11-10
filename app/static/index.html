@@ -174,6 +174,7 @@
         <div id="list" class="list" role="listbox" aria-label="Messages" tabindex="0"></div>
         <section id="chat" class="chat" hidden aria-labelledby="chat-title">
           <header class="chat-head">
+            <button id="chat-back" class="btn icon ripple" type="button" hidden></button>
             <div class="chat-who">
               <h2 id="chat-title"></h2>
               <p id="chat-sub" class="dim"></p>
@@ -209,6 +210,7 @@
         <div class="reader-bar" role="toolbar" aria-label="Message">
           <button id="reader-back" class="btn icon ripple" type="button" aria-label="Back to the list" title="Back to the list (Esc)"></button>
           <span id="reader-pos" class="dim reader-pos"></span>
+          <div id="reader-who" class="reader-who" aria-label="Sender and recipient"></div>
           <span class="spacer"></span>
           <button id="reader-delete" class="btn icon ripple" type="button" aria-label="Delete this thread" title="Delete this thread from this computer (Shift+Delete; Delete: this message alone)"></button>
           <button id="reader-prev" class="btn icon ripple" type="button" aria-label="Previous message" title="Previous message (k)"></button>
@@ -251,11 +253,22 @@
         </div>
         <label class="switch-row"><input type="checkbox" role="switch" id="b-active" class="switch" checked> <span>active only</span></label>
       </div>
+      <div class="list-head">
+        <input type="checkbox" class="check" id="b-sel-all" aria-label="Select every box shown" title="Select every box shown (Shift+click a row's box: a range)">
+        <div id="b-batch" class="batch" role="toolbar" aria-label="Selected boxes" hidden>
+          <span id="b-batch-n" class="batch-n" aria-live="polite"></span>
+          <button class="btn small ripple" type="button" id="b-batch-empty" data-box="empty" title="Purge what waits unhandled in the selected boxes of this computer (their senders are told)">Empty what waits</button>
+          <button class="btn small ripple" type="button" id="b-batch-purge" data-box="purge" title="Purge from this computer the history of the selected boxes of this computer (what no longer waits)">Purge history</button>
+          <button class="btn small ripple" type="button" id="b-batch-close" data-box="close" title="Close the selected session boxes of this computer that are still open">Close</button>
+          <button class="btn small danger ripple" type="button" id="b-batch-delete" data-box="delete" title="Delete the selected project boxes and closed session boxes of this computer">Delete</button>
+          <button class="btn small text ripple" type="button" id="b-batch-clear">Clear</button>
+        </div>
+        <p id="boxes-caption" class="dim" role="status" aria-live="polite"></p>
+      </div>
       <div class="table-wrap">
-        <table class="table">
-          <caption class="dim" id="boxes-caption"></caption>
+        <table class="table boxes-table">
           <thead><tr>
-            <th scope="col">State</th><th scope="col">Box</th><th scope="col">Machine</th><th scope="col">Project</th>
+            <th scope="col" class="check-col"><span class="sr">Selection</span></th><th scope="col">State</th><th scope="col">Box</th><th scope="col">Machine</th><th scope="col">Project</th>
             <th scope="col">Servers</th><th scope="col">Waiting</th><th scope="col">Last activity</th><th scope="col"><span class="sr">Actions</span></th>
           </tr></thead>
           <tbody id="boxes-body"></tbody>

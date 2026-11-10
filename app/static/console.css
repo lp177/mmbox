@@ -137,8 +137,8 @@ body.own-titlebar .splash { -webkit-user-select: none; user-select: none; }
   transition: transform .15s var(--ease), color .15s var(--ease); white-space: nowrap; max-width: calc(100% - 24px);
   overflow: hidden; text-overflow: ellipsis;
 }
-.field input:focus + label, .field input:not(:placeholder-shown) + label,
-.field textarea:focus + label, .field textarea:not(:placeholder-shown) + label,
+.field input:focus ~ label, .field input:not(:placeholder-shown) ~ label,
+.field textarea:focus ~ label, .field textarea:not(:placeholder-shown) ~ label,
 .field select + label { transform: translateY(-9px) scale(.78); }
 .field input:hover, .field select:hover, .field textarea:hover { background: var(--s3); }
 .field input:focus, .field select:focus, .field textarea:focus { border-bottom: 2px solid var(--primary); background: var(--s3); }
@@ -149,7 +149,7 @@ body.own-titlebar .splash { -webkit-user-select: none; user-select: none; }
 .field :focus-visible { outline: none; }
 .field.small input { min-height: 40px; padding-top: 16px; }
 .field.small label { top: 10px; }
-.field.small input:focus + label, .field.small input:not(:placeholder-shown) + label { transform: translateY(-7px) scale(.75); }
+.field.small input:focus ~ label, .field.small input:not(:placeholder-shown) ~ label { transform: translateY(-7px) scale(.75); }
 .help { color: var(--text-3); font-size: 12px; margin: 0 0 8px; }
 .error { color: var(--err); min-height: 1.2em; margin: 4px 0; font-size: 13px; }
 
@@ -256,7 +256,17 @@ main { min-height: 0; }
 .list-head { align-items: center; }
 .batch { display: flex; gap: 8px; align-items: center; }
 .batch-n { font-size: 13px; color: var(--primary); font-weight: 500; white-space: nowrap; }
-.batch:not([hidden]) ~ #list-count { display: none; }
+.batch:not([hidden]) ~ #list-count, .batch:not([hidden]) ~ #boxes-caption { display: none; }
+/* the Boxes table: a checkbox at the start of each row, the checked rows highlighted as the list's */
+#view-boxes:not([hidden]) { display: flex; flex-direction: column; overflow: hidden; }
+#view-boxes > .toolbar, #view-boxes > .list-head { flex: none; }
+#view-boxes > .list-head { min-height: 48px; }
+#view-boxes > .table-wrap { flex: 1; min-height: 0; }
+.boxes-table .check-col { width: 18px; padding-right: 0; }
+.boxes-table td.check-col { padding-top: 9px; }
+.boxes-table tr.checked td { background: rgb(138 180 248 / .09); }
+.boxes-table tr.checked:hover td { background: rgb(138 180 248 / .13); }
+#b-batch [data-fit]:not([data-fit=""])::after { content: " (" attr(data-fit) ")"; }  /* the action fits only some of the selection */
 @media (prefers-reduced-motion: reduce) { .check { transition: none; } }
 .msg .line1 { display: flex; gap: 8px; align-items: center; min-width: 0; font-size: 12px; color: var(--text-2); }
 .msg .route { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -305,7 +315,13 @@ details.raw pre { font: 12px/1.5 var(--mono); background: var(--s1); padding: 12
   display: flex; align-items: center; gap: 4px; padding: 4px 8px; min-height: 48px; border-bottom: 1px solid var(--line); background: var(--s1); flex: none;
 }
 .reader-bar .btn.icon svg { width: 22px; height: 22px; }
-.reader-pos { font-size: 12px; font-variant-numeric: tabular-nums; margin-left: 6px; }
+.reader-pos { font-size: 12px; font-variant-numeric: tabular-nums; margin-left: 6px; white-space: nowrap; flex: none; }
+/* who sent the open message and to whom, always in sight above it */
+.reader-who { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 18px; min-width: 0; margin-left: 14px; font-size: 14px; }
+.reader-who .who { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; max-width: 100%; }
+.reader-who .who-k { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); flex: none; }
+.reader-who .boxref { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.reader-who .who-v { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .spacer { flex: 1; }
 .reader-scroll { flex: 1; min-height: 0; overflow: auto; outline: none; }
 .reader-body { padding: 18px 28px 4px; max-width: 1100px; }
@@ -514,6 +530,8 @@ fieldset { border: 0; margin: 0; padding: 0; }
 .chat { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .chat-head { padding: 10px 14px 6px; border-bottom: 1px solid var(--line); background: var(--s1); display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; }
 .chat-who { flex: 1 1 220px; min-width: 0; }
+.chat-head #chat-back { margin: -4px -6px -4px -8px; }
+.chat-head #chat-back svg { width: 22px; height: 22px; }
 .chat-who h2 { font-size: 16px; }
 .chat-who p { margin: 2px 0 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-keep { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
