@@ -412,33 +412,111 @@ class Operator:
 _SKEW: dict[str, float] = {}
 
 
+class ConnPool:
+    """Kept-alive connections to the services, shared by every thread of the console. A distant service costs a
+    round trip per request on a kept connection, against three or four for a new TLS one (about 1 s instead of 0.3 s
+    over a 300 ms link); the refresh's jobs and the page's actions each run in a thread of their own, so the
+    client's per-thread connections would never be used twice. Behind a proxy (its environment variables) or with
+    MMBOX_NO_KEEPALIVE: urllib, a new connection each time, as before."""
+
+    KEEP = 8  # idle connections kept per service: about as many as one refresh asks at once
+
+    def __init__(self):
+        self.idle: dict[tuple, list] = {}
+        self.lock = threading.Lock()
+        self._tls = None
+        self.direct = not (os.environ.get("MMBOX_NO_KEEPALIVE") or any(os.environ.get(k) for k in (
+            "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY")))
+
+    def tls(self):
+        if self._tls is None:
+            import ssl
+            self._tls = ssl.create_default_context()
+        return self._tls
+
+    def request(self, url: str, method: str, body: bytes | None, headers: dict, timeout: float) -> tuple[int, dict, bytes]:
+        """(status, headers, body) of one request; OSError when the service could not be reached or answered
+        nothing readable."""
+        if not self.direct:
+            req = urllib.request.Request(url, data=body, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return r.status, dict(r.headers), r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, dict(e.headers or {}), e.read() or b""
+            except urllib.error.URLError as e:
+                raise OSError(str(e.reason)) from None
+        import http.client
+        u = urllib.parse.urlsplit(url)
+        key = (u.scheme, u.hostname, u.port)
+        path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+        for attempt in range(2):
+            with self.lock:
+                idle = self.idle.get(key) or []
+                conn = idle.pop() if idle else None
+            kept = conn is not None
+            if conn is None:
+                conn = (http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=self.tls())
+                        if u.scheme == "https" else http.client.HTTPConnection(u.hostname, u.port, timeout=timeout))
+            try:
+                conn.timeout = timeout
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                conn.request(method, path, body=body, headers={**headers, "Connection": "keep-alive"})
+                r = conn.getresponse()
+                data = r.read()
+            except (http.client.HTTPException, OSError) as exc:
+                conn.close()
+                if kept and not attempt and not isinstance(exc, TimeoutError):
+                    continue  # a kept connection the service closed while it was idle: once more, on a new one
+                if isinstance(exc, OSError):
+                    raise
+                raise OSError(f"{type(exc).__name__}: {exc}") from None
+            if r.will_close:
+                conn.close()
+            else:
+                with self.lock:
+                    idle = self.idle.setdefault(key, [])
+                    if len(idle) < self.KEEP:
+                        idle.append(conn)
+                        conn = None
+                if conn is not None:
+                    conn.close()
+            return r.status, dict(r.getheaders()), data
+        raise OSError("no answer")
+
+
+POOL = ConnPool()
+
+
 def call(url: str, ident, path: str, body: dict, timeout: float = 20) -> dict:
     """POST /v1<path> on service `url`, signed by `ident` (anything with .id and .sign): {"ok"...} or {"_error"...}."""
     raw = json.dumps(body, ensure_ascii=False).encode()
     for attempt in range(2):
         ts, nonce = str(int(time.time() + _SKEW.get(url, 0))), secrets.token_hex(16)
         msg = "\n".join(["mmbox/2", "POST", "/v1" + path, ts, nonce, hashlib.sha256(raw).hexdigest()]).encode()
-        req = urllib.request.Request(url + "/v1" + path, data=raw, method="POST", headers={
-            "Content-Type": "application/json", "User-Agent": M.UA + " console", "X-Mmbox-Id": ident.id,
-            "X-Mmbox-Ts": ts, "X-Mmbox-Nonce": nonce, "X-Mmbox-Sig": M.b64e(ident.sign.sign(msg))})
+        headers = {"Content-Type": "application/json", "User-Agent": M.UA + " console", "X-Mmbox-Id": ident.id,
+                   "X-Mmbox-Ts": ts, "X-Mmbox-Nonce": nonce, "X-Mmbox-Sig": M.b64e(ident.sign.sign(msg))}
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                _clock(url, r.headers.get("Date"))
-                return json.loads(r.read() or b"{}")
-        except urllib.error.HTTPError as e:
-            _clock(url, e.headers.get("Date") if e.headers else None)
+            code, rh, data = POOL.request(url + "/v1" + path, "POST", raw, headers, timeout)
+        except OSError as e:  # TimeoutError included
+            return {"_error": 0, "error": str(e) or type(e).__name__}
+        _clock(url, rh.get("Date") or rh.get("date"))
+        if 200 <= code < 300:
             try:
-                why = json.loads(e.read() or b"{}").get("error", "")
+                return json.loads(data or b"{}")
             except ValueError:
-                why = ""
-            if e.code == 401 and "skew" in why and attempt == 0:
-                continue
-            if e.code == 401 and "unknown identity" in why and attempt == 0 and isinstance(ident, Operator):
-                call(url, ident, "/card", {"card": ident.card()})
-                continue
-            return {"_error": e.code, "error": why}
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            return {"_error": 0, "error": str(getattr(e, "reason", e))}
+                return {"_error": code, "error": "unreadable answer"}
+        try:
+            why = json.loads(data or b"{}").get("error", "")
+        except (ValueError, AttributeError):
+            why = ""
+        if code == 401 and "skew" in why and attempt == 0:
+            continue
+        if code == 401 and "unknown identity" in why and attempt == 0 and isinstance(ident, Operator):
+            call(url, ident, "/card", {"card": ident.card()})
+            continue
+        return {"_error": code, "error": why}
     return {"_error": 0, "error": "gave up"}
 
 
@@ -454,14 +532,15 @@ def _clock(url: str, date: str | None) -> None:
 def health(url: str) -> dict:
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(urllib.request.Request(url + "/v1/health", headers={"User-Agent": M.UA + " console"}),
-                                    timeout=6) as r:
-            _clock(url, r.headers.get("Date"))
-            h = json.loads(r.read() or b"{}")
-            h["ms"] = round((time.monotonic() - t0) * 1000)
-            return h
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return {"_error": 0, "error": str(getattr(e, "reason", e))}
+        code, rh, data = POOL.request(url + "/v1/health", "GET", None, {"User-Agent": M.UA + " console"}, 6)
+        _clock(url, rh.get("Date") or rh.get("date"))
+        if not 200 <= code < 300:
+            return {"_error": code, "error": f"HTTP {code}"}
+        h = json.loads(data or b"{}")
+        h["ms"] = round((time.monotonic() - t0) * 1000)
+        return h
+    except (OSError, ValueError) as e:
+        return {"_error": 0, "error": str(e) or type(e).__name__}
 
 
 def parallel(fns: dict) -> dict:
