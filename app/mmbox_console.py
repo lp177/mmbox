@@ -704,6 +704,12 @@ class Recaps:
             return len(gone)
 
 
+def nm(name) -> str:
+    """A name the user chose (a box, a session, a machine, a service) marked in a text the page shows: it sets it apart
+    (console.js rich()). Only in what the page displays, never in logs or system notifications."""
+    return f"\u27e6{name}\u27e7"
+
+
 def desktop_session() -> bool:
     """A Linux graphical session with a session bus: where the notification area and the notifications are."""
     return os.name != "nt" and sys.platform != "darwin" and bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS")) \
@@ -2172,7 +2178,7 @@ class State:
                 continue
             b = self.snapshot_box(sender) or {}
             d = self.daemon_of(b) if b else None
-            name = b.get("label") or sender
+            name = nm(b.get("label") or sender)
             if not d:
                 why.append(f"{name} keeps resending it from another computer, which runs no mmbox daemon this console "
                            f"knows: only that computer can drop it")
@@ -2369,7 +2375,7 @@ class State:
                     err += " (its client predates remote box commands: update it, then restart its daemon)"
                 return {"ok": not err, "out": out.get("out"), "err": err}
             time.sleep(0.5)
-        return {"ok": True, "out": f"asked the daemon of {d.get('label') or d['id']}; no answer yet: its box shows the "
+        return {"ok": True, "out": f"asked the daemon of {nm(d.get('label') or d['id'])}; no answer yet: its box shows the "
                                    f"change once it acted (never, if that computer has not pinned this console's "
                                    f"operator key: then its butler's chat says it got a message)"}
 

@@ -5,19 +5,30 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
+// A name the user chose (a box, a session, a machine, a project, a service, a channel) is set apart in a sentence:
+// nm() marks it, rich() draws it (span.uname), plain() drops the marks where only text goes (attributes, notifications)
+const nm = (s) => `\u27E6${s}\u27E7`;
+const plain = (s) => String(s ?? "").replace(/[\u27E6\u27E7]/g, "");
+function rich(s) {
+  return String(s).split(/\u27E6([^\u27E7]*)\u27E7/).map((part, i) =>
+    i % 2 ? h("span", { class: "uname" }, part) : part).filter((x) => x !== "");
+}
+const setRich = (el, s) => el.replaceChildren(...rich(s ?? ""));
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v === undefined || v === null || v === false) continue;
     if (k === "class") el.className = v;
-    else if (k === "text") el.textContent = v;
+    else if (k === "text") el.textContent = plain(v);
     else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else if (k === "dataset") Object.assign(el.dataset, v);
-    else el.setAttribute(k, v === true ? "" : v);
+    else el.setAttribute(k, v === true ? "" : typeof v === "string" ? plain(v) : v);
   }
   for (const c of kids.flat(Infinity)) {
     if (c === null || c === undefined || c === false) continue;
-    el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    if (c instanceof Node) el.append(c);
+    else if (typeof c === "string" && c.includes("\u27E6") && tag !== "option") el.append(...rich(c));
+    else el.append(document.createTextNode(plain(c)));
   }
   return el;
 }
@@ -181,9 +192,9 @@ const projectBoxIds = () => new Set([...S.boxes.values()].filter(isProjectBox).m
 function nodeLabel(node) {
   if (node.type === "all") return "All messages";
   if (node.type === "projects") return "Project boxes";
-  if (node.type === "machine") return `Machine ${machineName(node.key)}`;
-  if (node.type === "project") { const [mk, wp] = node.key.split("\u0000"); return `Project ${wp || "(no project)"} on ${machineName(mk)}`; }
-  if (node.type === "box") return `Box ${boxName(node.key)}`;
+  if (node.type === "machine") return `Machine ${nm(machineName(node.key))}`;
+  if (node.type === "project") { const [mk, wp] = node.key.split("\u0000"); return `Project ${wp ? nm(wp) : "(no project)"} on ${nm(machineName(mk))}`; }
+  if (node.type === "box") return `Box ${nm(boxName(node.key))}`;
   if (node.type === "provider") return `Provider ${node.key || "(not declared)"}`;
   if (node.type === "model") { const [p, m] = node.key.split("\u0000"); return `Model ${[p, m].filter(Boolean).join(" · ") || "(not declared)"}`; }
   if (node.type === "server") return `Server ${(S.servers.get(node.key) || {}).name || node.key}`;
@@ -441,7 +452,7 @@ function rightsOf(node) {
     const b = S.boxes.get(node.key);
     const butler = [...S.boxes.values()].find((x) => x.role === "butler" && !x.local && machineKey(x) === node.key);
     return b?.rights ? { target: b.id, rights: b.rights.rights, source: b.rights.source, butler: !!butler, butlerBox: butler?.id,
-      title: `Messages from ${machineName(node.key)} and its sessions` + networkNote(b) } : null;
+      title: `Messages from ${nm(machineName(node.key))} and its sessions` + networkNote(b) } : null;
   }
   if (node.type === "server") {
     const net = snap.service_rights?.[node.key];
@@ -458,11 +469,11 @@ function rightsOf(node) {
     // what this computer can do to its own boxes; another computer's daemon does it to its boxes (an op)
     const acts = b?.local ? (b.role !== "operator" ? boxActs(b) : null) : remoteActs(b);
     if (!base && !acts) return null;
-    return { ...(base || { noRights: true, title: `${boxTitle(b)} (${b.local ? "this computer" : machineName(machineKey(b))})` }), acts };
+    return { ...(base || { noRights: true, title: `${boxTitle(b)} (${b.local ? "this computer" : nm(machineName(machineKey(b)))})` }), acts };
   }
   return null;
 }
-const boxTitle = (b) => isProjectBox(b) ? `Project box ${b.work || b.label}` : b.role === "machine" ? `Machine box ${b.label || b.id}` : `Box ${boxName(b.id)}`;
+const boxTitle = (b) => isProjectBox(b) ? `Project box ${nm(b.work || b.label)}` : b.role === "machine" ? `Machine box ${nm(b.label || b.id)}` : `Box ${nm(boxName(b.id))}`;
 function boxActs(b) {
   const open = !b.closed_at;
   return { purge: true, empty: true, close: b.role === "session" && open, del: isProjectBox(b) || (b.role === "session" && !open) };
@@ -480,13 +491,13 @@ function boxRights(b, snap) {
     if (r.other_project) {  // a session of another project of this computer: its box, then its project, the computer, the network, Ask
       const p = r.other_project, pr = snap.other_project_rights?.projects?.[p];
       return { target: b.id, rights: r.rights, source: r.source, otherProject: p, follow: "Follow its project and this computer",
-        followed: "follows its project and this computer", following: r.source !== "own", title: `Messages from ${boxName(b.id)} — another project (${p})`,
+        followed: "follows its project and this computer", following: r.source !== "own", title: `Messages from ${nm(boxName(b.id))} — another project (${nm(p)})`,
         other: { target: "project:" + p, rights: pr || null, follow: "Follow this computer's setting for other projects",
           followed: "follows this computer's setting for other projects", following: !pr, title: `Every session of project ${p} on this computer` } };
     }
-    const follow = r.local ? "Follow the sessions of this computer" : r.introduced_by ? `Follow its workstation (${machineName(machineKey(b))})` : null;
+    const follow = r.local ? "Follow the sessions of this computer" : r.introduced_by ? `Follow its workstation (${nm(machineName(machineKey(b)))})` : null;
     return { target: b.id, rights: r.rights, source: r.source, follow, following: r.source === "follows" || r.source === "local",
-      env: r.local && snap.local_rights?.env, title: `Messages from ${boxName(b.id)}` + (r.local ? "" : networkNote(b)) };
+      env: r.local && snap.local_rights?.env, title: `Messages from ${nm(boxName(b.id))}` + (r.local ? "" : networkNote(b)) };
   }
 }
 const RM = { el: $("#rights-menu"), r: null, nid: null, fromPointer: false };
@@ -517,7 +528,7 @@ function openRangeMenu(url, fromPointer) {
   if (!btn) return;
   if (RG.el.matches(":popover-open")) RG.el.hidePopover();
   Object.assign(RG, { url, btn, nid: li.dataset.nid, fromPointer });
-  $("#range-menu-title").textContent = `Messages through ${(S.servers.get(url) || {}).name || url} over`;
+  setRich($("#range-menu-title"), `Messages through ${nm((S.servers.get(url) || {}).name || url)} over`);
   $$('[data-range]', RG.el).forEach((b) => b.dataset.range !== "clear" && b.setAttribute("aria-checked", String(+b.dataset.range === rangeOf(url))));
   try { RG.el.showPopover({ source: btn }); } catch { RG.el.showPopover(); }
 }
@@ -570,7 +581,7 @@ function openRightsMenu(li, fromPointer) {
   if (!r || !btn) return;
   if (RM.el.matches(":popover-open")) RM.el.hidePopover();
   Object.assign(RM, { r, nid: li.dataset.nid, fromPointer, btn });
-  $("#rights-menu-title").textContent = r.title;
+  setRich($("#rights-menu-title"), r.title);
   $("#rights-main").hidden = !!r.noRights;
   $("#rights-butler").hidden = $("#rights-butler-sep").hidden = !r.butler;
   const ba = $("#box-acts");
@@ -657,16 +668,16 @@ RM.el.addEventListener("keydown", (e) => {
 });
 RM.el.addEventListener("pointermove", (e) => { const it = e.target.closest('[role="menuitemradio"]'); if (it && !it.disabled && document.activeElement !== it) it.focus({ focusVisible: false }); });
 const BOX_ACT = {
-  purge: (b) => [`Purge the history of ${boxTitle(b).toLowerCase().startsWith("box") ? boxName(b.id) : boxTitle(b)}?`,
+  purge: (b) => [`Purge the history of ${boxTitle(b).toLowerCase().startsWith("box") ? nm(boxName(b.id)) : boxTitle(b)}?`,
     "What no longer waits among its messages goes from this computer for good: its log, their attached files and the console's copy. What still waits, and what an open box handled within the kept delay (Settings), stays.",
     "Purge", "box_purge"],
-  empty: (b) => [`Empty what waits in ${isProjectBox(b) ? boxTitle(b) : boxName(b.id)}?`,
+  empty: (b) => [`Empty what waits in ${isProjectBox(b) ? boxTitle(b) : nm(boxName(b.id))}?`,
     "Every message still waiting in this box is purged without being handled; each sender is told. Its log keeps them, marked purged.",
     "Empty", "box_empty"],
-  close: (b) => [`Close the session box ${boxName(b.id)}?`,
+  close: (b) => [`Close the session box ${nm(boxName(b.id))}?`,
     "Its remote peers are told; what still reaches it goes to its project's box (else the machine box). The session opens it again if it comes back.",
     "Close", "box_close"],
-  delete: (b) => [isProjectBox(b) ? `Delete the project box ${b.work || b.label}?` : `Delete the closed box ${boxName(b.id)}?`,
+  delete: (b) => [isProjectBox(b) ? `Delete the project box ${nm(b.work || b.label)}?` : `Delete the closed box ${nm(boxName(b.id))}?`,
     isProjectBox(b) ? "What waits in it goes to the machine box and its remote peers are told; it closes, and its folder goes 7 days later. It opens again by itself when a session of the project starts or a message for the project arrives."
       : "What still waits in it goes to its project's box (else the machine box); its folder is archived without its keys.",
     "Delete", "box_delete"],
@@ -923,7 +934,7 @@ $("#chat-log").addEventListener("keydown", (e) => {
 async function setPin(box, pinned) {
   const r = await action({ action: "conv_pin", box, pinned });
   if (!r.ok) { toast("Failed: " + (r.err || "?"), true); return; }
-  toast(pinned ? `Conversation with ${boxName(box)} pinned: nothing expires` : `Conversation with ${boxName(box)} unpinned: each message starts the full delay again`);
+  toast(pinned ? `Conversation with ${nm(boxName(box))} pinned: nothing expires` : `Conversation with ${nm(boxName(box))} unpinned: each message starts the full delay again`);
   S.snap.pinned = pinned ? [...new Set([...(S.snap.pinned || []), box])] : (S.snap.pinned || []).filter((x) => x !== box);
   renderTree(); renderBoxes();
   if (CH.box === box) renderChat(true);
@@ -990,7 +1001,7 @@ function renderList() {
   $("#list-count").textContent = `${rows.length} message(s)${span} · ${waitingN} waiting` + (rows.length > S.limit ? ` · ${S.limit} shown` : "");
   $("#new-session-btn").hidden = !["machine", "project", "box", "projects"].includes(S.node.type);
   $("#list-count").title = "The history of the boxes of this computer and of the collectors, with the filters above; \"waiting\": still in a box (queued, sent, unread or taken). The Memory view purges what no longer waits.";
-  $("#scope").textContent = nodeLabel(S.node);
+  setRich($("#scope"), nodeLabel(S.node));
   const frag = document.createDocumentFragment();
   let last = null;
   const shown = rows.slice(0, S.limit);
@@ -1256,7 +1267,7 @@ function renderSent() {
     const sm = x.id && S.byId.get(x.id);
     const st = !x.id ? "sent (no id in the client's answer)" : sm ? stateText(sm) : "sent, waiting for the next refresh";
     return h("div", { class: "sent-note" }, svg(ICON.check, "ico tiny"),
-      h("span", {}, `Sent ${fmtTime.format(new Date(x.at))} to ${boxName(x.to)}: `, h("strong", {}, st)),
+      h("span", {}, `Sent ${fmtTime.format(new Date(x.at))} to ${nm(boxName(x.to))}: `, h("strong", {}, st)),
       x.id ? h("span", { class: "mono dim" }, " " + x.id) : null,
       sm ? h("button", { class: "btn text ripple", type: "button", onclick: () => openMessage(x.id) }, "Open") : null);
   }));
@@ -1285,7 +1296,7 @@ async function openReply(m = RP.msg, draft = null, focus = true) {
   const f = $("#reply-form");
   if (!f.hidden && !draft) { if (focus) { $("#reply-text").focus({ preventScroll: true }); f.scrollIntoView({ block: "nearest", behavior: reduceMotion.matches ? "auto" : "smooth" }); } return; }
   const subj = m.subject || (m.lock ? `lock ${m.lock.name}` : "");
-  $("#reply-head").textContent = `${t.to === m.from ? "Reply to" : "Write again to"} ${boxName(t.to)}`;
+  setRich($("#reply-head"), `${t.to === m.from ? "Reply to" : "Write again to"} ${nm(boxName(t.to))}`);
   $("#reply-subject").value = draft?.subject ?? (/^re:/i.test(subj) ? subj : "Re: " + subj);
   $("#reply-kind").value = draft?.kind ?? (t.to === m.from ? "reply" : m.kind || "info");
   // writing again to a box that was asked something: the operator wants to hear back
@@ -1311,7 +1322,7 @@ async function openReply(m = RP.msg, draft = null, focus = true) {
 function replyRoute() {
   const el = $("#reply-route"), s = RP.senders?.get($("#reply-from").value);
   if (!s) { el.replaceChildren(); return; }
-  const b = boxOf(s.id), name = s.role === "machine" ? `the machine box ${b.label || s.label}` : `the session box ${boxName(s.id)}`;
+  const b = boxOf(s.id), name = s.role === "machine" ? `the machine box ${nm(b.label || s.label)}` : `the session box ${nm(boxName(s.id))}`;
   const gone = b.closed_at || b.retired_at, live = b.listening || b.listening_here;
   el.className = "reply-route" + (gone ? " warn" : "");
   el.replaceChildren(`Sent as ${name}: its answer comes back to that box`,
@@ -1394,7 +1405,7 @@ function renderDetail(m, partial) {
     })() : null,
     (m.answers || []).length ? [h("dt", {}, "Answered"), h("dd", {}, m.answers.flatMap((id, i) => {
       const a = S.byId.get(id);
-      return [i ? ", " : null, h("button", { class: "boxref", type: "button", onclick: () => openMessage(id) }, a ? `${when(tsOf(a))} by ${boxName(a.from)}` : id)];
+      return [i ? ", " : null, h("button", { class: "boxref", type: "button", onclick: () => openMessage(id) }, a ? `${when(tsOf(a))} by ${nm(boxName(a.from))}` : id)];
     }))] : null,
     m.work || m.project ? [h("dt", {}, "Project"), h("dd", {}, projectText(m))] : null,
     m.topic ? [h("dt", {}, "Topic"), h("dd", {}, m.topic)] : null,
@@ -1411,16 +1422,16 @@ function renderDetail(m, partial) {
   const heldBlock = isHeld(m) ? h("div", { class: "held-banner", role: "note" },
     h("div", { class: "held-head" }, svg(ICON.warn, "ico"), h("h2", {}, `Not delivered for ${heldAge(m)}`)),
     h("p", { class: "held-help" }, (m.held.why === "full"
-      ? `${recipientName(m.to)}'s box is full.`
-      : `${recipientName(m.to)} does not accept messages from ${boxName(m.from)} yet: its computer has not run since they were introduced.`)
-      + ` ${boxName(m.from)} keeps it and tries again by itself.`
+      ? `${nm(recipientName(m.to))}'s box is full.`
+      : `${nm(recipientName(m.to))} does not accept messages from ${nm(boxName(m.from))} yet: its computer has not run since they were introduced.`)
+      + ` ${nm(boxName(m.from))} keeps it and tries again by itself.`
       + (heldSilent(m) ? ` No new try since ${fmtFull.format(new Date(m.held.last || m.held.since))}: that computer may be off.` : "")),
     h("div", { class: "held-actions" },
       h("button", { class: "btn small ripple", type: "button", title: "Removed from its sender's queue: never delivered",
         onclick: () => deleteMessages([m.id]) }, "Delete it"),
       h("button", { class: "btn small text ripple", type: "button", title: "Out of the alert; its sender still keeps it and tries again by itself",
         onclick: () => heldAck([m.id]) }, "Mark handled"))) : heldAcked(m) ? h("div", { class: "notice held-acked" },
-    `Held for ${heldAge(m)}, marked handled ${when(m.held.ack)}: out of the alert. ${boxName(m.from)} still keeps it and sends it again by itself. `,
+    `Held for ${heldAge(m)}, marked handled ${when(m.held.ack)}: out of the alert. ${nm(boxName(m.from))} still keeps it and sends it again by itself. `,
     h("button", { class: "btn small text ripple", type: "button", onclick: () => heldAck([m.id], false) }, "Alert again")) : null;
   const rc = m.recap;
   const recapBlock = rc ? h("div", { class: "notice" }, h("strong", {}, `${m.sender_title || boxName(m.from)} finished its work`), h("br"),
@@ -1438,7 +1449,7 @@ function renderDetail(m, partial) {
     m.attachments?.length ? [h("h3", { class: "dim att-head" }, `Attachments (${m.attachments.length})`), attachmentsBlock(m, "detail")] : null,
     decisionBlock(m),
     thread.length ? [h("h3", { class: "dim" }, "Same thread"), h("ul", { class: "thread" }, thread.sort((a, b) => tsOf(a) - tsOf(b)).map((x) =>
-      h("li", {}, h("button", { type: "button", onclick: () => openMessage(x.id) }, `${when(tsOf(x))} · ${boxName(x.from)}: ${x.subject || x.id}`), msgMenuBtn(x))))] : null,
+      h("li", {}, h("button", { type: "button", onclick: () => openMessage(x.id) }, `${when(tsOf(x))} · ${nm(boxName(x.from))}: ${x.subject || x.id}`), msgMenuBtn(x))))] : null,
     h("div", { class: "actions" },
       replyTarget(m) ? h("button", { class: "btn filled ripple reply-btn", type: "button", onclick: () => openReply(RP.id === m.id && RP.msg ? RP.msg : m) },
         m.broadcast ? "Reply to the author" : replyTarget(m).to === m.from ? "Reply" : "Write again") : null,
@@ -1465,7 +1476,7 @@ function msgMenuBtn(m) {
 }
 function confirmAsk(title, text, okLabel) {
   const dlg = $("#confirm");
-  $("#confirm-title").textContent = title; $("#confirm-text").textContent = text;
+  setRich($("#confirm-title"), title); setRich($("#confirm-text"), text);
   $("#confirm-ok").textContent = okLabel;
   dlg.returnValue = "";
   return new Promise((done) => { dlg.addEventListener("close", () => done(dlg.returnValue === "ok"), { once: true }); dlg.showModal(); });
@@ -1719,7 +1730,7 @@ $("#b-batch").addEventListener("click", (e) => {
     const one = async (b) => {
       const r = await action({ action: act, id: b.id }).catch((x) => ({ ok: false, err: x.message }));
       ok = ok && !!r.ok;
-      outs.push(`${r.ok ? "✓" : "✗"} ${boxName(b.id)}: ` + ([r.out, r.err].filter(Boolean).join(" ").trim() || (r.ok ? "done" : "failed")));
+      outs.push(`${r.ok ? "✓" : "✗"} ${nm(boxName(b.id))}: ` + ([r.out, r.err].filter(Boolean).join(" ").trim() || (r.ok ? "done" : "failed")));
       if (r.ok && (kind === "close" || kind === "delete")) BS.checked.delete(b.id);
     };
     const remote = fit.filter((b) => !b.local);
@@ -1790,20 +1801,20 @@ function renderActivity() {
 // ---------------------------------------------------------------- actions
 function busy(btn, on) { btn?.classList.toggle("loading", on); if (btn) btn.disabled = on; }
 function showOutput(title, r) {
-  $("#output-title").textContent = title;
-  $("#output-text").textContent = [r.cmd ? "$ " + r.cmd : null, r.out, r.err, r.ok === false && r.code !== undefined ? `(code ${r.code})` : null].filter(Boolean).join("\n").trim() || (r.ok ? "done" : "failed");
+  setRich($("#output-title"), title);
+  setRich($("#output-text"), [r.cmd ? "$ " + r.cmd : null, r.out, r.err, r.ok === false && r.code !== undefined ? `(code ${r.code})` : null].filter(Boolean).join("\n").trim() || (r.ok ? "done" : "failed"));
   $("#output").showModal();
 }
 async function setLevel(btn, s, level) {
   busy(btn, true);
   const r = await action({ action: "collector", url: s.url, level, fingerprint: s.collector?.fingerprint && !s.operator ? s.collector.fingerprint : undefined });
   busy(btn, false);
-  if (!r.ok) showOutput("Collector", r); else toast(level === "off" ? "No more annotations for " + s.name : `Annotations "${level}" for ${s.name}`);
+  if (!r.ok) showOutput("Collector", r); else toast(level === "off" ? "No more annotations for " + nm(s.name) : `Annotations "${level}" for ${nm(s.name)}`);
   poll(true);
 }
 function confirmRun(title, text, body, { okLabel = "Confirm", after } = {}) {
   const dlg = $("#confirm");
-  $("#confirm-title").textContent = title; $("#confirm-text").textContent = text;
+  setRich($("#confirm-title"), title); setRich($("#confirm-text"), text);
   $("#confirm-ok").textContent = okLabel;
   dlg.returnValue = "";
   dlg.addEventListener("close", async () => {
@@ -1819,7 +1830,7 @@ function confirmRun(title, text, body, { okLabel = "Confirm", after } = {}) {
 }
 function openServer(mode, s) {
   const dlg = $("#server-dialog");
-  $("#server-title").textContent = mode === "add" ? "Add a service" : `Edit ${s.name}`;
+  setRich($("#server-title"), mode === "add" ? "Add a service" : `Edit ${nm(s.name)}`);
   $("#s-mode").value = mode; $("#s-orig").value = s?.name || "";
   $("#s-name").value = s?.name || ""; $("#s-url").value = s?.url || ""; $("#s-address").value = s?.address || ""; $("#s-note").value = s?.note || "";
   $("#s-url").required = mode === "add";
@@ -1977,6 +1988,7 @@ function remember(key) {
 const IN_APP = DEEP.get("app") === "1" || sessionStorage.getItem("mmbox-console-app") === "1";
 const webNotify = () => "Notification" in window && Notification.permission === "granted";
 function notify(title, body, tag) {
+  title = plain(title); body = plain(body);
   if (F.desktop && IN_APP) {
     const id = tag.replace(/^(late|fw):/, "");
     action({ action: "alert", title, body, ...(tag === "late:summary" ? { late: true } : { msg: id }) }).catch(() => {});
@@ -2017,7 +2029,7 @@ function watchAlerts(first) {
         remember("late:" + m.id);
         S.freshLate.add(m.id);
         if (first) { freshAtOpen++; continue; }  // at the opening: one summary below, not one alert each
-        toast(`Unread for more than ${F.lateMin} min: ${m.subject || m.id} (${boxName(m.to)})`);
+        toast(`Unread for more than ${F.lateMin} min: ${m.subject || m.id} (${nm(boxName(m.to))})`);
         notify(`Unread: ${boxName(m.from)} → ${boxName(m.to)}`, m.subject || m.preview || m.id, "late:" + m.id);
       }
     }
@@ -2100,7 +2112,7 @@ function renderHeld() {
         g.msgs.length > 1 ? h("ul", { class: "held-sub" }, g.msgs.sort((a, b) => a.held.since - b.held.since).map((m) =>
           h("li", {},
             h("span", { class: "held-subj" }, `${m.subject || m.kind || m.id}`),
-            h("span", { class: "dim" }, ` — for ${heldAge(m)}, from ${boxName(m.from)}`),
+            h("span", { class: "dim" }, ` — for ${heldAge(m)}, from ${nm(boxName(m.from))}`),
             h("button", { class: "btn small text ripple", type: "button", onclick: () => openMessage(m.id) }, "Open"),
             h("button", { class: "btn small text ripple", type: "button", onclick: () => heldAck([m.id]) }, "Mark handled")))) : null);
     })),
@@ -2922,7 +2934,7 @@ async function openButlerLaunch(mk) {
   await ensureButlerData();
   const info = machineInfo(mk), set = BT.data?.settings || {};
   const inv = info.local ? (BT.data?.inventory || {}) : info.inv;
-  $("#bl-title").textContent = `Start the butler of ${machineName(mk)}`;
+  setRich($("#bl-title"), `Start the butler of ${nm(machineName(mk))}`);
   $("#bl-text").textContent = info.local
     ? "It runs with this console (Settings), takes what no session took for 5 min, starts sessions and keeps the list of this computer's agents and models. Its own thinking uses the agent and model below."
     : "This console cannot start a program on another computer: it asks that computer's machine box, and a session there starts the butler (as a systemd user service on Linux). It takes effect once a session of that computer handles the request.";
@@ -2957,7 +2969,7 @@ async function openSessionDialog(pre = {}) {
     fillAgentModel($("#sd-agent"), $("#sd-model"), $("#sd-models"), startable(info.local ? (BT.data?.inventory || {}) : info.inv),
       { agent: set.session_agent, model: set.session_model });
     $("#sd-note").textContent = info.local ? "Started here by the butler's command: its box first, then the agent in a tmux session, in its no-prompt mode."
-      : `Asked to the butler of ${machineName(info.mk)} (it acts when this computer's machine box has the Execute right there); the new box shows in the explorer once it listens.`;
+      : `Asked to the butler of ${nm(machineName(info.mk))} (it acts when this computer's machine box has the Execute right there); the new box shows in the explorer once it listens.`;
     $("#sd-go").disabled = !$("#sd-agent").value;
   };
   ms.onchange = () => { wantProject = $("#sd-project").value; fill(); };

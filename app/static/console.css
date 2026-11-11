@@ -802,3 +802,7 @@ dialog.att-viewer { width: min(1100px, calc(100vw - 32px)); }
 #splash-anim { width: 100%; height: 100%; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .ob-pw-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* a name the user chose (a box, a session, a machine, a project, a service) set apart in a sentence (nm() in console.js) */
+.uname { font-weight: 600; padding: 0 .3em; border-radius: 4px; background: color-mix(in srgb, currentColor 13%, transparent);
+  box-decoration-break: clone; -webkit-box-decoration-break: clone; overflow-wrap: anywhere; }
