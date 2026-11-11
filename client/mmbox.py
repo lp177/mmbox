@@ -7869,10 +7869,29 @@ def hook_python() -> tuple[str, list[str]]:
     return "python3", ["python3"]
 
 
+def codex_on_windows(harness: str) -> bool:
+    """Codex on Windows runs a hook's command in the Windows shell (cmd or PowerShell), not in a POSIX one: there
+    `2>/dev/null` is a path that does not exist, `|| true` is no command, and the hook does not run at all."""
+    return os.name == "nt" and harness.split()[:1] == ["codex"]
+
+
 def hook_command(client: Path, harness: str) -> str:
-    """The command written in a harness's hook settings: never fails the harness (`|| true`), never prints an error."""
+    """The command written in a harness's hook settings: never fails the harness (`|| true`), never prints an error.
+    For Codex on Windows, the bare command, which cmd, PowerShell and bash read alike (double quotes only around a
+    word with a space): the client's hook prints nothing on stderr and always exits 0 by itself."""
     import shlex
-    exe, _ = hook_python()
+    exe, argv = hook_python()
+    if codex_on_windows(harness):
+        if " " in argv[0]:  # PowerShell reads a quoted first word as a string, not a command: its short name instead
+            try:
+                import ctypes
+                buf = ctypes.create_unicode_buffer(1024)
+                if ctypes.windll.kernel32.GetShortPathNameW(argv[0], buf, 1024):
+                    argv = [buf.value] + argv[1:]
+            except (AttributeError, OSError):
+                pass
+        words = [w.replace("\\", "/") for w in argv + [str(client)]] + ["hook", *harness.split()]
+        return " ".join(f'"{w}"' if " " in w else w for w in words)
     path = str(client).replace("\\", "/") if os.name == "nt" else str(client)
     return f"{exe} {shlex.quote(path)} hook {harness} 2>/dev/null || true"
 
@@ -7890,6 +7909,17 @@ def hook_check(client: Path, harness: str) -> str:
         why = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["no output"]
         return (f"WARNING: the hook command exits {r.returncode} here ({' '.join(argv)}: {why[0][:200]}): the hook "
                 f"would do nothing, silently")
+    if codex_on_windows(harness):  # the written command itself, through the Windows shell, as Codex runs it
+        cmd = hook_command(client, harness)
+        try:
+            r = subprocess.run(cmd, shell=True, input="{}", capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as exc:
+            r = subprocess.CompletedProcess(cmd, 1, "", str(exc))
+        if r.returncode != 0:
+            why = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["no output"]
+            return (f"WARNING: the hook command exits {r.returncode} in cmd ({cmd}: {why[0][:200]}): the hook would "
+                    f"do nothing, silently")
+        return f"CHECK ok: the hook command runs here, in cmd too ({cmd}, exit 0)"
     return f"CHECK ok: the hook command runs here ({' '.join(argv)}, exit 0)"
 
 
@@ -7928,7 +7958,8 @@ def hook_groups_set(hooks: dict, events, cmd: str, pattern: str, install: bool, 
 CODEX_WAKE = (("SessionStart", "prompt", {"timeout": 10}), ("SessionStart", "watch", {"async": True, "timeout": 86400}),
               ("UserPromptSubmit", "prompt", {"timeout": 10}),
               ("UserPromptSubmit", "watch", {"async": True, "timeout": 86400}),
-              ("PostToolUse", "prompt", {"timeout": 10}), ("SessionEnd", "stop", {"timeout": 5}))
+              ("PostToolUse", "prompt", {"timeout": 10}),
+              ("SessionEnd", "stop", {"timeout": 3}))  # Codex allows a SessionEnd hook 3 s at most
 
 
 def hook_install_claude(install: bool, harness: str = "claude", wake: bool = False) -> int:
