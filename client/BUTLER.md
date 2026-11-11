@@ -95,7 +95,7 @@ answers in a fixed JSON (`{"action": "wake|start|handle|wait", "project": …, "
 1. **An open session of the project whose listener is down** but whose agent still runs: a wake-up ping (as the
    relay does); if the session's harness can be told (the Claude Code hook), the next prompt reminds it.
 2. **A closed session of the project** with a known agent session id: resumed (`claude --resume <id>`, `codex
-   resume <id>`…) with a first prompt: "Start mmbox listening (`memories-mailbox-start --session <name>`), then
+   resume <id>`…) with a first prompt: "Start mmbox listening (`mmbox-start --session <name>`), then
    take message <id> from the project box."
 3. **No session of the project:** a new session is started in the project's folder with the project's default
    agent and model (section 6).
@@ -139,7 +139,7 @@ A message to the butler box, kind `butler`, from a peer with `execute` rights (o
 2. **Makes the session box first** (a child of the machine box, name `<project>-<agent>-<4 chars>`), so its id is
    known before the agent starts.
 3. Starts the agent in that folder in a **detached tmux session** named `mmbox-<box name>` (one can attach to it;
-   it works on a server), with a first prompt: "Run `memories-mailbox-start --session <name> --title … `, listen,
+   it works on a server), with a first prompt: "Run `mmbox-start --session <name> --title … `, listen,
    then: <task>".
 4. Answers at once `{"box": "<id>", "profile": "<name>", "tmux": "mmbox-<name>", "state": "starting"}`, then
    `"listening"` once the session's listener runs, or `"failed"` with the reason after 3 min.
@@ -183,7 +183,7 @@ A new tab per machine that runs a butler:
 ## 7. Order of work
 
 1. Project boxes, the take rules, forwarding to the project box, `giveback` (client, PROTOCOL,
-   skills `memories-mailbox-inbox` and `-start`).
+   skills `mmbox-inbox` and `-start`).
 2. The butler daemon: watching, claims, waking, resuming, starting in tmux, inventory, the `butler` messages.
 3. The console: Butler tab, chat, the new-session form, inventory, project boxes, settings.
 4. Systemd unit for servers; doc and skills (`mmbox-butler`).

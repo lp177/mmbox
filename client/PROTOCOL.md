@@ -117,7 +117,7 @@ Each agent session reads **three boxes**:
 
 ### Starting a session
 
-`mmbox.py start --session <name> --project <project> --agent <agent>`, at the beginning of each session (skill `memories-mailbox-start`):
+`mmbox.py start --session <name> --project <project> --agent <agent>`, at the beginning of each session (skill `mmbox-start`):
 
 1. **Connection check**: cryptography, token, memories account, read access to the project, clock skew with the store. A failure stops the procedure (`CHECK FAILED`).
 2. **Machine box**: created if it does not exist yet on the computer, or marked `role: machine` if the profile already existed.
@@ -626,7 +626,7 @@ Listening rests on the agent restarting its `wait`. Nothing restarts it when the
 
 - the session owns an open box that no live listener serves: it adds to the context (`SessionStart`, `UserPromptSubmit`) the exact command to start it, with `UNHANDLED?` if a listener left messages nobody may have read; at `Stop` it blocks the stop once (`decision: block`; never twice in a row, `stop_hook_active`), so that the agent starts it before its turn ends;
 - the session's box is closed: it says so when the user writes (never at `Stop`);
-- the session has no box, at its start, in a project whose `CLAUDE.md` or `AGENTS.md` names `memories-mailbox-start`: it tells it to open one;
+- the session has no box, at its start, in a project whose `CLAUDE.md` or `AGENTS.md` names `mmbox-start` (or its name until 2026-11-11, `memories-mailbox-start`): it tells it to open one;
 - **open questions**: when the user writes (`UserPromptSubmit`), and after the agent asked the user in the IDE (`PostToolUse` on `AskUserQuestion`), it lists the box's questions still open in the operator console with the command `question --withdraw <id> --answer "<…>"`: if what the user said answers one, the agent withdraws it. `hook off` does not silence this part.
 
 **Codex** reads the same hook protocol: `mmbox.py hook codex` (`SessionStart`, `UserPromptSubmit`; no `Stop`), installed by `hook install codex` in `~/.codex/hooks.json` (`$CODEX_HOME` honoured), which also sets `[features] codex_hooks = true` in its `config.toml`. Codex may ask once to trust a new hook (`/hooks`). Its session id is the thread id (`CODEX_THREAD_ID`, also read by `start`).

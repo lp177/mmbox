@@ -322,7 +322,7 @@ def first_prompt(name: str, box_id: str, title: str | None, task: str | None, re
                  why: str | None = None) -> str:
     head = (f"The mmbox butler of {HOST} {'resumed' if resumed else 'started'} this session"
             + (f" because {why}" if why else "") + ". ")
-    return (head + f"First start the encrypted mailbox for it with the skill memories-mailbox-start: session name "
+    return (head + f"First start the encrypted mailbox for it with the skill mmbox-start: session name "
             f"`{name}` (its box exists already, {box_id})" + (f", title \"{title}\"" if title else "")
             + ", then keep its listener running as that skill says, and handle what it hands over (its project's box "
             "included). " + (f"Then: {task}" if task else "Then wait for messages; do nothing else on your own."))

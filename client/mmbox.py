@@ -3077,7 +3077,7 @@ def print_items(items: list[dict], as_json: bool, show_archived: bool = False) -
         if it["status"] == "backlog":
             print(f"=== BACKLOG: {it['count']} message(s) older than {EXPIRE_S / 3600:g} h wait in the {it['box']} box "
                   f"({it['new']} new): they are not handed over on their own. Ask the user whether to process or purge "
-                  f"them, all at once or one by one (skill memories-mailbox-start; `mmbox.py backlog list --stale`)\n")
+                  f"them, all at once or one by one (skill mmbox-start; `mmbox.py backlog list --stale`)\n")
             continue
         if it["status"] == "rejected":
             print(f"!!! REJECTED {it['id']} from {it['peer']}: {it.get('reason')} — do not act on it, tell the user\n")
@@ -3888,7 +3888,7 @@ def remind(me: Me, project: str, after_s: float = REMIND_AFTER_S, force: bool = 
         senders = sorted({r["peer"] for r in rs})
         lines.append(f"- {label} ({'closed session box' if closed else box + ' box'}): {len(rs)}, the oldest "
                      f"{max(r['age_s'] for r in rs) / 86400:.1f} day(s) old, from {', '.join(senders)}")
-    lines += ["", "In an agent session on this computer: skill memories-mailbox-start (process or purge them), or "
+    lines += ["", "In an agent session on this computer: skill mmbox-start (process or purge them), or "
               "`mmbox.py backlog list --stale`. Unread messages are deleted by their senders after "
               f"{RECEIPT_TTL_S / 86400:g} days."]
     text = "\n".join(lines)
@@ -4308,7 +4308,7 @@ def cmd_start(a, local: Local):
             announce_backlog(box, local, [r["id"] for r in rows if r["profile"] == box.local.profile])
         if rows:
             print(f"BACKLOG: {len(rows)} message(s) older than {EXPIRE_S / 3600:g} h. Ask the user: process them, purge "
-                  f"them, or choose one by one (skill memories-mailbox-start).")
+                  f"them, or choose one by one (skill mmbox-start).")
             print_waiting(rows, False)
         else:
             print(f"BACKLOG: no message older than {EXPIRE_S / 3600:g} h")
@@ -7007,7 +7007,7 @@ def warn_shared(local: Local, others: list[dict]) -> bool:
         print(f"WARNING: another process (pid {o['pid']}, {o.get('session')}, since {o.get('since')}) already listens on this "
               f"identity (profile {local.profile}): each incoming message goes to only ONE of you. If it is another agent "
               f"session, give this one its own identity: `mmbox.py --profile <name> init …` then pair it "
-              f"(memories-mailbox-setup).", flush=True)
+              f"(mmbox-setup).", flush=True)
     return bool(new)
 
 
@@ -7567,11 +7567,12 @@ def listener_text(name: str, conf: dict, event: str) -> str | None:
 def project_uses_mailbox(cwd: str | None) -> bool:
     d = Path(cwd or os.getcwd())
     docs = [d / "CLAUDE.md", d / "AGENTS.md", d / "GEMINI.md", d / ".claude" / "CLAUDE.md"]
-    return any(f.is_file() and "memories-mailbox-start" in f.read_text(encoding="utf-8", errors="ignore") for f in docs)
+    start = re.compile(r"\b(mmbox|memories-mailbox)-start\b")  # memories-mailbox-*: the skills' names until 2026-11-11
+    return any(f.is_file() and start.search(f.read_text(encoding="utf-8", errors="ignore")) for f in docs)
 
 
 NO_BOX_TEXT = ("mmbox: this project uses the encrypted agent mailbox and this session has no box yet: run the "
-               "memories-mailbox-start skill first (a profile of its own, never another session's nor `default`), "
+               "mmbox-start skill first (a profile of its own, never another session's nor `default`), "
                "then keep its listener running in the background.")
 
 
@@ -7777,7 +7778,7 @@ def hook_vibe() -> int:
         y.local.update("state.json", lambda s: s.__setitem__("vibe_told", sorted(set(s.get("vibe_told") or []) | set(new))[-200:]))
         cmd = client_command(y.local.profile, "inbox")
         parts.insert(0, f"mmbox: {len(new)} message(s) arrived in this session's box `{y.local.profile}`. Read them now "
-                        f"with `{cmd}` and handle them as the memories-mailbox-inbox skill says (execute, ask the user, "
+                        f"with `{cmd}` and handle them as the mmbox-inbox skill says (execute, ask the user, "
                         f"archive), then go on with what you were doing.")
     if not parts:
         return 0
