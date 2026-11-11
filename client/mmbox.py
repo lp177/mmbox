@@ -1574,6 +1574,11 @@ def flush_outbox(me: "Me") -> int:
         p = item.get("payload") or {}
         own = p.get("kind") in BOOKKEEPING_KINDS
         gw, r, _failed = send_env(me, peer, item["env"], p) if peer else (None, {}, [])
+        if not r.get("ok") and peer and not peer.get("retired_at") and any(f["error"].startswith("410") for f in _failed):
+            # the service says its box closed, a notice that never reached us: known from now on, then handled below
+            fields = {"retired_at": iso(), "retired_machine": peer.get("retired_machine") or peer.get("introduced_by")}
+            peer_update(me, item["peer_id"], fields)
+            peer = peers[item["peer_id"]] = {**peer, **fields}
         age = time.time() - item["at"]
         if r.get("ok"):
             me.local.append_log({"dir": "out", "id": item["msg_id"], "peer": item["peer_id"], "status": "sent", "at": iso(),
@@ -6722,6 +6727,25 @@ def cmd_inbox(a, local: Local):
     print_items(items, a.json)
 
 
+def cmd_unqueue(a, local: Local):
+    """Sends still queued in this box's outbox (the service refused them: the recipient does not list this box, or its
+    box is full), dropped: never delivered, logged `dropped`. The operator's console deletes a held message this way."""
+    ids = set(a.ids)
+    q = (local.load("state.json", {}) or {}).get("outbox") or []
+    drop = [i for i in q if i.get("msg_id") in ids]
+    local.update("state.json", lambda st: st.__setitem__("outbox", [i for i in (st.get("outbox") or [])
+                                                                      if i.get("msg_id") not in ids]))
+    for item in drop:
+        p = item.get("payload") or {}
+        local.append_log({"dir": "out", "id": item["msg_id"], "peer": item.get("peer_id"), "status": "dropped",
+                          "at": iso(), "reason": "dropped from the queue on request (never delivered)",
+                          "payload": {k: p[k] for k in ("v", "id", "ts", "from", "to", "kind", "subject", "project", "re")
+                                      if k in p}})
+    done = {i["msg_id"] for i in drop}
+    for mid in sorted(ids):
+        print(f"{mid}: " + ("dropped from the queue: never delivered" if mid in done else "not queued in this box"))
+
+
 def cmd_sent(a, local: Local):
     """What this machine sent: still waiting in the store, or consumed by its peer (read, expired or revoked)."""
     me = Me(local)
@@ -8431,6 +8455,8 @@ def main():
     x.add_argument("-n", type=int, default=20)
     x.add_argument("--id", help="one message: its state, the service it went through, and (for a box of this "
                                 "computer) the session that took it")
+    x = sub("unqueue", cmd_unqueue, "drop sends the service refused and this box keeps resending (never delivered)")
+    x.add_argument("ids", nargs="+")
     x = sub("archive", cmd_archive, "mark messages archived (or done)")
     x.add_argument("ids", nargs="+")
     x.add_argument("--done", action="store_true")

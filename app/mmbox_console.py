@@ -2104,6 +2104,11 @@ class State:
         profiles = [y for n in M.local_profiles() if (y := M.load_me(n))]
         for y in profiles:
             outbox |= {i.get("msg_id") for i in (y.local.load("state.json", {}) or {}).get("outbox") or []}
+        # held: queued by its sender (the service refuses it). Deleting it drops it from that queue: here with the
+        # client, on another computer through its daemon (an op signed with this console's operator key)
+        unqueued, unqueue_err = self._unqueue({i: m for i, m in msgs.items() if m and m.get("state") == "queued"}, outbox)
+        waiting -= unqueued
+        outbox -= unqueued
         gone = ids - waiting - outbox
         entries = folders = 0
         errors = list(unbox_err)
@@ -2139,11 +2144,58 @@ class State:
                 + (f"; errors: {'; '.join(errors)}" if errors else ""))
             threading.Thread(target=self.refresh, daemon=True).start()
         kept_n = len(ids) - len(gone)
-        out = (f"{len(gone)} message(s) deleted from this computer" if gone else "Nothing deleted") \
-            + (f", {len(unboxed)} of them taken out of their box unread" if unboxed else "") \
-            + (f"; {kept_n} kept: still waiting in another computer's box or in its sender's outbox" if kept_n else "") + "."
+        out = (f"Deleted ({len(gone)})" if gone else "Not deleted") \
+            + (f"; {len(unboxed)} taken out of their box unread" if unboxed else "") \
+            + (f"; {len(unqueued)} removed from their sender's queue, never delivered" if unqueued else "") + "."
+        if kept_n:
+            out += (f" {kept_n} could not be: " + "; ".join(unqueue_err) if unqueue_err else
+                    f" {kept_n} kept: still waiting in a box of another computer, which only that computer can empty.")
         return {"ok": not errors, "out": out, "deleted": sorted(gone), "kept": sorted(ids - gone),
                 "err": "; ".join(errors) or None}
+
+    def _unqueue(self, queued: dict, outbox: set, wait_s: float = 45.0) -> tuple[set, list]:
+        """Queued messages dropped from their sender's queue: a box of this computer with the client, another
+        computer's through its daemon (`op: unqueue`), its answer awaited. (dropped ids, why the others stayed)"""
+        done, why = set(), []
+        local = {y.id: y for n in M.local_profiles() if (y := M.load_me(n))}
+        by_sender: dict = {}
+        for i, m in queued.items():
+            by_sender.setdefault(m.get("from") or "", []).append(i)
+        asked = {}
+        for sender, mids in by_sender.items():
+            if sender in local or any(i in outbox for i in mids):
+                y = local.get(sender)
+                if not y:
+                    continue
+                r = run_client(["--profile", y.local.profile, "unqueue", *mids], timeout=60)
+                done |= {ln.split(":")[0] for ln in (r.get("out") or "").splitlines() if "dropped from the queue" in ln}
+                continue
+            b = self.snapshot_box(sender) or {}
+            d = self.daemon_of(b) if b else None
+            name = b.get("label") or sender
+            if not d:
+                why.append(f"{name} keeps resending it from another computer, which runs no mmbox daemon this console "
+                           f"knows: only that computer can drop it")
+                continue
+            r = self.send_op(d["id"], {"op": "unqueue", "box": sender, "ids": mids})
+            if r.get("ok"):
+                asked[r["op_id"]] = (name, mids)
+            else:
+                why.append(f"{name}'s computer could not be asked: {r.get('err')}")
+        end = time.time() + wait_s
+        while asked and time.time() < end:
+            res = getattr(self, "op_results", {}) or {}
+            for oid in [o for o in asked if o in res]:
+                name, mids = asked.pop(oid)
+                out = res[oid].get("result") or {}
+                if out.get("error"):
+                    why.append(f"{name}'s computer answered: {out['error']}"
+                               + (" (its client predates this: update it, restart its daemon)" if "unknown op" in out["error"] else ""))
+                done |= set(out.get("dropped") or [])
+            time.sleep(0.5)
+        why += [f"{name}'s computer did not answer within {wait_s:.0f} s (its daemon stopped, or this console's operator "
+                f"key is not pinned there)" for name, _ in asked.values()]
+        return done, why
 
     def move_messages(self, ids, to: str) -> dict:
         """The list's batch action: these messages, waiting unread in boxes of this computer, handed to another open box
@@ -3508,8 +3560,8 @@ class State:
         # Times only (since, last refusal): the ages are computed where they are shown, or the snapshot would change
         # at every refresh
         for m in msgs.values():
-            if m.get("state") != "queued" or m.get("broadcast"):
-                m.pop("held", None)
+            if m.get("state") != "queued" or m.get("broadcast") or m.get("kind") in M.BOOKKEEPING_KINDS:
+                m.pop("held", None)  # the tool's own notices (a new gateway, a link): redone by it, never an alarm
                 continue
             m["held"] = m.get("held") or {"since": _ms(m.get("ts")) or int(time.time() * 1000)}
             ack = (self.console_state.get("held_ack") or {}).get(m["id"])

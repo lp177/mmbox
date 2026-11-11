@@ -582,6 +582,8 @@ async def send(request: web.Request) -> web.Response:
             raise _http(410, "this box closed: write to its machine box")
     to_op = not me_op and await is_operator(r, to)
     if not me_op and not to_op and not await r.hexists(f"mmbox:links:{to}", me):
+        if (_loads(await r.get(f"mmbox:box:{to}")) or {}).get("closed_ms"):  # closed: it will never list the sender
+            raise _http(410, "this box closed: write to its machine box")
         await refused(r, me, to, env, data, "not_listed")
         raise _http(403, "the recipient does not list the sender among its peers (not paired, or its links are not synced)")
     box = f"mmbox:in:{to}"

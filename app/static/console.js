@@ -1360,8 +1360,8 @@ function renderWho(m) {
     ? field("to", h("span", { class: "who-v", title: (m.to_boxes || []).map(boxName).join(", ") || null },
       m.scope === "network" ? "everyone (whole network)" : "every session of this computer"))
     : field("to", ref(m.to));
-  el.replaceChildren(field("from", ref(m.from)), to,
-    m.via_machine ? field("via", h("span", { class: "who-v" }, "machine box")) : null);
+  el.replaceChildren(...[field("from", ref(m.from)), to,  // replaceChildren writes a null as the text "null"
+    m.via_machine ? field("via", h("span", { class: "who-v" }, "machine box")) : null].filter(Boolean));
 }
 function renderDetail(m, partial) {
   renderWho(m);
@@ -1409,13 +1409,17 @@ function renderDetail(m, partial) {
   const fwBlock = fw ? h("div", { class: "notice" }, h("strong", {}, "Forwarded to the machine box"), h("br"),
     `Original message from ${fw.from ? boxName(fw.from) : fw.from_label || "?"}` + (fw.stored_at ? `, stored on ${fmtFull.format(new Date(Date.parse(fw.stored_at)))}` : "") + (fw.reason ? ` — ${fw.reason}` : "")) : null;
   const heldBlock = isHeld(m) ? h("div", { class: "held-banner", role: "note" },
-    h("div", { class: "held-head" }, svg(ICON.warn, "ico"), h("h2", {}, `Held for ${heldAge(m)}: ${recipientName(m.to)} does not accept it yet`)),
-    h("p", { class: "held-help" }, `${boxName(m.from)} keeps it and sends it again by itself. The service refuses it`
-      + (m.held.why === "full" ? " because the recipient's box is full" : " because the recipient does not list the sender yet: no client of its computer has run since the sender's box was introduced to it")
-      + ". It leaves as soon as a session of that computer runs" + (m.held.why === "full" ? " and empties its box" : "") + "; if the recipient's box closes meanwhile, it goes to its machine box. Nothing to send again."
-      + (heldSilent(m) ? ` Its sender has not retried since ${fmtFull.format(new Date(m.held.last || m.held.since))}: its computer may be off too.` : "")),
-    h("div", { class: "held-actions" }, h("button", { class: "btn small ripple", type: "button", title: "Out of the alert; its sender still keeps it and sends it again by itself",
-      onclick: () => heldAck([m.id]) }, "Mark handled"))) : heldAcked(m) ? h("div", { class: "notice held-acked" },
+    h("div", { class: "held-head" }, svg(ICON.warn, "ico"), h("h2", {}, `Not delivered for ${heldAge(m)}`)),
+    h("p", { class: "held-help" }, (m.held.why === "full"
+      ? `${recipientName(m.to)}'s box is full.`
+      : `${recipientName(m.to)} does not accept messages from ${boxName(m.from)} yet: its computer has not run since they were introduced.`)
+      + ` ${boxName(m.from)} keeps it and tries again by itself.`
+      + (heldSilent(m) ? ` No new try since ${fmtFull.format(new Date(m.held.last || m.held.since))}: that computer may be off.` : "")),
+    h("div", { class: "held-actions" },
+      h("button", { class: "btn small ripple", type: "button", title: "Removed from its sender's queue: never delivered",
+        onclick: () => deleteMessages([m.id]) }, "Delete it"),
+      h("button", { class: "btn small text ripple", type: "button", title: "Out of the alert; its sender still keeps it and tries again by itself",
+        onclick: () => heldAck([m.id]) }, "Mark handled"))) : heldAcked(m) ? h("div", { class: "notice held-acked" },
     `Held for ${heldAge(m)}, marked handled ${when(m.held.ack)}: out of the alert. ${boxName(m.from)} still keeps it and sends it again by itself. `,
     h("button", { class: "btn small text ripple", type: "button", onclick: () => heldAck([m.id], false) }, "Alert again")) : null;
   const rc = m.recap;
@@ -1473,15 +1477,18 @@ async function deleteMessages(ids, mode) {
   const one = S.byId.get(ids[0]) || (RP.msg?.id === ids[0] ? RP.msg : null);
   const here = (i) => (S.byId.get(i)?.sources || []).some((s) => s.startsWith("waiting:"));
   const unboxed = ids.filter((i) => ["unread", "taken"].includes(S.byId.get(i)?.state) && here(i)).length;
-  const waiting = ids.filter((i) => ["queued", "sent", "unread", "taken"].includes(S.byId.get(i)?.state) && !here(i)).length;
+  const queued = ids.filter((i) => S.byId.get(i)?.state === "queued").length;  // never delivered: out of its sender's queue
+  const waiting = ids.filter((i) => ["sent", "unread", "taken"].includes(S.byId.get(i)?.state) && !here(i)).length;
   const title = thread ? `Delete this thread (${ids.length} message${ids.length > 1 ? "s" : ""})?`
     : batch && ids.length > 1 ? `Delete the ${ids.length} selected messages?` : `Delete “${one?.subject || ids[0]}”?`;
   const text = (thread ? "Every message of this thread goes" : batch && ids.length > 1 ? "These messages go" : "This message goes") + " from this computer for good: the boxes' logs, "
     + "their attached files and the console's copy. The other computers keep theirs."
     + (!unboxed ? "" : ids.length === 1 ? " It still waits unread in a box of this computer: it is taken out of it, unread, and its sender is told."
       : ` ${unboxed} of them still wait${unboxed > 1 ? "" : "s"} unread in a box of this computer: taken out of it, unread, their senders told.`)
-    + (!waiting ? "" : ids.length === 1 ? " It waits in another computer's box, or in its sender's outbox: it stays until taken."
-      : ` ${waiting} of them wait${waiting > 1 ? "" : "s"} in another computer's box or an outbox: ${waiting > 1 ? "they stay" : "it stays"} until taken.`);
+    + (!queued ? "" : ids.length === 1 ? " It was never delivered: it is removed from its sender's queue, which stops the retries."
+      : ` ${queued} of them were never delivered: removed from their senders' queues.`)
+    + (!waiting ? "" : ids.length === 1 ? " It waits in a box of another computer: only that computer can take it out, so it stays."
+      : ` ${waiting} of them wait${waiting > 1 ? "" : "s"} in a box of another computer: only that computer can take ${waiting > 1 ? "them" : "it"} out, so ${waiting > 1 ? "they stay" : "it stays"}.`);
   if (!(await confirmAsk(title, text, "Delete"))) return;
   const r = await action({ action: "delete_messages", ids }).catch((x) => ({ ok: false, err: x.message }));
   if (!r.ok && !(r.deleted || []).length) { showOutput("Delete", r); return; }

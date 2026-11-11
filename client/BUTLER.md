@@ -270,7 +270,7 @@ box for a session the operator starts.
   `butler.json` `"launcher": "tmux"` brings Claude Code back to tmux.
 - **Ops, operator key only**: what the daemon does on request (status, config, inventory, start, stop, input,
   output, box: empty, close or delete one of this computer's boxes, the console's box menu for another computer's
-  box) is asked by an `op` message signed by the operator's console and sent to the butler's box. The client accepts
+  box; unqueue: held messages a box of this computer keeps resending, dropped when the console deletes them) is asked by an `op` message signed by the operator's console and sent to the butler's box. The client accepts
   an `op` only from the operator key it pinned (`collector enable … --fingerprint`), and only in the butler's box; the
   daemon answers with an `op_result` to the operator's box. Messages from peers are never ops, whatever their rights.
   `mmbox.py daemon operator [--fingerprint FP]` shows the pins of this computer's services and pins FP where none is

@@ -1030,11 +1030,20 @@ def box_command(bid: str, what: str) -> dict:
 def do_op(op: dict) -> dict:
     """What the operator's console asks the daemon (signed with its operator key, nobody else): status, config,
     inventory, start, stop, input (a line typed into a hidden session), output (a hidden session's output), box (a
-    box's menu: empty, close, delete)."""
+    box's menu: empty, close, delete), unqueue (held messages a box keeps resending, dropped)."""
     try:
         o = op.get("op")
         if o == "box":
             return box_command(str(op.get("box") or ""), str(op.get("what") or ""))
+        if o == "unqueue":  # held messages deleted from the console: dropped from their sender's queue, here
+            y = next((b for n in M.local_profiles() if (b := M.load_me(n)) and b.id == str(op.get("box") or "")), None)
+            ids = [str(i) for i in op.get("ids") or [] if re.fullmatch(r"[0-9A-Za-z-]{6,40}", str(i))][:500]
+            if not y or not ids:
+                return {"error": "no box of this computer, or no message id"}
+            rc, out = run([sys.executable, client_file(), "--profile", y.local.profile, "unqueue", *ids], timeout=60)
+            gone = [ln.split(":")[0] for ln in out.splitlines() if "dropped from the queue" in ln]
+            log("daemon", f"unqueue {len(gone)}/{len(ids)} in {y.label}")
+            return {"dropped": gone, "out": out.strip()[-1500:]} if rc == 0 else {"error": f"exit {rc}: {out.strip()[-300:]}"}
         if o == "status":
             st = status()
             return {k: st[k] for k in ("running", "box", "beat", "started", "fails", "folders", "after_s")} | {
