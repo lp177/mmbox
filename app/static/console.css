@@ -76,6 +76,8 @@ body.own-titlebar .appbar img { -webkit-user-drag: none; }
 body.own-titlebar:not(.maximized)::after {
   content: ""; position: fixed; inset: 0; border: 1px solid var(--line-strong); pointer-events: none; z-index: 10001;
 }
+/* the holder itself out of the flow: a child of the body's grid, it took the row meant for <main> */
+.win-edges { position: fixed; }
 .win-edges > div { position: fixed; z-index: 10001; }
 body.own-titlebar .splash { -webkit-user-select: none; user-select: none; }
 .win-edges > [data-edge="n"] { top: 0; left: 10px; right: 10px; height: 4px; cursor: ns-resize; }
@@ -178,7 +180,7 @@ body.own-titlebar .splash { -webkit-user-select: none; user-select: none; }
 .segmented input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: -2px; }
 
 /* ---------- layout of the views */
-main { min-height: 0; }
+main { grid-row: 2; min-height: 0; }  /* always the body's 1fr row, whatever else sits between the app bar and it */
 .view { height: 100%; min-height: 0; overflow: auto; }
 .view-messages {
   display: grid; grid-template-columns: minmax(230px, 300px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); overflow: hidden;

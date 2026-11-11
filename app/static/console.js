@@ -455,9 +455,10 @@ function rightsOf(node) {
   if (node.type === "box") {
     const b = S.boxes.get(node.key);
     const base = boxRights(b, snap);
-    const acts = b?.local && b.role !== "operator" ? boxActs(b) : null;  // what this computer can do to its own boxes
+    // what this computer can do to its own boxes; another computer's daemon does it to its boxes (an op)
+    const acts = b?.local ? (b.role !== "operator" ? boxActs(b) : null) : remoteActs(b);
     if (!base && !acts) return null;
-    return { ...(base || { noRights: true, title: `${boxTitle(b)} (this computer)` }), acts };
+    return { ...(base || { noRights: true, title: `${boxTitle(b)} (${b.local ? "this computer" : machineName(machineKey(b))})` }), acts };
   }
   return null;
 }
@@ -466,6 +467,12 @@ function boxActs(b) {
   const open = !b.closed_at;
   return { purge: true, empty: true, close: b.role === "session" && open, del: isProjectBox(b) || (b.role === "session" && !open) };
 }
+const daemonOf = (b) => b?.machine ? [...S.boxes.values()].find((x) => x.role === "butler" && x.machine === b.machine) : null;
+function remoteActs(b) {  // a box of another computer: its daemon empties, closes or deletes it (purging is its own)
+  if (!b || ["operator", "machine", "butler"].includes(b.role) || !daemonOf(b)) return null;
+  return { ...boxActs(b), purge: false, remote: true };
+}
+const remoteOk = (b) => !b.local && !!remoteActs(b);
 function boxRights(b, snap) {
   {  // the handling of what this box sends (its own setting, its project's, its computer's)
     if (!b?.rights || b.role === "operator" || b.role === "machine" || isProjectBox(b)) return null;  // a machine box: its machine's menu
@@ -570,6 +577,7 @@ function openRightsMenu(li, fromPointer) {
   ba.hidden = !r.acts;
   if (r.acts) {
     const b = S.boxes.get(li.dataset.key) || {};
+    $('#box-acts [data-box="purge"]').hidden = !r.acts.purge;
     $("#box-close").hidden = !r.acts.close;
     $("#box-delete").hidden = !r.acts.del;
     $("#box-delete").firstChild.textContent = isProjectBox(b) ? "Delete the project box" : "Delete the closed box";
@@ -1632,10 +1640,10 @@ function renderBoxes() {
 const BS = { checked: new Set(), last: null };
 const shownBoxIds = () => $$("#boxes-body tr").map((r) => r.dataset.id);
 const BOX_BATCH = {  // which selected boxes an action fits: the client acts with the box's own keys, so this computer's only
-  empty: (b) => b.local,
+  empty: (b) => b.local || remoteOk(b),  // another computer's: its daemon does it (an op signed by this console)
   purge: (b) => b.local,
-  close: (b) => b.local && b.role === "session" && !b.closed_at,
-  delete: (b) => b.local && (isProjectBox(b) || (b.role === "session" && !!b.closed_at)),
+  close: (b) => (b.local || remoteOk(b)) && b.role === "session" && !b.closed_at,
+  delete: (b) => (b.local || remoteOk(b)) && (isProjectBox(b) || (b.role === "session" && !!b.closed_at)),
 };
 function syncBoxChecks() {
   const ids = shownBoxIds(), shown = new Set(ids);
@@ -1695,17 +1703,22 @@ $("#b-batch").addEventListener("click", (e) => {
   const [verb, text, okLabel, act] = BOX_BATCH_TXT[kind];
   const noun = kind === "close" ? "session box(es)" : "box(es)";
   const left = sel.length - fit.length;
-  const skip = left ? ` The ${left} other selected box(es) stay as they are: ${kind === "close" ? "only an open session box of this computer closes"
-    : kind === "delete" ? "only a project box or a closed session box of this computer is deleted" : "only this computer's own boxes are acted upon"}.` : "";
+  const skip = left ? ` The ${left} other selected box(es) stay as they are: ${kind === "close" ? "only an open session box closes"
+    : kind === "delete" ? "only a project box or a closed session box is deleted" : kind === "purge" ? "only this computer's own boxes are purged"
+    : "only this computer's boxes, and those of a computer whose daemon this console knows, are acted upon"}.` : "";
   confirmRun(`${verb} ${fit.length} ${noun}?`, `${fit.map((b) => boxName(b.id)).join(", ")}. ${text}${skip}`, async () => {
     const outs = [];
     let ok = true;
-    for (const b of fit) {  // one at a time: each runs the client under that box's lock
+    const one = async (b) => {
       const r = await action({ action: act, id: b.id }).catch((x) => ({ ok: false, err: x.message }));
       ok = ok && !!r.ok;
       outs.push(`${r.ok ? "✓" : "✗"} ${boxName(b.id)}: ` + ([r.out, r.err].filter(Boolean).join(" ").trim() || (r.ok ? "done" : "failed")));
       if (r.ok && (kind === "close" || kind === "delete")) BS.checked.delete(b.id);
-    }
+    };
+    const remote = fit.filter((b) => !b.local);
+    const far = Promise.all(remote.map(one));  // other computers' daemons: all asked at once, each answers in its round
+    for (const b of fit.filter((b) => b.local)) await one(b);  // one at a time: each runs the client under that box's lock
+    await far;
     syncBoxChecks();
     return { ok, out: outs.join("\n") };
   }, { okLabel });

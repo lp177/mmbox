@@ -2211,10 +2211,11 @@ class State:
 
     def box_command(self, bid: str, what: str) -> dict:
         """A box's menu: empty what waits in it (purged, senders told), close a session box, delete a project box (or
-        a closed session box). Only for the boxes of this computer: the client does it with the box's own keys."""
+        a closed session box). The client does it with the box's own keys: for a box of another computer, its daemon
+        does it there, asked with an op signed by this console's operator key (`op: box`)."""
         y = next((b for n in M.local_profiles() if (b := M.load_me(n)) and b.id == bid), None)
         if not y:
-            return {"ok": False, "err": "not a box of this computer: only its own computer can do that"}
+            return self.remote_box_command(bid, what)
         prof = y.local.profile
         if what == "empty":
             r = run_client(["--profile", prof, "backlog", "purge", "--box", "session", "--all"], timeout=180)
@@ -2232,6 +2233,42 @@ class State:
         self._usage = (0.0, {})
         threading.Thread(target=self.refresh, daemon=True).start()
         return r
+
+    def daemon_of(self, b: dict) -> dict | None:
+        """The daemon (butler box) of the computer a box of the snapshot runs on, if this console knows one."""
+        mk = b.get("machine")
+        return next((x for x in self.snapshot.get("boxes") or [] if mk and x.get("role") == "butler"
+                     and x.get("machine") == mk), None)
+
+    def remote_box_command(self, bid: str, what: str, wait_s: float = 45.0) -> dict:
+        """A box's menu for a box of another computer: an op to that computer's daemon, then its answer awaited (the
+        daemon reads its box every round, 15 s)."""
+        b = self.snapshot_box(bid)
+        if not b:
+            return {"ok": False, "err": "unknown box"}
+        if what not in ("empty", "close", "delete"):
+            return {"ok": False, "err": "only its own computer purges a box's history"}
+        d = self.daemon_of(b)
+        if not d:
+            return {"ok": False, "err": "its computer runs no mmbox daemon this console knows (its butler's box): only "
+                                        "its own computer can do that"}
+        r = self.send_op(d["id"], {"op": "box", "box": bid, "what": what})
+        if not r.get("ok"):
+            return r
+        end = time.time() + wait_s
+        while time.time() < end:
+            res = (getattr(self, "op_results", {}) or {}).get(r["op_id"])
+            if res:
+                out = res.get("result") or {}
+                threading.Thread(target=self.refresh, daemon=True).start()
+                err = out.get("error")
+                if err and "unknown op" in err:
+                    err += " (its client predates remote box commands: update it, then restart its daemon)"
+                return {"ok": not err, "out": out.get("out"), "err": err}
+            time.sleep(0.5)
+        return {"ok": True, "out": f"asked the daemon of {d.get('label') or d['id']}; no answer yet: its box shows the "
+                                   f"change once it acted (never, if that computer has not pinned this console's "
+                                   f"operator key: then its butler's chat says it got a message)"}
 
     # ---------------------------------------------------------------- the butler (client/BUTLER.md)
     def butler_on(self) -> bool:
@@ -2382,7 +2419,7 @@ class State:
             return {**r, "out": "asked; its inventory shows within a round or two" if r.get("ok") else None}
         if a == "daemon_op":  # any op to a computer's daemon (operator key only); its answer: op_results[op_id]
             op = body.get("op") if isinstance(body.get("op"), dict) else {}
-            if op.get("op") not in ("status", "config", "inventory", "start", "stop", "input", "output", "list"):
+            if op.get("op") not in ("status", "config", "inventory", "start", "stop", "input", "output", "list", "box"):
                 return {"ok": False, "err": "unknown op"}
             return self.send_op(str(body.get("box") or ""), op)
         if a == "session_input":  # a line typed into a hidden session of this computer

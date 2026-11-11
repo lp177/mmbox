@@ -999,11 +999,42 @@ def refresh_chains(b, force: bool = False) -> None:
     jsave("state.json", {**jload("state.json", {}), "chains_at": time.time()})
 
 
+def box_command(bid: str, what: str) -> dict:
+    """A box's menu, for a box of this computer, asked by the operator's console of another one (`op: box`): empty what
+    waits in it, close a session box, delete a project box or a closed session box. The client does it here, with the
+    box's own keys: the same rules as the console's menu for its own computer's boxes."""
+    y = next((b for n in M.local_profiles() if (b := M.load_me(n)) and b.id == bid), None)
+    if not y:
+        return {"error": f"{bid} is no box of this computer"}
+    prof = y.local.profile
+    if y.role in ("machine", "butler", "operator") and what != "empty":
+        return {"error": f"a {y.role} box is neither closed nor deleted"}
+    if what == "empty":
+        args = ["--profile", prof, "backlog", "purge", "--box", "session", "--all"]
+    elif what == "close":
+        if y.role != "session" or y.closed_at:
+            return {"error": "only an open session box is closed"}
+        args = ["--profile", M.MACHINE_PROFILE, "sessions", "--close", prof, "--reason", "closed by the operator's console"]
+    elif what == "delete":
+        if y.role == "session" and not y.closed_at:
+            return {"error": "only a project box, or a closed session box, is deleted: close it first"}
+        args = ["--profile", M.MACHINE_PROFILE, "sessions", "--remove", prof, "--reason", "deleted by the operator's console"]
+    else:
+        return {"error": f"unknown box command {what}: empty, close or delete"}
+    rc, out = run([sys.executable, str(Path(M.__file__).resolve()), *args], timeout=180)
+    log("daemon", f"box {what} {y.label} ({bid}): exit {rc}")
+    return {"box": bid, "what": what, "out": out.strip()[-1500:]} if rc == 0 else \
+        {"error": f"exit {rc}: " + (out.strip().splitlines()[-1:] or ["no output"])[0][:500], "out": out.strip()[-1500:]}
+
+
 def do_op(op: dict) -> dict:
     """What the operator's console asks the daemon (signed with its operator key, nobody else): status, config,
-    inventory, start, stop, input (a line typed into a hidden session), output (a hidden session's output)."""
+    inventory, start, stop, input (a line typed into a hidden session), output (a hidden session's output), box (a
+    box's menu: empty, close, delete)."""
     try:
         o = op.get("op")
+        if o == "box":
+            return box_command(str(op.get("box") or ""), str(op.get("what") or ""))
         if o == "status":
             st = status()
             return {k: st[k] for k in ("running", "box", "beat", "started", "fails", "folders", "after_s")} | {
