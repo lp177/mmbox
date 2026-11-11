@@ -1081,6 +1081,8 @@ def daemon(once: bool = False) -> int:
         print("ALREADY RUNNING: the daemon runs on this computer already", flush=True)
         return 6
     (home() / "butler.pid").write_text(str(os.getpid()), encoding="utf-8")
+    (home() / "stopped").unlink(missing_ok=True)  # started again: the operator's stop is over
+    jsave("state.json", {**jload("state.json", {}), "since": time.time(), "code": code_version().get("commit")})
     b = butler_me()
     M.listeners(b.local, register=True)
     log("daemon", f"butler {b.label} ({b.id}) runs, pid {os.getpid()}; takes what waited {AFTER_S / 60:g} min")
@@ -1101,6 +1103,7 @@ def daemon(once: bool = False) -> int:
             jsave("state.json", {**jload("state.json", {}), "claims": st["claims"], "fails": st.get("fails") or {},
                                  "last_start": st.get("last_start") or {}, "beat": time.time()})
             check_started()
+            maybe_tray()
             refresh_chains(b)
             handle_own_box(b, st)
             q = home() / "chat.queue"
@@ -1117,12 +1120,340 @@ def daemon(once: bool = False) -> int:
         time.sleep(LOOP_S)
 
 
+# ---------------------------------------------------------------- control: up, down, restart, update, the tray
+def client_file() -> str:
+    return str(Path(M.__file__).resolve())
+
+
+def pythonw() -> str:
+    """The interpreter of a background process: pythonw on Windows (no window), else this one."""
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    return str(pyw) if os.name == "nt" and pyw.is_file() else sys.executable
+
+
+def spawn(*args: str) -> int:
+    """A process of the client that outlives this one (detached, no window), its pid."""
+    kw = {"creationflags": DETACHED | NOWIN} if os.name == "nt" else {"start_new_session": True}
+    p = subprocess.Popen([pythonw(), client_file(), *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, cwd=str(home()), **kw)
+    threading.Thread(target=p.wait, daemon=True).start()  # reaped when it ends: no zombie a long-lived parent keeps
+    return p.pid
+
+
+def service() -> str | None:
+    """How this computer runs the daemon at login: systemd or launchd (they start and stop it), else None (a Windows
+    Startup shortcut, or nothing: the daemon is a process of its own here)."""
+    if sys.platform.startswith("linux") and (Path.home() / ".config" / "systemd" / "user" / "mmbox-daemon.service").is_file():
+        return "systemd" if shutil.which("systemctl") else None
+    if sys.platform == "darwin" and (Path.home() / "Library" / "LaunchAgents" / "com.mmbox.daemon.plist").is_file():
+        return "launchd"
+    return None
+
+
+def wait_running(want: bool, timeout: float = 20) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        pid = read(home() / "butler.pid").strip()
+        alive = pid.isdigit() and M.pid_alive(int(pid))
+        if want and alive and float(jload("state.json", {}).get("since") or 0) > end - timeout - 1:
+            return True
+        if not want and not alive:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def stopped_by_operator() -> bool:
+    """The operator stopped the daemon (`daemon down`, the tray, the console): nothing starts it again by itself (the
+    console's "Run the butler") until it is started (`daemon up`, a login)."""
+    return (home() / "stopped").exists()
+
+
+def up() -> dict:
+    """The daemon started, if it does not run: through its service (systemd, launchd), else as a process of its own."""
+    (home() / "stopped").unlink(missing_ok=True)
+    if status()["running"]:
+        return {"ok": True, "out": f"the daemon runs already (pid {status()['pid']})"}
+    svc = service()
+    if svc == "systemd":
+        code, out = run(["systemctl", "--user", "start", "mmbox-daemon.service"], 60)
+    elif svc == "launchd":
+        code, out = run(["launchctl", "load", "-w", str(Path.home() / "Library" / "LaunchAgents" / "com.mmbox.daemon.plist")], 30)
+    else:
+        code, out = 0, f"pid {spawn('daemon', 'run')}"
+    if code != 0:
+        return {"ok": False, "err": f"{svc}: {out.strip()[-300:]}"}
+    ok = wait_running(True)
+    log("daemon", f"started from the control ({svc or 'process'})")
+    return {"ok": ok, "out": "the daemon started" if ok else None,
+            "err": None if ok else "started, but it does not run yet: see `mmbox.py daemon log`"}
+
+
+def down(reason: str = "stopped") -> dict:
+    """The daemon stopped, and kept stopped (nothing starts it again by itself until `up` or the next login)."""
+    (home() / "stopped").write_text(f"{time.time():.0f} {reason}", encoding="utf-8")
+    svc = service()
+    if svc == "systemd":
+        run(["systemctl", "--user", "stop", "mmbox-daemon.service"], 60)
+    elif svc == "launchd":
+        run(["launchctl", "unload", str(Path.home() / "Library" / "LaunchAgents" / "com.mmbox.daemon.plist")], 30)
+    pid = read(home() / "butler.pid").strip()
+    if pid.isdigit() and int(pid) != os.getpid() and M.pid_alive(int(pid)):
+        if os.name == "nt":
+            run(["taskkill", "/PID", pid, "/F"], 30)
+        else:
+            import signal
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except OSError:
+                pass
+    ok = wait_running(False)
+    log("daemon", f"{reason} from the control")
+    return {"ok": ok, "out": "the daemon is stopped" if ok else None, "err": None if ok else f"pid {pid} still runs"}
+
+
+def restart() -> dict:
+    """The daemon stopped and started again: it loads the client as it is on disk now."""
+    svc = service()
+    if svc == "systemd":
+        (home() / "stopped").unlink(missing_ok=True)
+        code, out = run(["systemctl", "--user", "restart", "mmbox-daemon.service"], 60)
+        if code != 0:
+            return {"ok": False, "err": f"systemd: {out.strip()[-300:]}"}
+        ok = wait_running(True)
+        return {"ok": ok, "out": "the daemon restarted" if ok else None, "err": None if ok else "it does not run yet"}
+    r = down("restarting")
+    if not r["ok"]:
+        return r
+    r = up()
+    return {**r, "out": "the daemon restarted" if r["ok"] else None}
+
+
+UPDATE_INTERVAL_S = 6 * 3600
+
+
+def git(*args: str, timeout: float = 90) -> tuple[int, str]:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # never a password prompt nobody can answer
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=15")
+    try:
+        p = subprocess.run(["git", "-C", str(Path(client_file()).parent.parent), *args], capture_output=True, text=True,
+                           timeout=timeout, stdin=subprocess.DEVNULL, creationflags=NOWIN, env=env)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, str(e)
+
+
+def code_version() -> dict:
+    """The client on disk: its commit, date and subject (a git clone), else its protocol version alone."""
+    code, out = git("log", "-1", "--format=%h%x09%cd%x09%s", "--date=short", timeout=15)
+    if code == 0 and out.count("\t") >= 2:
+        h, d, subj = out.strip().split("\t", 2)
+        return {"commit": h, "date": d, "subject": subj, "protocol": M.VERSION}
+    return {"commit": None, "protocol": M.VERSION}
+
+
+class UpdateLock:
+    """`<temp>/mmbox-update.lock`, shared with the skills' mmbox_client.py: `<unix time>;<who>` of the computer's last
+    check, read and written under an OS lock on the file itself."""
+
+    def __init__(self):
+        import tempfile
+        p = Path(tempfile.gettempdir()) / "mmbox-update.lock"
+        if p.exists() and not os.access(p, os.W_OK):
+            p = p.with_name(f"mmbox-update-{os.environ.get('USER') or os.environ.get('USERNAME') or 'me'}.lock")
+        self.fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o644)
+        if os.name == "nt":
+            import msvcrt
+            for _ in range(100):
+                try:
+                    os.lseek(self.fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1 << 20)
+                    break
+                except OSError:
+                    time.sleep(0.2)
+        else:
+            import fcntl
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+
+    def write(self, who: str) -> None:
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        os.ftruncate(self.fd, 0)
+        os.write(self.fd, f"{int(time.time())};{who}".encode())
+
+    def close(self) -> None:
+        if os.name == "nt":
+            import msvcrt
+            try:
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1 << 20)
+            except OSError:
+                pass
+        os.close(self.fd)
+
+
+def update(apply: bool = False, who: str = "mmbox-daemon") -> dict:
+    """The client's clone checked against its origin (git fetch): how many commits it is behind, which; with `apply`, it
+    moves to them (fast-forward only, never over local changes), checks itself (selftest) and restarts the daemon. The
+    result is kept in update.json (the tray and the window show it)."""
+    res: dict = {"at": time.time(), "current": code_version()}
+    if not (Path(client_file()).parent.parent / ".git").exists():
+        res["error"] = "this client is no git clone: update it the way it was installed"
+        jsave("update.json", res)
+        return res
+    lk = UpdateLock()
+    try:
+        lk.write(who)
+        code, out = git("status", "--porcelain", "--untracked-files=no", timeout=30)
+        if code == 0 and out.strip():
+            res["error"] = "the client's folder has local changes: left untouched"
+            return res
+        code, ref = git("rev-parse", "--abbrev-ref", "HEAD", timeout=15)
+        ref = ref.strip() if code == 0 and ref.strip() not in ("", "HEAD") else "master"
+        code, out = git("fetch", "--quiet", "origin", ref)
+        if code != 0:
+            res["error"] = f"git fetch failed: {out.strip()[-200:] or 'no answer'} (network, VPN?)"
+            return res
+        _, old = git("rev-parse", "HEAD", timeout=15)
+        _, new = git("rev-parse", "FETCH_HEAD", timeout=15)
+        old, new = old.strip(), new.strip()
+        _, lines = git("log", "--format=%h %s", f"{old}..{new}", timeout=15)
+        res["behind"] = [x for x in lines.splitlines() if x.strip()][:50]
+        res["latest"] = new[:9]
+        if old == new or not apply:
+            return res
+        if git("merge-base", "--is-ancestor", old, new, timeout=15)[0] != 0:
+            res["error"] = f"the client's commit {old[:9]} is not in origin's {ref}: left untouched"
+            return res
+        code, out = git("reset", "--hard", "--quiet", new, timeout=60)
+        if code != 0:
+            res["error"] = f"git reset failed: {out.strip()[-200:]}"
+            return res
+        code, out = run([sys.executable, client_file(), "selftest"], 60)
+        res.update(updated=True, behind=[], current=code_version(), selftest=code == 0 and "selftest ok" in out)
+        log("daemon", f"client updated to {res['current'].get('commit')} from the control")
+    finally:
+        lk.close()
+        jsave("update.json", res)
+    if res.get("updated") and status()["running"]:
+        res["restart"] = restart()
+        jsave("update.json", res)
+    return res
+
+
+def console_instance() -> dict | None:
+    """The operator's console running on this computer (its instance file, its process alive), if any."""
+    if os.environ.get("MMBOX_CONSOLE_HOME"):
+        ch = Path(os.environ["MMBOX_CONSOLE_HOME"])
+    elif os.name == "nt":
+        ch = Path(os.environ.get("APPDATA", Path.home())) / "mmbox-console"
+    else:
+        ch = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mmbox-console"
+    inst = jload_path(ch / "instance.json")
+    pid = int(inst.get("pid") or 0)
+    if not pid or not M.pid_alive(pid):
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            if b"mmbox_console" not in Path(f"/proc/{pid}/cmdline").read_bytes():
+                return None  # its pid went to another program
+        except OSError:
+            return None
+    return inst
+
+
+def console_has_tray() -> bool:
+    """A console runs here with its own icon in the notification area (it then shows the daemon's actions itself)."""
+    inst = console_instance()
+    return bool(inst) and inst.get("tray", os.name != "nt" and sys.platform != "darwin") is not False
+
+
+def desktop_env() -> dict:
+    """The graphical session's variables, for a tray started by a service that lacks them (systemd may start the daemon
+    before the session exports them): its own environment first, else systemd's user environment."""
+    keys = ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_RUNTIME_DIR",
+            "XAUTHORITY", "XDG_SESSION_TYPE")
+    env = {k: os.environ[k] for k in keys if os.environ.get(k)}
+    if sys.platform.startswith("linux") and not (env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")) and shutil.which("systemctl"):
+        code, out = run(["systemctl", "--user", "show-environment"], 10)
+        for ln in out.splitlines() if code == 0 else []:
+            k, _, v = ln.partition("=")
+            if k in keys and v and k not in env:
+                env[k] = v
+    return env
+
+
+def has_desktop() -> bool:
+    if os.name == "nt":
+        return True
+    if sys.platform == "darwin":
+        return False  # no tray of its own on macOS yet
+    env = desktop_env()
+    return bool(env.get("DBUS_SESSION_BUS_ADDRESS") and (env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")))
+
+
+def tray_pid() -> int | None:
+    t = jload("tray.json", {})
+    pid = int(t.get("pid") or 0)
+    return pid if pid and M.pid_alive(pid) and (not t.get("start") or M.proc_start(pid) == t["start"]) else None
+
+
+def maybe_tray() -> None:
+    """The daemon's own icon in the notification area, when this computer has a desktop, no console with its icon runs
+    and none runs yet (butler.json `"tray": false` turns it off). It quits by itself when a console comes."""
+    if config().get("tray") is False or tray_pid() or console_has_tray() or not has_desktop():
+        return
+    t, st = jload("tray.json", {}), jload("state.json", {})
+    if t.get("ended") == "failed" and time.time() - float(t.get("at") or 0) < 1800:
+        return  # it could not show (no panel, no Dbusmenu): tried again in 30 min
+    if time.time() - float(st.get("tray_tried") or 0) < 60:
+        return  # one try a minute at most
+    jsave("state.json", {**st, "tray_tried": time.time()})
+    pid = spawn("daemon", "tray")
+    log("daemon", f"its icon in the notification area started (pid {pid})")
+
+
+def control_state() -> dict:
+    """The daemon's state for a menu, read every few seconds: cheap (a few files and one pid)."""
+    pid = read(home() / "butler.pid").strip()
+    st = jload("state.json", {})
+    alive = pid.isdigit() and M.pid_alive(int(pid))
+    fresh = time.time() - max(float(st.get("beat") or 0), float(st.get("since") or 0)) < LOOP_S * 8
+    up = jload("update.json", {})
+    return {"running": bool(alive and fresh), "pid": int(pid) if alive else None, "update": up,
+            "behind": len(up.get("behind") or []) if not up.get("error") else 0, "stopped": stopped_by_operator()}
+
+
+def about() -> dict:
+    """What the daemon's window shows: its state, this computer's boxes, the client's version and its last update
+    check."""
+    st, s = jload("state.json", {}), status()
+    boxes = {"projects": 0, "open": 0, "closed": 0}
+    for n in M.local_profiles():
+        y = M.load_me(n)
+        if not y:
+            continue
+        if y.role == "project":
+            boxes["projects"] += 1
+        elif y.role == "session":
+            boxes["closed" if y.closed_at else "open"] += 1
+    m = M.machine_me()
+    ver = code_version()
+    inv = s.get("inventory") or {}
+    return {"running": s["running"], "pid": s["pid"], "since": st.get("since") if s["running"] else None,
+            "beat": s.get("beat"), "box": s.get("box"), "host": HOST, "machine": m.label if m else None,
+            "services": M.gw_urls(m) if m else [], "boxes": boxes, "started": len(s.get("started") or {}),
+            "agents": [a["agent"] for a in inv.get("agents") or [] if isinstance(a, dict) and a.get("available")],
+            "version": ver, "loaded": st.get("code") if s["running"] else None,
+            "update": jload("update.json", {}), "stopped": stopped_by_operator(), "service": service(),
+            "console": bool(console_instance())}
+
+
 def status() -> dict:
     st = jload("state.json", {})
     pid = read(home() / "butler.pid").strip()
     alive = pid.isdigit() and M.pid_alive(int(pid))  # never os.kill(pid, 0): on Windows it terminates the process
     b = butler_me(create=False)
-    running = alive and time.time() - float(st.get("beat") or 0) < LOOP_S * 8
+    running = alive and time.time() - max(float(st.get("beat") or 0), float(st.get("since") or 0)) < LOOP_S * 8
     return {"running": running, "pid": int(pid) if running else None,
             "box": {"id": b.id, "label": b.label} if b else None, "beat": st.get("beat"), "home": str(home()),
             "inventory": jload("inventory.json", {}), "started": st.get("started") or {}, "claims": st.get("claims") or {},
@@ -1287,6 +1618,14 @@ def main(module, argv: list[str]) -> int:
     x.add_argument("--operator-fingerprint", dest="fingerprint", help=argparse.SUPPRESS)
     x.add_argument("--account", help="pin this account's root fingerprint: its devices may then send ops (client/ACCOUNTS.md)")
     x.add_argument("--chain", help="with --account: its device chain (a JSON file the console exports), checked against it")
+    sp.add_parser("up", help="start the daemon if it does not run (through its service when it has one)")
+    sp.add_parser("down", help="stop the daemon, and keep it stopped until `up` or the next login")
+    sp.add_parser("restart", help="stop the daemon and start it again: it loads the client as it is on disk")
+    x = sp.add_parser("update", help="check the client's clone against its origin; --apply: update it, then restart")
+    x.add_argument("--apply", action="store_true")
+    sp.add_parser("about", help="what the daemon's window shows (JSON)")
+    sp.add_parser("tray", help="the daemon's icon in the notification area (started by the daemon when no console runs)")
+    sp.add_parser("window", help="the daemon's window: its state, version, start, stop, restart, update")
     x = sp.add_parser("session-run", help=argparse.SUPPRESS)  # a hidden session's runner (started by the daemon)
     x.add_argument("name")
     x = sp.add_parser("session-input", help="type a line into a hidden session the daemon started")
@@ -1298,6 +1637,24 @@ def main(module, argv: list[str]) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "run":
         return daemon(a.once)
+    if a.cmd in ("up", "down", "restart"):
+        r = {"up": up, "down": down, "restart": restart}[a.cmd]()
+        print(r.get("out") or r.get("err") or "")
+        return 0 if r.get("ok") else 1
+    if a.cmd == "update":
+        r = update(apply=a.apply, who="daemon update")
+        print(json.dumps(r, ensure_ascii=False, indent=1))
+        return 1 if r.get("error") else 0
+    if a.cmd == "about":
+        print(json.dumps(about(), ensure_ascii=False, indent=1))
+        return 0
+    if a.cmd in ("tray", "window"):
+        try:
+            import mmbox_tray
+        except ImportError:
+            print("the tray needs mmbox_tray.py beside mmbox.py (a full clone of the client: mmbox-install)", file=sys.stderr)
+            return 1
+        return mmbox_tray.main(sys.modules[__name__], a.cmd)
     if a.cmd == "status":
         print(json.dumps(status(), ensure_ascii=False, indent=1))
     elif a.cmd == "inventory":

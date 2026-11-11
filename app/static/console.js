@@ -2695,6 +2695,18 @@ async function butlerLoad() {
   $("#butler-meta").textContent = [d.box ? `box ${d.box.label}` : "no box yet", d.running && d.pid ? `pid ${d.pid}` : null,
     d.beat ? `last round ${fmtSec.format(new Date(d.beat * 1000))}` : null, `takes what waited ${Math.round(d.after_s / 60)} min`].filter(Boolean).join(" · ");
   $("#butler-run").checked = !!d.run_with_console;
+  const c = d.control;  // the daemon's own controls (mmbox_tray.py): start or stop, restart, updates
+  $("#butler-ctl").hidden = !c;
+  if (c && !BT.ctlBusy) {
+    $("#butler-toggle").textContent = d.running ? "Stop" : "Start";
+    $("#butler-restart").disabled = !d.running;
+    $("#butler-update").textContent = c.behind ? `Update to ${c.update?.latest || "the latest"}` : "Check for updates";
+    const u = c.update || {};
+    $("#butler-update").title = u.error ? `Last check failed: ${u.error}`
+      : c.behind ? (u.behind || []).slice(0, 8).join("\n") : u.at ? `Up to date, checked ${fmtSec.format(new Date(u.at * 1000))}` : "Not checked yet";
+    $("#butler-meta").textContent += [c.version?.commit ? ` · client ${c.version.commit} (${c.version.date})` : "",
+      c.behind ? ` · ${c.behind} update(s) available` : "", c.stopped && !d.running ? " · stopped by the operator" : ""].join("");
+  }
   renderButlerChat(d.chat || []);
   renderButlerInventory(d.inventory || {});
   renderButlerForm(d);
@@ -2823,6 +2835,22 @@ $("#butler-run").addEventListener("change", async (e) => {
   toast(on ? "The butler runs with this console" : "The butler is stopped and no longer runs with this console");
   setTimeout(butlerLoad, 1500);
 });
+async function daemonCtl(act, body = {}) {  // the daemon's start or stop, restart, update: seconds each
+  const btns = ["#butler-toggle", "#butler-restart", "#butler-update"].map((s) => $(s));
+  BT.ctlBusy = true;
+  btns.forEach((b) => { b.disabled = true; });
+  const me = { daemon_up: btns[0], daemon_down: btns[0], daemon_restart: btns[1], daemon_update: btns[2] }[act];
+  me.classList.add("loading"); me.setAttribute("aria-busy", "true");
+  const r = await action({ action: act, ...body }).catch((x) => ({ ok: false, err: x.message }));
+  me.classList.remove("loading"); me.removeAttribute("aria-busy");
+  btns.forEach((b) => { b.disabled = false; });
+  BT.ctlBusy = false;
+  toast(r.ok ? (r.out || "Done") : "Failed: " + (r.err || "?"));
+  butlerLoad();
+}
+$("#butler-toggle").addEventListener("click", () => daemonCtl(BT.data?.running ? "daemon_down" : "daemon_up"));
+$("#butler-restart").addEventListener("click", () => daemonCtl("daemon_restart"));
+$("#butler-update").addEventListener("click", () => daemonCtl("daemon_update", { apply: !!BT.data?.control?.behind }));
 $("#butler-refresh").addEventListener("click", async (e) => {
   const b = e.currentTarget; b.classList.add("loading"); b.setAttribute("aria-busy", "true");
   const r = await action({ action: "butler_refresh" });

@@ -1209,6 +1209,8 @@ class Desktop:
             log("no icon in the notification area (" + "; ".join(errors) + "): install gir1.2-dbusmenu-glib-0.4 "
                 "(or gir1.2-ayatanaappindicator3-0.1)")
             self.ok = False
+        else:  # the daemon's entries follow its state (started, stopped, an update found elsewhere)
+            self.GLib.timeout_add_seconds(5, lambda: (self._refresh(), True)[1])
         if self.app:
             self.app.can_hide = self.tray is not None
             if self.tray is None and not self.app.visible:
@@ -1223,7 +1225,43 @@ class Desktop:
                 ("held", "No message held", lambda: self.open(held=True)),
                 ("hide", "Hide in the notification area", self.hide),
                 ("sep", None, None),
+                ("d_state", "mmbox daemon", lambda: None),
+                ("d_toggle", "Stop the daemon", lambda: self.daemon_act("toggle")),
+                ("d_restart", "Restart the daemon", lambda: self.daemon_act("restart")),
+                ("d_update", "Check for updates", lambda: self.daemon_act("update")),
+                ("sep", None, None),
                 ("quit", "Quit the console", self.on_quit)]
+
+    def daemon_state(self) -> dict | None:
+        return B.control_state() if B and hasattr(B, "control_state") else None
+
+    def daemon_act(self, what: str) -> None:
+        """The daemon's actions from this menu (the same as its own icon's, mmbox_tray.py), in a thread: their result
+        in a notification."""
+        d = self.daemon_state()
+        if d is None or getattr(self, "daemon_busy", None):
+            return
+        key = ("down" if d["running"] else "up") if what == "toggle" else what
+        self.daemon_busy = {"up": "starting", "down": "stopping", "restart": "restarting",
+                            "update": "updating" if d["behind"] else "checking for updates"}[key]
+        self._refresh()
+
+        def work():
+            try:
+                if key == "update":
+                    r = B.update(apply=bool(d["behind"]), who="mmbox console")
+                    n = len(r.get("behind") or [])
+                    r = {"ok": False, "err": r["error"]} if r.get("error") else {"ok": True, "out": (
+                        f"Updated to {(r.get('current') or {}).get('commit')}: restart the console to load it" if r.get("updated")
+                        else f"{n} update(s) available: {r['behind'][0]}" if n else "The client is up to date")}
+                else:
+                    r = {"up": B.up, "down": B.down, "restart": B.restart}[key]()
+            except Exception as e:  # noqa: BLE001 - shown, never fatal
+                r = {"ok": False, "err": f"{type(e).__name__}: {e}"}
+            self.daemon_busy = None
+            self.alert("mmbox daemon", r.get("out") if r.get("ok") else "Failed: " + str(r.get("err") or "?"))
+            self.GLib.idle_add(self._refresh)
+        threading.Thread(target=work, daemon=True, name="daemon-act").start()
 
     def menu_state(self) -> dict:
         n, app = self.pending_n, self.app
@@ -1231,7 +1269,20 @@ class Desktop:
                 "browser": (None, True, bool(app)),
                 "questions": (f"Answer the questions ({n})" if n else "No question waiting", bool(n), True),
                 "held": (f"See the held messages ({self.held_n})", True, bool(self.held_n)),
-                "hide": (None, bool(app and app.visible), bool(app and app.can_hide))}
+                "hide": (None, bool(app and app.visible), bool(app and app.can_hide)),
+                **self.daemon_menu_state()}
+
+    def daemon_menu_state(self) -> dict:
+        d, busy = self.daemon_state(), getattr(self, "daemon_busy", None)
+        if d is None:
+            return {k: (None, False, False) for k in ("d_state", "d_toggle", "d_restart", "d_update")}
+        free = busy is None
+        return {"d_state": (f"Daemon: {busy}..." if busy else f"Daemon: running (pid {d['pid']})" if d["running"]
+                            else "Daemon: stopped", False, True),
+                "d_toggle": ("Stop the daemon" if d["running"] else "Start the daemon", free, True),
+                "d_restart": (None, free and d["running"], True),
+                "d_update": (f"Update to {d['update'].get('latest') or 'the latest'} and restart the daemon"
+                             if d["behind"] else "Check for updates", free, True)}
 
     def _refresh(self) -> bool:
         if self.tray:
@@ -2282,8 +2333,8 @@ class State:
             self._butler_proc = None  # an ended butler this console started: reaped
         if not B or not self.butler_on() or not M.machine_me():
             return
-        if B.status().get("running"):
-            return
+        if B.status().get("running") or (hasattr(B, "stopped_by_operator") and B.stopped_by_operator()):
+            return  # running, or stopped by the operator (the tray, the Butler tab): started again only when asked
         if time.time() - getattr(self, "_butler_started", 0) < 120:
             return  # just started: its first beat comes
         self._butler_started = time.time()
@@ -2297,7 +2348,13 @@ class State:
         if not B:
             return {"available": False, "why": "the client has no butler yet (mmbox_daemon.py): update it (mmbox-update)"}
         c = B.config()
+        control = None
+        if hasattr(B, "control_state"):
+            if time.time() - getattr(self, "_code_at", 0) > 60:
+                self._code, self._code_at = B.code_version(), time.time()
+            control = {**B.control_state(), "version": self._code}
         return {"available": True, "run_with_console": self.butler_on(), **B.status(), "chat": B.chat_history(200),
+                "control": control,
                 "op_results": getattr(self, "op_results", {}),
                 "settings": {"butler_agent": c.get("agent"), "butler_model": c.get("model"),
                              "session_agent": self.console_state.get("session_agent"),
@@ -2446,6 +2503,23 @@ class State:
                 except OSError as e:
                     return {"ok": False, "err": str(e)}
             return {"ok": True, "run_with_console": on}
+        if a in ("daemon_up", "daemon_down", "daemon_restart", "daemon_update"):  # the daemon's own icon's actions
+            if not hasattr(B, "up"):
+                return {"ok": False, "err": "the client predates these commands: update it"}
+            if a == "daemon_update":
+                r = B.update(apply=bool(body.get("apply")), who="mmbox console")
+                self._code_at = 0
+                if r.get("error"):
+                    return {"ok": False, "err": r["error"]}
+                n = len(r.get("behind") or [])
+                return {"ok": True, "updated": bool(r.get("updated")), "behind": n,
+                        "out": f"updated to {(r.get('current') or {}).get('commit')}: restart the console to load it"
+                        + ("; the daemon restarted" if (r.get("restart") or {}).get("ok") else "") if r.get("updated")
+                        else f"{n} update(s) available" if n else "the client is up to date"}
+            r = {"daemon_up": B.up, "daemon_down": B.down, "daemon_restart": B.restart}[a]()
+            if a == "daemon_up":
+                self._butler_started = time.time()  # this console does not start a second one meanwhile
+            return {"ok": bool(r.get("ok")), "out": r.get("out"), "err": r.get("err")}
         if a == "butler_stop_session":
             r = run_client(["butler", "stop", str(body.get("profile") or "")], timeout=30)
             return {"ok": r.get("ok"), "out": r.get("out"), "err": r.get("err")}
@@ -4180,6 +4254,14 @@ def main():
             threading.Thread(target=httpd.shutdown, daemon=True).start()
         state.desktop = Desktop(op.home, url_of, quit_console, app)
         state.tick()
+    try:  # whether this console shows its icon: the daemon's own icon stays away while it does (mmbox_tray.py)
+        inst = json.loads(instance.read_text(encoding="utf-8"))
+        inst["tray"] = bool(state.desktop and state.desktop.ok)
+        fd = os.open(instance, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(inst, f)
+    except (OSError, ValueError, AttributeError):
+        pass
     print(f"mmbox console: {url}\n  operator id {op.id} · fingerprint {op.fingerprint}\n  Ctrl+C to stop", flush=True)
     if a.open and not app:
         import webbrowser

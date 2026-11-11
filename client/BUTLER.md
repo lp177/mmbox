@@ -246,6 +246,22 @@ box for a session the operator starts.
   systemd (Linux; `loginctl enable-linger` to run without a login), launchd (macOS), a logon task running pythonw
   (Windows: no window). `daemon uninstall` removes it. Its folder: `~/.local/share/mmbox/daemon/`
   (Windows `%LOCALAPPDATA%\mmbox\daemon`).
+- **Its own controls** (`daemon start|stop` start and stop agent sessions): `daemon up` starts it (through systemd or
+  launchd when it is their service, else as a detached process), `daemon down` stops it and keeps it stopped (a file
+  `stopped`: the console's "Run the butler" no longer starts it again; `up` or the next login does), `daemon restart`
+  (it loads the client as it is on disk), `daemon update [--apply]` (the client's clone against its origin, the same
+  6 h lock file as the skills' updater; `--apply`: fast-forward only, never over local changes, selftest, restart),
+  `daemon about` (JSON: state, boxes, version, last update check).
+- **Its icon** (`client/mmbox_tray.py`, `daemon tray`): when the computer has a desktop and no console with its own icon
+  runs, the daemon starts an icon in the notification area (Linux: a StatusNotifierItem with Dbusmenu, as the console's;
+  Windows: Shell_NotifyIcon through ctypes, nothing to install; not on macOS yet). A dot says its state (green running,
+  grey stopped, gold busy). The right button: its state, Information..., Start, Stop, Restart, Check for updates
+  (Update to ... when the clone is behind), Quit (stops the daemon, removes the icon). The left button opens its
+  window (`daemon window`, tkinter, one at a time; Debian: `python3-tk`): the logo, the state, this computer's boxes,
+  the agents found, the client's version, the last check, and the same buttons. The icon quits when a console with its
+  own icon starts (its menu and its Butler tab then have the same actions), comes back within a minute or two after
+  it quits, starts again by itself on a new client, and is tried again 30 min after it could not show.
+  `butler.json` `"tray": false` turns it off.
 - **Hidden sessions**: Claude Code sessions run without a terminal: a runner per session (`daemon session-run`,
   detached, no window on any OS, outlives a restart of the daemon) keeps the agent's input open (stream-JSON: it stays
   alive, listens, wakes on its background commands) and appends its output to `sessions/<box>/out.jsonl`; what the

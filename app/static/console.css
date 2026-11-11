@@ -738,6 +738,8 @@ dialog.att-viewer { width: min(1100px, calc(100vw - 32px)); }
 .view-butler { overflow: auto; }
 .butler-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 .butler-head .grow, .butler-chat-form .grow { flex: 1; }
+.butler-ctl { display: inline-flex; gap: 8px; }
+.butler-ctl[hidden] { display: none; }
 .chip.running { background: rgb(129 201 149 / .16); color: var(--ok); }
 .chip.stopped { background: rgb(242 139 130 / .14); color: var(--err); }
 .butler-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; padding: 16px; align-items: start; }

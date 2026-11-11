@@ -400,6 +400,7 @@ deploy/mmbox-server.sh up --ssh admin@server.example.com --bind 10.8.0.1 # a VPN
 ```text
 client/mmbox.py, client/PROTOCOL.md   the client (a single file) and its protocol
 client/mmbox_daemon.py, BUTLER.md     the computer's daemon and butler (beside mmbox.py)
+client/mmbox_tray.py                  the daemon's icon in the notification area and its window
 client/mmbox_account.py, ACCOUNTS.md  operator accounts: root key, device chain
 client/mmbox_codex.py                 Codex woken when a message arrives (hook install codex --wake)
 app/                                  the operator console (optional): mmbox_console.py, static/

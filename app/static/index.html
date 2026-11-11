@@ -306,6 +306,11 @@
         <span class="grow"></span>
         <label class="switch-row"><input type="checkbox" role="switch" id="butler-run" class="switch"> <span>Run the butler with this console</span></label>
         <button class="btn small ripple" id="butler-refresh" type="button">Refresh agents and models</button>
+        <span id="butler-ctl" class="butler-ctl" role="group" aria-label="The daemon of this computer" hidden>
+          <button class="btn small ripple" id="butler-toggle" type="button">Stop</button>
+          <button class="btn small ripple" id="butler-restart" type="button">Restart</button>
+          <button class="btn small ripple" id="butler-update" type="button">Check for updates</button>
+        </span>
       </div>
       <p id="butler-missing" class="notice pad" hidden></p>
       <div class="butler-grid">
