@@ -157,7 +157,7 @@ MMBOX --profile backend inbox                    # read now
 MMBOX --profile backend sent                     # where my sends stand: waiting, being read, consumed, queued
 ```
 
-- **Add the start to the agent's instructions** (`CLAUDE.md`, `AGENTS.md`…): "At the start of each session on a project that uses mmbox, run `mmbox.py start --session <name> --project <space> --agent <agent>`, then keep `mmbox.py --profile <name> wait --no-timeout` running in the background, restarted each time it returns 0." On Claude Code, `MMBOX hook install claude` adds a hook that reminds a session whose listener stopped, and recalls its questions still open in the operator console when the user writes. `hook install codex`, `hook install vibe` and `hook install gemini` do the same for Codex, Mistral Vibe and Gemini CLI.
+- **Add the start to the agent's instructions** (`CLAUDE.md`, `AGENTS.md`…): "At the start of each session on a project that uses mmbox, run `mmbox.py start --session <name> --project <space> --agent <agent>`, then keep `mmbox.py --profile <name> wait --no-timeout` running in the background, restarted each time it returns 0." On Claude Code, `MMBOX hook install claude` adds a hook that reminds a session whose listener stopped, and recalls its questions still open in the operator console when the user writes. `hook install codex`, `hook install vibe` and `hook install gemini` do the same for Codex, Mistral Vibe and Gemini CLI. Codex is not woken when a background command ends: `hook install codex --wake` lets the hook listen for each Codex session and wake it when a message arrives (through the Codex IDE, else `codex queue`).
 - **Silent session**: the relay round, one per computer, runs every 10 minutes, and about 2 minutes after a message arrives in a session box nobody listens to. It wakes the session (`ping`). If the session does not answer within 15 seconds, its messages go to the machine box, with a header that says so. If its agent is still running (a long command), its messages younger than 15 minutes wait for it.
 - **Work done**: `MMBOX --profile backend done --recap "…"` sends what the session did to the operator console, then closes its box (the listener exits 8) or keeps listening, as the computer is set (`tune --on-done close|listen`, `close` by default).
 - **Not for this session**: `giveback <id> --why "…"` puts back a message the session took and cannot do, in the box of the project it is meant for; `move <ids…> --to <box>` hands waiting messages to another box of this computer.
@@ -401,6 +401,7 @@ deploy/mmbox-server.sh up --ssh admin@server.example.com --bind 10.8.0.1 # a VPN
 client/mmbox.py, client/PROTOCOL.md   the client (a single file) and its protocol
 client/mmbox_daemon.py, BUTLER.md     the computer's daemon and butler (beside mmbox.py)
 client/mmbox_account.py, ACCOUNTS.md  operator accounts: root key, device chain
+client/mmbox_codex.py                 Codex woken when a message arrives (hook install codex --wake)
 app/                                  the operator console (optional): mmbox_console.py, static/
 gateway/                              the service: mmbox_gateway.py, Containerfile, requirements.txt
 deploy/mmbox-server.sh                host a service in containers, here or over SSH

@@ -38,7 +38,7 @@ the timeout (wait), 4 pairing failed.
 from __future__ import annotations
 
 import argparse, base64, datetime as dt, hashlib, ipaddress, json, os, platform, re, secrets, socket, stat
-import subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
 try:
@@ -3249,6 +3249,23 @@ def listen_command(profile: str) -> str:
     return f"{exe} {shlex.quote(os.path.abspath(sys.argv[0]))} --profile {shlex.quote(profile)} wait --no-timeout"
 
 
+def codex_watching(sid: str | None) -> int | None:
+    """The pid of the Codex hook's watcher of this agent session (`hook install codex --wake`, mmbox_codex.py), if it
+    runs: it listens for the session and wakes Codex, so the agent starts no listener."""
+    try:
+        sid = str(uuid.UUID(str(sid or "")))
+    except ValueError:
+        return None
+    try:
+        w = json.loads((base_dir() / "codex" / sid / "watch.json").read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return None
+    pid = int(w.get("pid") or 0)
+    if pid and pid_alive(pid) and (not w.get("start") or proc_start(pid) == w["start"]):
+        return pid
+    return None
+
+
 HANDOVER_LATE_S = float(os.environ.get("MMBOX_HANDOVER_LATE_S", "600"))
 
 
@@ -4216,8 +4233,9 @@ def cmd_start(a, local: Local):
           f"fingerprint {fingerprint(me.sign_pub, me.box_pub)})" + (f", child of {me.conf['parent']}" if me.conf.get("parent") else ""))
     if note := harness_title(local, me.conf.get("title")):
         print(note)
-    print(f"NEXT (already possible): the box exists; if this command was moved to the background, start listening now "
-          f"with `{listen_command(local.profile)}` as its own background command, without waiting for its end")
+    if not (cw := codex_watching(me.session_id)):
+        print(f"NEXT (already possible): the box exists; if this command was moved to the background, start listening "
+              f"now with `{listen_command(local.profile)}` as its own background command, without waiting for its end")
     url = a.gateway or os.environ.get("MMBOX_GATEWAY") or m.conf.get("gateway")  # a new session follows its machine box
     deferred = []
     if url:
@@ -4309,10 +4327,14 @@ def cmd_start(a, local: Local):
         print(note)
     if oq := open_questions_text(local, "wait"):
         print(oq)
-    print(f"NEXT: listen now with `{listen_command(local.profile)}`, as its own background command (Claude Code: "
-          f"run_in_background): it returns only when something arrives for this session (a message of the session box "
-          f"or the machine box, a channel post), stops by itself when this agent session ends, and runs the relay round "
-          f"meanwhile; start it again at once each time it returns, then handle what it printed")
+    if cw := codex_watching(Me(local).session_id):
+        print(f"NEXT: nothing to start: the Codex hook listens for this session (pid {cw}) and wakes it when a message "
+              f"arrives (a notification that gives the command to read it). Do not run `wait` yourself.")
+    else:
+        print(f"NEXT: listen now with `{listen_command(local.profile)}`, as its own background command (Claude Code: "
+              f"run_in_background): it returns only when something arrives for this session (a message of the session "
+              f"box or the machine box, a channel post), stops by itself when this agent session ends, and runs the "
+              f"relay round meanwhile; start it again at once each time it returns, then handle what it printed")
     if Me(local).role != "butler":
         print(f"WHEN YOUR WORK IS DONE (the user's task finished, nothing left waiting on you): "
               f"`{client_command(local.profile, 'done --recap "<what you did, what changed, what is left>"')}`: the "
@@ -6960,7 +6982,8 @@ def listeners(local: Local, register: bool = False, agent: int | None = None) ->
     def tidy(st):
         ls = {k: v for k, v in (st.get("listeners") or {}).items() if pid_alive(int(k))}
         if register:
-            ls[str(me_pid)] = {"since": iso(), "session": session_hint(), "cmd": " ".join(sys.argv[1:3]), "agent": agent}
+            ls[str(me_pid)] = {"since": iso(), "session": session_hint(), "cmd": " ".join(sys.argv[1:3]), "agent": agent,
+                               "sid": session_facts()["session_id"]}
         st["listeners"] = ls
         others.extend({"pid": int(k), **v} for k, v in ls.items() if int(k) != me_pid)
     local.update("state.json", tidy)
@@ -7135,7 +7158,8 @@ def wait_loop(me: Me, project: str, timeout: float, on_items, forever: bool = Fa
         return EXIT_GONE
     if me.role != "machine":
         others = listeners(me.local, register=True, agent=agent["pid"] if agent else None)
-        twin = [o for o in others if agent and o.get("agent") == agent["pid"]]
+        sid = session_facts()["session_id"]  # the Codex hook's listener runs under another process, same session
+        twin = [o for o in others if (agent and o.get("agent") == agent["pid"]) or (sid and o.get("sid") == sid)]
         if twin:
             print(f"ALREADY LISTENING: listener pid {twin[0]['pid']} of this agent session runs since {twin[0].get('since')}: "
                   f"this one stops. Do not start another (exit {EXIT_TWICE}).", flush=True)
@@ -7858,7 +7882,8 @@ def hook_check(client: Path, harness: str) -> str:
     import subprocess
     _, argv = hook_python()
     try:
-        r = subprocess.run(argv + [str(client), "hook", harness], input="{}", capture_output=True, text=True, timeout=20)
+        r = subprocess.run(argv + [str(client), "hook", *harness.split()], input="{}", capture_output=True, text=True,
+                           timeout=20)
     except (OSError, subprocess.SubprocessError) as exc:
         return f"WARNING: the hook command does not run here ({argv[0]}: {exc}): the hook would do nothing, silently"
     if r.returncode != 0:
@@ -7900,11 +7925,18 @@ def hook_groups_set(hooks: dict, events, cmd: str, pattern: str, install: bool, 
             hooks.pop(ev, None)
 
 
-def hook_install_claude(install: bool, harness: str = "claude") -> int:
+CODEX_WAKE = (("SessionStart", "prompt", {"timeout": 10}), ("SessionStart", "watch", {"async": True, "timeout": 86400}),
+              ("UserPromptSubmit", "prompt", {"timeout": 10}),
+              ("UserPromptSubmit", "watch", {"async": True, "timeout": 86400}),
+              ("PostToolUse", "prompt", {"timeout": 10}), ("SessionEnd", "stop", {"timeout": 5}))
+
+
+def hook_install_claude(install: bool, harness: str = "claude", wake: bool = False) -> int:
     """`mmbox.py hook install|uninstall claude`: the mmbox hook in Claude Code's user settings (~/.claude/settings.json,
     or $CLAUDE_CONFIG_DIR) for SessionStart, UserPromptSubmit, Stop and PostToolUse (AskUserQuestion only).
     `… codex`: the same hook in Codex's user hooks (~/.codex/hooks.json, or $CODEX_HOME) for SessionStart and
-    UserPromptSubmit, with the `codex_hooks` feature turned on in its config.toml. Both run the installed client
+    UserPromptSubmit, with the `codex_hooks` feature turned on in its config.toml; with `--wake` (mmbox_codex.py) the
+    hook owns the session's listener and wakes Codex when a message arrives (CODEX_WAKE). Both run the installed client
     (mmbox-install's folder) when there is one. Only our own entries are added or removed."""
     import shlex
     # never exit 2 (Claude Code would hold the stop on it): an older client without `hook` answers argparse's 2
@@ -7919,9 +7951,15 @@ def hook_install_claude(install: bool, harness: str = "claude") -> int:
     except ValueError:
         die(f"{path}: not valid JSON; fix it first (nothing changed)")
     hooks = conf.setdefault("hooks", {})
-    hook_groups_set(hooks, HOOK_EVENTS, cmd, rf"mmbox\.py\S* hook {harness}", False)  # every event of ours out first
-    if install:
-        hook_groups_set(hooks, HOOK_EVENTS_OF[harness], cmd, rf"mmbox\.py\S* hook {harness}", True,
+    ours = rf"mmbox\.py\S* hook {harness}"
+    hook_groups_set(hooks, HOOK_EVENTS + ("SessionEnd",), cmd, ours, False)  # every event of ours out first
+    if install and wake:
+        for ev, verb, extra in CODEX_WAKE:
+            hooks.setdefault(ev, []).append({"hooks": [{"type": "command", "command": hook_command(installed_client(),
+                                                                                                  f"codex {verb}"),
+                                                        **extra}]})
+    elif install:
+        hook_groups_set(hooks, HOOK_EVENTS_OF[harness], cmd, ours, True,
                         matcher=(lambda ev: HOOK_MATCHER.get(ev)) if harness == "claude" else None)
     if not hooks:
         conf.pop("hooks", None)
@@ -7929,13 +7967,20 @@ def hook_install_claude(install: bool, harness: str = "claude") -> int:
     note = ""
     if harness == "codex" and install:
         note = codex_feature_on(path.parent / "config.toml")
-    print(f"{'INSTALLED' if install else 'REMOVED'}: the mmbox hook ({', '.join(HOOK_EVENTS_OF[harness])}) in {path}"
-          + (f": {cmd}" if install else "") + (". " + note if note else "")
+    events = sorted({e for e, _, _ in CODEX_WAKE}, key=[e for e, _, _ in CODEX_WAKE].index) if wake else \
+        HOOK_EVENTS_OF[harness]
+    print(f"{'INSTALLED' if install else 'REMOVED'}: the mmbox hook ({', '.join(events)}"
+          + ("; it listens for each Codex session and wakes it when a message arrives" if wake and install else "")
+          + f") in {path}" + (f": {cmd}" if install and not wake else "") + (". " + note if note else "")
           + (". Sessions already running take it at their next start or /hooks." if harness == "claude" else
              ". Codex reads its hooks when a session starts; it may ask you once to trust a new hook (/hooks)."
              if install else "."))
     if install:
-        print(hook_check(installed_client(), harness))
+        print(hook_check(installed_client(), "codex prompt" if wake else harness))
+    if install and wake and (Path.cwd() / ".codex" / "hooks.json").is_file() and \
+            "mmbox" in (Path.cwd() / ".codex" / "hooks.json").read_text(encoding="utf-8", errors="ignore"):
+        print(f"WARNING: {Path.cwd() / '.codex' / 'hooks.json'} has mmbox hooks of its own: keep only one of the two "
+              f"(the second listener of a session stops at once, but both would wake Codex)")
     return 0
 
 
@@ -7986,6 +8031,17 @@ HOOK_HARNESSES = ("claude", "codex", "vibe", "gemini")
 def hook_main(argv: list[str]) -> int:
     """`mmbox.py hook claude` (the harness hook), `mmbox.py --profile <session> hook off|on|status` (the user asked this
     session to stop listening: the hook keeps quiet about it)."""
+    if argv[:1] == ["codex"] and argv[1:2] and argv[1] in ("prompt", "watch", "stop", "read"):
+        try:
+            import mmbox_codex
+        except ImportError:
+            return 0  # a lone mmbox.py without its companions: the hook does nothing
+        if argv[1] == "read":  # run by the agent: its errors are shown
+            return mmbox_codex.main(sys.modules[__name__], argv[1:])
+        try:
+            return mmbox_codex.main(sys.modules[__name__], argv[1:])
+        except Exception:  # a hook never breaks the session it serves
+            return 0
     if argv[:1] and argv[0] in HOOK_HARNESSES:
         try:
             return {"claude": hook_claude, "codex": lambda: hook_claude("codex"), "vibe": hook_vibe,
@@ -7994,7 +8050,8 @@ def hook_main(argv: list[str]) -> int:
             return 0
     if argv[:1] in (["install"], ["uninstall"]) and argv[1:2] and argv[1] in HOOK_HARNESSES:
         on = argv[0] == "install"
-        return {"claude": lambda: hook_install_claude(on), "codex": lambda: hook_install_claude(on, "codex"),
+        return {"claude": lambda: hook_install_claude(on),
+                "codex": lambda: hook_install_claude(on, "codex", wake="--wake" in argv[2:]),
                 "vibe": lambda: hook_install_vibe(on), "gemini": lambda: hook_install_gemini(on)}[argv[1]]()
     prof = os.environ.get("MMBOX_PROFILE", "default")
     rest = list(argv)
