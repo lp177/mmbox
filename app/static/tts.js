@@ -33,7 +33,7 @@ function ttsSet(st) {
   const was = TT.st;
   TT.st = st; TT.at = performance.now();
   if (st.v !== undefined) TT.lastV = Math.max(TT.lastV, st.v);
-  if (st.cfg && S.snap) { S.snap.tts = st.cfg; TT.cfgV = st.cfg_v; ttsCfgChanged(); }
+  if (st.cfg && S.snap) { S.snap.tts = st.cfg; TT.cfgV = st.cfg_v; ttsCfgChanged(); ttsDownNews(st.cfg); }
   else if (st.cfg_v) TT.cfgV ||= st.cfg_v;
   if (st.error && st.error.at !== was.error?.at && st.error.id) toast(`Reading aloud failed: ${st.error.err}`, true);
   ttsPaint();
@@ -112,7 +112,8 @@ function ttsPaintOne(el, here) {
   const listen = el.querySelector(".tts-listen");
   if (listen) { listen.hidden = loaded; listen.classList.toggle("loading", gen); listen.disabled = gen; }
   const g = el.querySelector(".tts-gen");
-  if (g) g.textContent = gen ? (st.gen?.total > 1 ? `Making the audio… ${st.gen.done}/${st.gen.total}` : "Making the audio…") : "";
+  if (g) g.textContent = gen ? ttsMaking(st, "Making the audio") : "";
+  el.title = loaded && ttsFallback(st) ? `Read by ${ttsName(st.engine)}: ${ttsName(st.preferred)} was unavailable` : "";
   const ctl = el.querySelector(".tts-ctl");
   ctl.hidden = !loaded;
   if (!loaded) return;
@@ -131,6 +132,12 @@ function ttsPaintOne(el, here) {
   const nx = el.querySelector(".tts-next");
   nx.hidden = !(st.queue || []).length;
   if (!nx.hidden) { nx.title = `Next message read aloud (${st.queue.length} waiting)`; nx.setAttribute("aria-label", nx.title); }
+}
+const ttsName = (e) => tts()?.names?.[e] || e || "?";
+const ttsFallback = (st) => !!st.engine && !!st.preferred && st.engine !== st.preferred;
+function ttsMaking(st, what) {  // "Making the audio with Local (Piper), Mistral (Voxtral) unavailable… 2/5"
+  const by = ttsFallback(st) ? ` with ${ttsName(st.engine)} (${ttsName(st.preferred)} unavailable)` : "";
+  return `${what}${by}…` + (st.gen?.total > 1 ? ` ${st.gen.done}/${st.gen.total}` : "");
 }
 function ttsPaintTime() {
   const pos = TT.scrub ?? ttsPos(), dur = TT.st.dur || 0;
@@ -155,8 +162,8 @@ function ttsPaint() {
     const t = $("#tts-bar-title");
     t.textContent = st.title || "…";
     t.title = "Open the message";
-    $("#tts-bar-sub").textContent = st.st === "generating" ? (st.gen?.total > 1 ? `making the audio… ${st.gen.done}/${st.gen.total}` : "making the audio…")
-      : [st.project && `Project ${st.project}`, st.who].filter(Boolean).join(" · ");
+    $("#tts-bar-sub").textContent = st.st === "generating" ? ttsMaking(st, "making the audio")
+      : [st.project && `Project ${st.project}`, st.who, ttsFallback(st) && `read by ${ttsName(st.engine)}`].filter(Boolean).join(" · ");
     $("#tts-bar .tts-ctl").hidden = !ttsLoaded(st);
     $("#tts-bar-close").hidden = !ttsBusy(st);
   }
@@ -273,6 +280,17 @@ function renderTtsSettings() {
   const eng = $("#tts-engine");
   eng.replaceChildren(eng.querySelector("legend"), ...av.map((p) => h("label", {}, h("input", { type: "radio", name: "tts-engine", value: p, checked: t.engine === p }), h("span", {}, t.names[p]))));
   $("#tts-engine-row").hidden = av.length < 2;
+  const fb = $("#tts-fallback"), ch = t.chain || [], down = t.down || {}, failed = ch.filter((e) => down[e]);
+  const every = Math.round(t.upgrade_every_s || 30);
+  fb.classList.toggle("warn", failed.length > 0);
+  if (failed.length) {
+    const e = failed[0], d = down[e];
+    fb.textContent = `${ttsName(e)} failed at ${fmtTime.format(new Date(d.since * 1000))} (${d.err}): ${ttsName(t.engine_now)} reads meanwhile. `
+      + `It is tested again only when a message is read, in parallel, at most every ${every} s, and reads again as soon as it works`
+      + (d.test_err ? `; last test at ${fmtTime.format(new Date(d.last_test * 1000))}: ${d.test_err}.` : ".");
+  } else fb.textContent = ch.length > 1 ? `In this order: ${ch.map(ttsName).join(", then ")}. A cloud voice that fails (quota, key, network) hands over to the next one; `
+    + `it is tested again only when a message is read (in parallel, at most every ${every} s) and comes back as soon as it works. A message already read plays its audio again.` : "";
+  fb.hidden = !fb.textContent;
   $("#tts-voice-row").hidden = !t.engine;
   for (const lg of ["fr", "en"]) {
     const sel = $(`#tts-voice-${lg}`), cur = (t.voices?.[t.engine] || {})[lg] || "";
@@ -393,9 +411,20 @@ $("#tts-cache-clear").addEventListener("click", async (e) => {
 // the rate select of the Settings card: the same speeds as the player
 $("#tts-rate-default").replaceChildren(...[0.75, 1, 1.25, 1.5, 1.75, 2].map((r) => h("option", { value: String(r) }, RATE_TXT(r))));
 
+// a cloud voice that failed, or came back: said once in a toast (Settings says it for good)
+function ttsDownNews(cfg) {
+  const now = new Set(Object.keys(cfg?.down || {}));
+  if (TT.down) {
+    for (const e of now) if (!TT.down.has(e)) toast(`${ttsName(e)} unavailable (${String(cfg.down[e].err || "").replace(/^\w+( \(\w+\))?: /, "")}): ${ttsName(cfg.engine_now)} reads meanwhile`, true);
+    for (const e of TT.down) if (!now.has(e)) toast(`${ttsName(e)} works again: it reads the next messages`);
+  }
+  TT.down = now;
+}
+
 // ---------------------------------------------------------------- what console.js calls
 function ttsOnSnap(snap) {  // each new snapshot: its settings (/api/snapshot computes them at each request)
   if (snap.tts_cfg_v) TT.cfgV = snap.tts_cfg_v;
+  ttsDownNews(snap.tts);
   renderTtsSettings();
   if (TT.lastV < 0) ttsFetch();
 }

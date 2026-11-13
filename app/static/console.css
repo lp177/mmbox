@@ -904,3 +904,4 @@ body { grid-template-rows: auto 1fr auto; }  /* the third row: the player bar, w
 .held-count { font-weight: 600; }
 .held-head .spacer { flex: 1; }
 .held-row.queue .held-to strong, .held-row.broadcast .held-to strong { color: #ffb4ab; }
+.tts-fallback.warn { color: var(--warn); }

@@ -29,6 +29,18 @@ CACHE_MAX_BYTES = CACHE_MAX_MB * 1000 * 1000
 MAX_CHARS_DEFAULT = 6000  # what one message reads at most (about six minutes): the rest is said to be skipped
 AUTO_FRESH_S = 900  # a message is read by itself only when it is this recent (never the backlog of a restart)
 RATES = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+# A cloud voice that fails (quota, key, network) hands over to the next one (the other key, then the local engine).
+# It is tested again only when a reading is asked meanwhile, in parallel with that reading, one test at a time and at
+# most once every UPGRADE_TEST_S: nothing is tested while nothing is read.
+UPGRADE_TEST_S = float(os.environ.get("MMBOX_TTS_UPGRADE_TEST_S", "30"))
+QUOTA_WORDS = ("quota", "credit", "insufficient", "billing", "payment", "exceeded", "limit")
+
+
+def is_quota(err: str) -> bool:
+    """A refusal for want of quota or credits (rather than a bad key or no network): only a real synthesis tells
+    whether it is over, a key check would pass."""
+    e = str(err).lower()
+    return any(c in e for c in ("http 402", "http 429")) or any(w in e for w in QUOTA_WORDS)
 ENGINES = ("mistral", "gradium", "local")
 ENGINE_NAMES = {"mistral": "Mistral (Voxtral)", "gradium": "Gradium", "local": "Local (Piper)"}
 SETTINGS_DEFAULT = {"engine": "", "show_play": False, "auto_operator": False, "auto": {}, "voices": {}, "rate": 1.0,
@@ -398,6 +410,10 @@ class MistralEngine:
         tts = [i for i in ids if i and "tts" in i]
         return "key accepted" + (f" (text to speech: {', '.join(tts[:2])})" if tts else "")
 
+    def usable(self) -> str:
+        """Whether a reading would work now (a check, no audio): raises EngineError when not."""
+        return self.test()
+
     def synth(self, text: str, lang: str, voice: str | None) -> Pcm:
         body = {"model": self.MODEL, "input": text, "voice_id": voice or default_voice(self.VOICES, lang), "response_format": "wav"}
         code, raw, hdr = http(self.BASE + "/v1/audio/speech", "POST", self.headers(), json.dumps(body).encode(), timeout=180)
@@ -428,6 +444,13 @@ class GradiumEngine:
         except (ValueError, AttributeError):
             left = plan = None
         return "key accepted" + (f" ({left:,} characters left" + (f", plan {plan}" if plan else "") + ")" if isinstance(left, int) else "")
+
+    def usable(self) -> str:
+        """Whether a reading would work now: the key answers and credits are left (raises EngineError when not)."""
+        msg = self.test()
+        if "(0 characters left" in msg:
+            raise EngineError("Gradium: no credits left")
+        return msg
 
     def synth(self, text: str, lang: str, voice: str | None) -> Pcm:
         body = {"text": text, "voice_id": voice or default_voice(self.VOICES, lang), "output_format": "wav", "only_audio": True}
@@ -958,6 +981,8 @@ class Tts:
         self.seen: dict[str, set] = {}  # message ids known, per source: none read at the opening
         self._keys_cache: dict | None = None
         self.seeked = 0
+        self.down: dict[str, dict] = {}  # a cloud voice that failed: {since, err, quota, last_test, test_err}
+        self.test_lock = threading.Lock()  # one upgrade test at a time, its 30 s checked and taken under it
         threading.Thread(target=self.prune, daemon=True).start()
 
     # -- settings
@@ -994,10 +1019,89 @@ class Tts:
             out.append("local")
         return out
 
-    def engine_name(self) -> str | None:
+    def chain(self) -> list[str]:
+        """The voices in the order they are tried: the one chosen (else the first cloud voice), the other cloud voice,
+        then the local engine. Chosen, the local engine reads alone."""
         av = self.available()
         want = self.settings().get("engine")
-        return want if want in av else (av[0] if av else None)
+        if want == "local" and "local" in av:
+            return ["local"]
+        clouds = [e for e in ("mistral", "gradium") if e in av]
+        first = want if want in clouds else (clouds[0] if clouds else None)
+        return ([first] if first else []) + [e for e in clouds if e != first] + (["local"] if "local" in av else [])
+
+    def preferred(self) -> str | None:
+        ch = self.chain()
+        return ch[0] if ch else None
+
+    def engine_name(self) -> str | None:
+        """The voice the next audio is made with: the first of the chain that has not failed (else the first)."""
+        ch = self.chain()
+        up = [e for e in ch if e not in self.down]
+        return (up or ch or [None])[0]
+
+    def mark_down(self, name: str, err) -> None:
+        with self.lock:
+            d = self.down.setdefault(name, {"since": time.time()})
+            d.update(err=str(err)[:300], quota=is_quota(str(err)), last_test=time.time())
+            d.pop("test_err", None)
+        log(f"{name} failed ({err}): the next voice reads; {name} is tested again with a later reading")
+        self._cfg()
+
+    def upgrade_test(self) -> bool:
+        """A reading is asked while a voice better than the one used failed: test it again, in a thread (the reading
+        goes on meanwhile), one test at a time and at most once every UPGRADE_TEST_S (both decided under an exclusive
+        lock). Returns whether a test started."""
+        ch = self.chain()
+        used = next((i for i, e in enumerate(ch) if e not in self.down), None)
+        if used is None:
+            return False  # every voice failed: the reading tries them itself, in order
+        better = [e for e in ch[:used] if e in self.down]
+        if not better or not self.test_lock.acquire(blocking=False):
+            return False
+        try:
+            now = time.time()
+            with self.lock:
+                due = [e for e in better if now - float((self.down.get(e) or {}).get("last_test") or 0) >= UPGRADE_TEST_S]
+                for e in due:
+                    self.down[e]["last_test"] = now
+            if not due:
+                self.test_lock.release()
+                return False
+            threading.Thread(target=self._upgrade_run, args=(due,), daemon=True, name="tts-upgrade").start()
+            return True
+        except BaseException:
+            self.test_lock.release()
+            raise
+
+    def _upgrade_run(self, names: list) -> None:
+        try:
+            for n in names:  # the best first: once one answers, the next readings use it
+                eng, d = self.engine(n), dict(self.down.get(n) or {})
+                try:
+                    if eng is None:
+                        raise EngineError("its key was removed")
+                    if d.get("quota"):  # a key check passes without quota: a short synthesis tells
+                        eng.synth("Test.", "en", None)
+                    else:
+                        eng.usable()
+                    ok, msg = True, "answers again"
+                except EngineError as e:
+                    ok, msg = False, str(e)
+                except Exception as e:  # noqa: BLE001 - a test never stops a reading
+                    ok, msg = False, f"{type(e).__name__}: {e}"
+                with self.lock:
+                    if n in self.down:
+                        if ok:
+                            self.down.pop(n)
+                        else:
+                            self.down[n].update(test_err=msg[:300], tested=time.time())
+                log(f"{n}: {msg}" + (": used again from the next reading" if ok else ": still unavailable"))
+                if ok:
+                    break
+            self._cfg()
+        finally:
+            self.test_lock.release()
 
     def engine(self, name: str | None = None):
         name = name or self.engine_name()
@@ -1031,7 +1135,10 @@ class Tts:
         av = self.available()
         return {**{k: st[k] for k in ("show_play", "auto_operator", "auto", "voices", "rate", "max_chars", "lang",
                                       "cache_keep_days", "cache_max_mb")},
-                "engine": self.engine_name(), "engine_set": st.get("engine") or None, "available": av,
+                "engine": self.preferred(), "engine_now": self.engine_name(), "engine_set": st.get("engine") or None,
+                "chain": self.chain(), "upgrade_every_s": UPGRADE_TEST_S,
+                "down": {n: {k: d.get(k) for k in ("since", "err", "quota", "last_test", "test_err")} for n, d in self.down.items()},
+                "available": av,
                 "names": ENGINE_NAMES,
                 "keys": {p: ({"set": True, "hint": "…" + keys[p][-4:], **(tested.get(p) or {})} if isinstance(keys.get(p), str) and keys.get(p)
                              else {"set": False}) for p in ("mistral", "gradium")},
@@ -1112,6 +1219,8 @@ class Tts:
         keys[provider] = key
         self.keys.save(keys)
         self._keys_cache = keys
+        if ok:
+            self.down.pop(provider, None)
         self._tested(provider, ok, msg)
         st = self.settings()
         if not had:  # the first voice: the Play button shows by itself (it can still be turned off)
@@ -1139,6 +1248,7 @@ class Tts:
         keys = dict(self._keys())
         keys.pop(provider, None)
         self.keys.save(keys)
+        self.down.pop(provider, None)
         self._keys_cache = keys
         tested = dict((self._get() or {}).get("tested") or {})
         tested.pop(provider, None)
@@ -1255,7 +1365,8 @@ class Tts:
         if it:
             out.update(id=it["id"], title=it.get("subject") or "(no subject)", project=it.get("project"),
                        who=" → ".join(x for x in (it.get("from_name"), "you" if it.get("to_operator") else it.get("to_name")) if x),
-                       manual=bool((cur if st != "generating" else self.gen or {}).get("manual")), lang=(cur or {}).get("lang"))
+                       manual=bool((cur if st != "generating" else self.gen or {}).get("manual")), lang=(cur or {}).get("lang"),
+                       engine=(cur if st != "generating" else self.gen or {}).get("engine"), preferred=self.preferred())
         if p and cur and st in ("playing", "paused", "ended"):
             out.update(pos=round(p.position(), 3), dur=round(p.dur, 3))
         if self.error:
@@ -1271,15 +1382,50 @@ class Tts:
             except Exception as e:  # noqa: BLE001 - a listener never stops playback
                 log(f"listener: {type(e).__name__}: {e}")
 
-    def audio(self, item: dict, progress=None) -> tuple[Path, float, str]:
-        """The audio of a message: from the cache, else made now (once, whoever else asks meanwhile waits for it).
-        progress(done, total): the pieces made so far."""
+    def audio(self, item: dict, progress=None, on_engine=None) -> tuple[Path, float, str]:
+        """The audio of a message: from the cache, else made now (once, whoever else asks meanwhile waits for it), by
+        the first voice of the chain that works: a cloud voice that fails hands over to the next one and is marked
+        down; while one is, each reading asks for its test, in parallel (upgrade_test). progress(done, total): the
+        pieces made so far; on_engine(name): the voice making it."""
         st = self.settings()
-        name = self.engine_name()
-        eng = self.engine(name)
-        if eng is None:
+        chain = self.chain()
+        if not chain:
             raise EngineError("no voice: set an API key or install the local engine (Settings, Reading aloud)")
         text, lang = speech_text(item, st.get("lang") or "auto", st.get("max_chars") or MAX_CHARS_DEFAULT)
+        order = [e for e in chain if e not in self.down] + [e for e in chain if e in self.down]
+        self.upgrade_test()  # every reading asked, even one played again: the voice that failed tested beside it
+        for name in chain:  # made already (the chosen voice's first): played again at no cost, never made twice
+            path = self._cache_path(name, item, text, lang, st)
+            if path and path.is_file():
+                os.utime(path)
+                if on_engine:
+                    on_engine(name)
+                return path, self._wav_len(path), lang
+        last: Exception | None = None
+        for name in order:
+            if on_engine:
+                on_engine(name)
+            try:
+                return self._make(name, item, text, lang, st, progress)
+            except EngineError as e:
+                last = e
+                if name != "local":
+                    self.mark_down(name, e)
+                log(f"audio of {item['id']} with {name}: {e}")
+        raise last or EngineError("no voice could make it")
+
+    def _cache_path(self, name: str, item: dict, text: str, lang: str, st: dict) -> Path | None:
+        eng = self.engine(name)
+        if eng is None:
+            return None
+        voice = ((st.get("voices") or {}).get(name) or {}).get(lang) or None
+        digest = hashlib.sha256(json.dumps([name, voice, lang, text, getattr(eng, "MODEL", "")]).encode()).hexdigest()
+        return self.cache.path(item["id"], digest)
+
+    def _make(self, name: str, item: dict, text: str, lang: str, st: dict, progress=None) -> tuple[Path, float, str]:
+        eng = self.engine(name)
+        if eng is None:
+            raise EngineError(f"{name}: not set up")
         voice = ((st.get("voices") or {}).get(name) or {}).get(lang) or None
         digest = hashlib.sha256(json.dumps([name, voice, lang, text, getattr(eng, "MODEL", "")]).encode()).hexdigest()
         path = self.cache.path(item["id"], digest)
@@ -1349,6 +1495,7 @@ class Tts:
             return {"ok": False, "err": self.player_error}
         if not self.engine_name():
             return {"ok": False, "err": "no voice: set an API key or install the local engine (Settings, Reading aloud)"}
+        self.upgrade_test()  # a reading asked: the voice that failed is tested beside it (at most every 30 s)
         cur = self.current
         if cur and cur["item"]["id"] == item["id"] and self.player.status in ("paused", "ended", "playing"):
             if self.player.status != "playing":
@@ -1371,8 +1518,15 @@ class Tts:
             if self.gen and self.gen.get("id") == item["id"]:
                 self.gen.update(done=done, total=total)
                 self._changed()
+        made_by = {}
+
+        def on_engine(name):
+            made_by["engine"] = name
+            if self.gen and self.gen.get("id") == item["id"] and self.gen.get("engine") != name:
+                self.gen.update(engine=name, done=0, total=0)
+                self._changed()
         try:
-            path, dur, lang = self.audio(item, progress)
+            path, dur, lang = self.audio(item, progress, on_engine)
         except Exception as e:  # noqa: BLE001 - said in the page and the log
             log(f"audio of {item['id']}: {e}")
             with self.lock:
@@ -1389,7 +1543,7 @@ class Tts:
             self.gen = None
             if self.current and self.current["item"]["id"] != item["id"]:
                 self.history = (self.history + [self.current])[-30:]
-            self.current = {"item": item, "manual": manual, "path": path, "lang": lang}
+            self.current = {"item": item, "manual": manual, "path": path, "lang": lang, "engine": made_by.get("engine")}
         self.player.load(path, dur, self.settings()["rate"] if not self.player or self.player.status == "idle" else self.player.rate)
 
     def enqueue(self, item: dict) -> None:
@@ -1424,6 +1578,8 @@ class Tts:
         p = self.ensure_player()
         if p is None:
             return {"ok": False, "err": self.player_error}
+        if op in ("play", "toggle", "next", "prev"):
+            self.upgrade_test()  # listening again is a reading asked too
         if op == "pause":
             p.pause()
         elif op == "play":
