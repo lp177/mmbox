@@ -32,6 +32,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
+sys.path.insert(0, str(HERE))
+import mmbox_tts  # noqa: E402 - reading aloud, beside this file
 VERBOSE = bool(os.environ.get("MMBOX_CONSOLE_DEBUG"))
 
 
@@ -221,6 +223,15 @@ def console_home() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mmbox-console"
 
 
+def console_data() -> Path:
+    """Where the console keeps what is big and can be downloaded again (the local voice engine and its voices)."""
+    if os.environ.get("MMBOX_CONSOLE_DATA"):
+        return Path(os.environ["MMBOX_CONSOLE_DATA"])
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mmbox-console"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "mmbox-console"
+
+
 class KeyStore:
     """Where the operator's private key lives, as safely as this system allows: the Secret Service (GNOME Keyring,
     KWallet: Linux desktops), DPAPI (Windows: encrypted for this user, file identity.dpapi), else a file readable by
@@ -228,8 +239,10 @@ class KeyStore:
     store; when it names a store that does not answer (a locked keyring), the console stops: it never makes a new key
     over the one that store holds (a new key is no longer the services' operator)."""
 
+    LABELS = {"root": "account root key", "tts-keys": "API keys of the voices (reading aloud)"}
+
     def __init__(self, home: Path, name: str = "identity"):
-        self.home, self.name = home, name  # "identity": this device's key pair; "root": the account's root key
+        self.home, self.name = home, name  # "identity": this device's key pair; "root": the account's root key; "tts-keys"
         self.where_file = home / f"{name}.where"
         self.attrs = {"home": str(home), "key": name}
 
@@ -303,7 +316,7 @@ class KeyStore:
         elif (sec := self._secret()) is not None:
             try:
                 ok = sec[0].password_store_sync(sec[1], self.attrs, sec[0].COLLECTION_DEFAULT,
-                                                f"mmbox console {'account root key' if self.name == 'root' else 'operator key'}", data, None)
+                                                f"mmbox console {self.LABELS.get(self.name, 'operator key')}", data, None)
                 if ok and sec[0].password_lookup_sync(sec[1], self.attrs, None) == data:
                     where = "secret-service"
             except Exception as e:  # noqa: BLE001 - no Secret Service on this session: a file of this user then
@@ -702,6 +715,11 @@ class Recaps:
             if gone:
                 self.save()
             return len(gone)
+
+
+def plain_names(s: str) -> str:
+    """A text without the marks nm() puts around names (system notifications show plain text)."""
+    return str(s or "").replace("\u27E6", "").replace("\u27E7", "")
 
 
 def nm(name) -> str:
@@ -1474,6 +1492,77 @@ class Desktop:
             log(f"notification: {e}")
         return False
 
+    # ---- reading aloud: the desktop's media controls (MPRIS), and a notification for what is read by itself
+    def tts_attach(self, tts) -> None:
+        if not self.ok:
+            return
+        self.tts, self.mpris, self.read_note, self.read_shown = tts, None, None, None
+        self.GLib.idle_add(self._tts_build)
+        tts.listeners.append(lambda st: self.GLib.idle_add(self._tts_update, st))
+
+    def _tts_build(self) -> bool:
+        try:
+            self.mpris = mmbox_tts.Mpris(self.Gio, self.GLib, self.tts, STATIC / "icon-256.png",
+                                         lambda mid: self.open(msg=mid) if mid else self.open())
+        except Exception as e:  # noqa: BLE001 - the media controls are a bonus
+            log(f"media controls unavailable: {type(e).__name__}: {e}")
+        return False
+
+    def _tts_update(self, st: dict) -> bool:
+        if self.mpris:
+            self.mpris.update()
+        self._reading_note(st)
+        return False
+
+    def _tts_ctl(self, op: str) -> None:
+        threading.Thread(target=self.tts.ctl, args=(op,), daemon=True, name="tts-note").start()
+
+    def _reading_note(self, st: dict) -> None:
+        """A message read by itself (not by its Play button): a notification while it plays, with Pause and Stop;
+        paused, it stays (resident) with Play and Stop; closed when the reading stops or ends."""
+        on = st.get("st") in ("playing", "paused") and st.get("id") and not st.get("manual")
+        if not on:
+            if self.read_note is not None:
+                note, self.read_note, self.read_shown = self.read_note, None, None
+                try:
+                    note.close()
+                except Exception:
+                    pass
+            return
+        key = (st["id"], st["st"], st.get("title"))
+        if key == self.read_shown:
+            return
+        playing, mid = st["st"] == "playing", st["id"]
+        title = ("Reading aloud: " if playing else "Paused: ") + plain_names(st.get("title") or "")
+        body = " · ".join(x for x in (st.get("project") and f"Project {st['project']}", st.get("who"),
+                                      f"{len(st.get('queue') or [])} more to read" if st.get("queue") else None) if x)
+        icon = str(self.icons / "mmbox-console.svg")
+        try:
+            note = self.read_note
+            if note is None or getattr(note, "mid", None) != mid:
+                if note is not None:
+                    note.close()
+                note = self.Notify.Notification.new(title, body, icon)
+                note.mid = mid
+                note.connect("closed", lambda n: setattr(self, "read_note", None) if n is self.read_note else None)
+            else:
+                note.update(title, body, icon)
+            note.clear_actions()
+            note.set_timeout(0)  # it stays while the message plays: its buttons are the player's
+            note.set_hint("resident", self.GLib.Variant.new_boolean(True))
+            note.set_hint("suppress-sound", self.GLib.Variant.new_boolean(True))
+            note.set_hint("desktop-entry", self.GLib.Variant.new_string("mmbox-console"))
+            note.add_action("default", "Open", lambda *_, mid=mid: self.open(msg=mid))
+            if playing:
+                note.add_action("pause", "Pause", lambda *_: self._tts_ctl("pause"))
+            else:
+                note.add_action("play", "Play", lambda *_: self._tts_ctl("play"))
+            note.add_action("stop", "Stop", lambda *_: self._tts_ctl("stop"))
+            note.show()
+            self.read_note, self.read_shown = note, key
+        except Exception as e:  # noqa: BLE001 - shown in the page all the same
+            log(f"notification: {e}")
+
     def _held_closed(self, note, ids):
         if note is self.held_note:
             self.held_dismissed |= getattr(note, "ids", ids)
@@ -1768,6 +1857,73 @@ class State:
         self.known_q: set | None = None  # the questions seen at the last tick (None: not yet: no sound at the opening)
         self.rights: dict[str, dict] = {}
         self.delivery: dict[str, dict] = {}  # message id -> {"st": consumed|taken|waiting|unknown, "at": when asked}
+        # reading aloud: settings in state.json ("tts"), API keys in the keyring, audio made on demand (mmbox_tts.py)
+        self.tts = mmbox_tts.Tts(op.home, console_data(), KeyStore(op.home, "tts-keys"),
+                                 lambda: self.console_state.get("tts"), self._save_tts)
+
+    def _save_tts(self, st: dict) -> None:
+        self.console_state["tts"] = {**(self.console_state.get("tts") or {}), **st}
+        self.save_console_state()
+
+    def tts_item(self, m: dict, boxes: dict) -> dict:
+        """What reading a message aloud needs: its words, and the names of its project, sender and recipient."""
+        def name(bid):
+            b = boxes.get(bid) or {}
+            return None if b.get("role") == "operator" or bid == self.op.id else (b.get("title") or b.get("label") or b.get("alias") or bid)
+        fw = m.get("forwarded") if isinstance(m.get("forwarded"), dict) else {}
+        to, frm = m.get("to"), m.get("from")
+        tb, fb = boxes.get(to) or {}, boxes.get(frm) or {}
+        body = m.get("body") if isinstance(m.get("body"), str) else fw.get("body") if isinstance(fw.get("body"), str) else None
+        kind = m.get("kind")
+        return {"id": m["id"], "subject": m.get("subject") or fw.get("subject"), "body": body,
+                "kind": (fw.get("kind") or kind) if kind == "forward" else kind,
+                "project": m.get("work") or tb.get("work") or fb.get("work"),
+                "from_name": m.get("sender_title") or name(frm) or "?", "to_name": name(to),
+                "to_operator": to == self.op.id or bool(m.get("to_operator")) or kind in ("question", "recap"),
+                "ts_s": (_ms(m.get("ts")) or 0) / 1000}
+
+    @staticmethod
+    def machine_key(b: dict, boxes: dict) -> str:
+        """The machine a box belongs to, as the page's tree groups them (console.js: machineKey)."""
+        if b.get("role") == "machine":
+            return b["id"]
+        if b.get("machine"):
+            return b["machine"]
+        hn = b.get("hostname")
+        mb = next((x for x in boxes.values() if x.get("role") == "machine" and hn and x.get("hostname") == hn), None)
+        return mb["id"] if mb else "host:" + (hn or "?")
+
+    def tts_watch(self, msgs: dict, boxes: dict) -> None:
+        """Every essential message seen by this refresh, offered to the reading rules (the new ones only are read)."""
+        out = []
+        for m in msgs.values():
+            to = m.get("to")
+            if m.get("tier") != 1 or m.get("broadcast") or not to or m.get("from") == self.op.id:
+                continue
+            tb = boxes.get(to) or {"id": to}
+            ctx = {"to": to, "to_operator": to == self.op.id or bool(m.get("to_operator")) or m.get("kind") in ("question", "recap"),
+                   "machine": self.machine_key(tb, boxes), "work": tb.get("work"), "servers": list(m.get("servers") or [])}
+            out.append((self.tts_item(m, boxes), ctx))
+        self.tts.watch(out, "messages")
+
+    def tts_message(self, mid: str) -> dict | None:
+        """A message to play now (its Play button): this refresh's copy, else the console's archive."""
+        with self.lock:
+            m = self.messages.get(mid)
+            boxes = {b["id"]: b for b in self.snapshot.get("boxes") or []}
+        if m is None:
+            m = self.archive.get(mid)
+        if m is None:
+            q = next((x for x in self.questions.pending() + self.questions.recent() if x["id"] == mid), None)
+            return self.tts_question(q) if q else None
+        return self.tts_item(m, boxes)
+
+    def tts_question(self, q: dict) -> dict:
+        options = q.get("options") or []
+        body = (q.get("body") or "") + ("\n" + "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options)) if options else "")
+        return {"id": q["id"], "subject": q.get("subject"), "body": body, "kind": "question", "project": q.get("work"),
+                "from_name": q.get("title") or q.get("label") or q.get("from"), "to_name": None, "to_operator": True,
+                "ts_s": q.get("received_at") or time.time()}
 
     def save_console_state(self) -> None:
         tmp = self.seen_path.with_suffix(".tmp")
@@ -1800,6 +1956,10 @@ class State:
         ids = {q["id"] for q in pend}
         new = ids - self.known_q if self.known_q is not None else set()
         self.known_q = ids
+        try:
+            self.tts.watch([(self.tts_question(q), {"to": self.op.id, "to_operator": True}) for q in pend], "questions")
+        except Exception as e:  # noqa: BLE001 - reading aloud never stops the console
+            log(f"tts: {type(e).__name__}: {e}")
         st = self.notify_settings()
         now = time.time()
         tab_notify = now - self.clients.get("notify", 0) < 15
@@ -2026,6 +2186,7 @@ class State:
                     files += 1
         # the markers outlive what could bring a message back: the collectors' retention and the list's horizon
         self.archive.mark_purged(gone, max(self.days * 86400, self.conv_default_ttl(), plan["keep_s"]) + 86400)
+        self.tts.forget(gone)
         self.purged = self.archive.purged()
         self.logs = LogCache()  # the rewritten logs are read again from their start
         self._usage = (0.0, {})
@@ -2072,6 +2233,7 @@ class State:
             return {"ok": False, "err": f"{y.local.profile}: {ex}"}
         n_arch = self.archive.drop(gone)
         self.archive.mark_purged(gone, max(self.days * 86400, self.conv_default_ttl(), plan["keep_s"]) + 86400)
+        self.tts.forget(gone)
         self.purged = self.archive.purged()
         self.logs = LogCache()
         self._usage = (0.0, {})
@@ -2140,6 +2302,7 @@ class State:
                     f.unlink(missing_ok=True)
                     folders += 1
             self.archive.mark_purged(gone, max(self.days * 86400, self.conv_default_ttl(), self.purge_keep_s()) + 86400)
+            self.tts.forget(gone)
             self.purged = self.archive.purged()
             self.logs = LogCache()
             self._usage = (0.0, {})
@@ -3585,6 +3748,10 @@ class State:
             m.setdefault("state", "sent")
             k = m.get("kind")
             m["tier"] = tier_of(m)
+        try:
+            self.tts_watch(msgs, boxes)
+        except Exception as e:  # noqa: BLE001 - reading aloud never stops a refresh
+            log(f"tts: {type(e).__name__}: {e}")
         purged = self.purged  # what the purge removed stays gone, unless it waits in a box again
         for mid in [i for i, m in msgs.items() if i in purged and m.get("state") not in WAITING and i not in recap_ids]:
             del msgs[mid]
@@ -3999,6 +4166,8 @@ def act(state: State, body: dict) -> dict:
             return {"ok": False, "err": "no sound chosen"}
         Desktop.play(p)
         return {"ok": True}
+    if a.startswith("tts_"):
+        return tts_act(state, a, body)
     if a == "dismiss_startup":
         state.startup = None
         return {"ok": True}
@@ -4008,6 +4177,38 @@ def act(state: State, body: dict) -> dict:
     if a == "refresh":
         state.refresh()
         return {"ok": True}
+    return {"ok": False, "err": f"unknown action {a!r}"}
+
+
+def tts_act(state: State, a: str, body: dict) -> dict:
+    """Reading aloud (mmbox_tts.py): play a message, the player's controls, the settings, the keys, the local engine."""
+    t = state.tts
+    s = lambda k: str(body.get(k) or "").strip()  # noqa: E731
+    if a == "tts_play":  # a message's Play button (manual), or the page asking for one again
+        item = state.tts_message(s("id"))
+        if not item:
+            return {"ok": False, "err": "unknown message"}
+        return t.play(item, manual=body.get("manual") is not False)
+    if a == "tts_ctl":  # pause, play, toggle, stop, seek, seek_by, rate, next, prev, dismiss_error
+        return t.ctl(s("op"), body.get("value"))
+    if a == "tts_settings":
+        return t.set(body.get("set") if isinstance(body.get("set"), dict) else {})
+    if a == "tts_key":  # Save & test: the key reaches this console over its loopback only, never logged
+        return t.set_key(s("provider"), str(body.get("key") or ""))
+    if a == "tts_key_test":
+        return t.test_key(s("provider"))
+    if a == "tts_key_clear":
+        return t.clear_key(s("provider"))
+    if a == "tts_rule":  # a box, project, machine or service read aloud by itself (its menu, or Settings)
+        return t.rule_set(s("type"), s("key"), s("label"), bool(body.get("on")))
+    if a == "tts_local":  # install, voices, remove_voice, uninstall
+        v = body.get("voices")
+        return t.local_op(s("op"), [str(x) for x in v] if isinstance(v, list) else [])
+    if a == "tts_cache_clear":
+        spare = (t.current or {}).get("path")
+        n = t.cache.remove_all(spare=spare)
+        t._cfg()
+        return {"ok": True, "out": f"{n} audio file(s) deleted", "tts": t.public()}
     return {"ok": False, "err": f"unknown action {a!r}"}
 
 
@@ -4068,6 +4269,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"version": have, "unchanged": True})
                 # what changes between two refreshes, as it is now: the operator's settings, the questions
                 return self._json({**snap, "notify": st.notify_settings(), "custom_sound": st.console_state.get("custom_sound"),
+                                   "tts": st.tts.public(), "tts_cfg_v": st.tts.cfg_version,
                                    "questions": {"pending": st.questions.pending(), "recent": st.questions.recent(),
                                                  "decisions": dict(st.questions.decisions)}})
             if u.path == "/api/message":
@@ -4090,6 +4292,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"count": len(pend), "ids": [x["id"] for x in pend], "version": st.snapshot.get("version", 0),
                                    "latest": ({k: pend[-1].get(k) for k in ("id", "from", "label", "title", "subject")} if pend else None),
                                    "desktop": bool(st.desktop and st.desktop.ok), "held": len(st.held()),
+                                   "tts_v": st.tts.version, "tts_st": st.tts.state()["st"],
                                    # the window's own page: what a notification's click asked it to open
                                    **({"goto": g} if (q.get("app") or ["0"])[0] == "1" and getattr(Handler, "app", None)
                                       and (g := Handler.app.take_goto()) else {})})
@@ -4133,6 +4336,25 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if u.path == "/api/attachment":
                 return self._attachment(q)
+            if u.path == "/api/tts_state":  # the player while it plays (the page asks every second), its settings when changed
+                cv = (q.get("cv") or ["0"])[0]
+                out = {**st.tts.state(), "cfg_v": st.tts.cfg_version}
+                if cv != str(st.tts.cfg_version):
+                    out["cfg"] = st.tts.public()
+                return self._json(out)
+            if u.path == "/api/tts_audio":  # a message's audio (made now if it is not yet): saved by the page
+                item = st.tts_message((q.get("id") or [""])[0])
+                if not item:
+                    return self._json({"error": "unknown message"}, 404)
+                try:
+                    path, _dur, _lang = st.tts.audio(item)
+                    raw = path.read_bytes()
+                except (mmbox_tts.EngineError, OSError) as e:
+                    return self._json({"error": str(e)}, 502)
+                name = re.sub(r"[^\w.-]+", "_", (item.get("subject") or item["id"]))[:60] or "message"
+                self._headers(200, "audio/wav", len(raw), {"Content-Disposition": f'attachment; filename="{name}.wav"'})
+                self.wfile.write(raw)
+                return
             if u.path == "/api/senders":
                 return self._json({"senders": senders_for((q.get("to") or [""])[0]), "posters": posters()})
             return self._json({"error": "not found"}, 404)
@@ -4311,6 +4533,7 @@ def main():
                 app.quit()
             threading.Thread(target=httpd.shutdown, daemon=True).start()
         state.desktop = Desktop(op.home, url_of, quit_console, app)
+        state.desktop.tts_attach(state.tts)
         state.tick()
     try:  # whether this console shows its icon: the daemon's own icon stays away while it does (mmbox_tray.py)
         inst = json.loads(instance.read_text(encoding="utf-8"))

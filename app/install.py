@@ -197,6 +197,19 @@ def window_note() -> str | None:
     return f"note: pywebview is not installed for {sys.executable}: the console opens in your browser instead of its own window ({how})"
 
 
+def audio_note() -> str | None:
+    """Reading messages aloud plays them with GStreamer (Linux); without it the console says it cannot play audio."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return None
+    p = subprocess.run([sys.executable, "-c", "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; "
+                        "Gst.init(None); assert Gst.ElementFactory.find('playbin') and Gst.ElementFactory.find('scaletempo')"],
+                       capture_output=True, text=True)
+    if p.returncode == 0:
+        return None
+    return ("note: GStreamer is missing: the console cannot read messages aloud "
+            "(sudo apt install gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good)")
+
+
 def console_cmd(*args, capture: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(CONSOLE), *args], capture_output=capture, text=True,
                           creationflags=0x08000000 if os.name == "nt" and capture else 0)
@@ -250,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{CONSOLE}: not found (run this script from the mmbox repository's app folder)", file=sys.stderr)
         return 2
     if not a.uninstall and (note := window_note()):
+        print(note)
+    if not a.uninstall and (note := audio_note()):
         print(note)
     if os.name == "nt":
         code = windows_uninstall(a.check) if a.uninstall else windows_install(a.check)

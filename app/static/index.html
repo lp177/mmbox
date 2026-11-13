@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="console.css">
   <link rel="stylesheet" href="splash.css">
   <script src="console.js" defer></script>
+  <script src="tts.js" defer></script>
 </head>
 <body>
   <!-- the start screen: shown at once, until the first view of the boxes arrives (the first refresh reads every service) -->
@@ -409,6 +410,85 @@
           <div class="actions">
             <button id="t-reset" class="btn ripple" type="button">Default values</button>
             <button id="t-apply" class="btn filled ripple" type="button">Apply</button>
+          </div>
+        </section>
+        <section class="card tts-card" aria-labelledby="set-tts" id="set-tts-card">
+          <h3 id="set-tts">Reading aloud</h3>
+          <p class="help">A message turns into speech only when it is played: by its Listen button, or by itself for the boxes, projects, computers and services you choose. Its project, who writes to whom and its subject are said first, then its content. The audio is kept to play it again, seek in it or change its speed.</p>
+          <p id="tts-none" class="notice" hidden></p>
+          <div class="tts-cols">
+          <div class="tts-col">
+          <h4 class="card-sub">Voices in the cloud</h4>
+          <form id="tts-key-mistral-form" class="tts-key" autocomplete="off" novalidate>
+            <div class="field with-btn">
+              <input id="tts-key-mistral" type="password" placeholder=" " autocomplete="off" spellcheck="false" aria-describedby="tts-key-mistral-status tts-key-mistral-help">
+              <label for="tts-key-mistral">Mistral API key</label>
+              <button id="tts-key-mistral-reveal" class="btn icon field-btn ripple" type="button" aria-label="Show the key" aria-pressed="false" title="Show or hide the key"></button>
+            </div>
+            <p class="help" id="tts-key-mistral-help">Voxtral TTS (console.mistral.ai, API keys). Kept in this computer's keyring, never shown again.</p>
+            <p id="tts-key-mistral-status" class="help tts-key-status" role="status"></p>
+            <div class="actions">
+              <button id="tts-key-mistral-save" class="btn small filled ripple" type="submit">Save &amp; test</button>
+              <button id="tts-key-mistral-test" class="btn small ripple" type="button" hidden>Test again</button>
+              <button id="tts-key-mistral-clear" class="btn small text ripple" type="button" hidden>Remove</button>
+            </div>
+          </form>
+          <form id="tts-key-gradium-form" class="tts-key" autocomplete="off" novalidate>
+            <div class="field with-btn">
+              <input id="tts-key-gradium" type="password" placeholder=" " autocomplete="off" spellcheck="false" aria-describedby="tts-key-gradium-status tts-key-gradium-help">
+              <label for="tts-key-gradium">Gradium API key</label>
+              <button id="tts-key-gradium-reveal" class="btn icon field-btn ripple" type="button" aria-label="Show the key" aria-pressed="false" title="Show or hide the key"></button>
+            </div>
+            <p class="help" id="tts-key-gradium-help">Gradium (gradium.ai, API keys). Kept in this computer's keyring, never shown again.</p>
+            <p id="tts-key-gradium-status" class="help tts-key-status" role="status"></p>
+            <div class="actions">
+              <button id="tts-key-gradium-save" class="btn small filled ripple" type="submit">Save &amp; test</button>
+              <button id="tts-key-gradium-test" class="btn small ripple" type="button" hidden>Test again</button>
+              <button id="tts-key-gradium-clear" class="btn small text ripple" type="button" hidden>Remove</button>
+            </div>
+          </form>
+          <h4 class="card-sub">Local engine, offline</h4>
+          <p class="help">Piper, installed by the console into a private Python environment of this computer (about 300 MB, then about 60 MB per voice): it runs on the processor, without network or account. Each voice is a model of its own: download the ones you want.</p>
+          <p id="tts-local-status" class="tts-local-status" role="status"></p>
+          <span id="tts-local-bar" class="mem-bar tts-local-bar" hidden aria-hidden="true"><span></span></span>
+          <p id="tts-local-err" class="error" aria-live="polite"></p>
+          <div id="tts-local-voices" class="tts-voices" hidden></div>
+          <div class="actions">
+            <button id="tts-local-install" class="btn small filled ripple" type="button">Install</button>
+            <button id="tts-local-uninstall" class="btn small text ripple" type="button" hidden>Uninstall</button>
+          </div>
+          </div>
+          <div class="tts-col">
+          <h4 class="card-sub">How it reads</h4>
+          <div id="tts-engine-row" hidden>
+            <fieldset id="tts-engine" class="segmented"><legend class="sr">Voice engine used</legend></fieldset>
+          </div>
+          <div id="tts-voice-row" class="row" hidden>
+            <div class="field select"><select id="tts-voice-fr"></select><label for="tts-voice-fr">French voice</label></div>
+            <div class="field select"><select id="tts-voice-en"></select><label for="tts-voice-en">English voice</label></div>
+          </div>
+          <div class="row">
+            <div class="field select"><select id="tts-lang" aria-describedby="tts-max-help"><option value="auto">Auto</option><option value="fr">French</option><option value="en">English</option></select><label for="tts-lang">Language</label></div>
+            <div class="field select"><select id="tts-rate-default"></select><label for="tts-rate-default">Speed</label></div>
+            <div class="field"><input id="tts-max" type="number" min="300" max="100000" step="100" placeholder=" " aria-describedby="tts-max-help"><label for="tts-max">Read at most (characters)</label></div>
+          </div>
+          <p class="help" id="tts-max-help">Language: Auto guesses French or English from each message (its voice and the words said first follow). Past this length, the rest of the message is said to be skipped (6,000 characters, about six minutes, by default). Code blocks are skipped, links are read as their site.</p>
+          <label class="switch-row"><input type="checkbox" role="switch" id="tts-show" class="switch" aria-describedby="tts-show-help"> <span>Show a Listen button in each message</span></label>
+          <p class="help" id="tts-show-help">On by itself once the first voice is set up. Shortcut in an open message: p (play, pause).</p>
+          <label class="switch-row"><input type="checkbox" role="switch" id="tts-auto-op" class="switch"> <span>Read aloud by itself what reaches the operator box</span></label>
+          <p class="help">Questions, recaps, replies to you. A message read by itself shows a notification with Pause and Stop, and the desktop's media controls show it (as for a music player).</p>
+          <h4 class="card-sub" id="tts-rules-head" hidden>Read aloud by itself</h4>
+          <ul id="tts-rules" class="tts-rules" aria-labelledby="tts-rules-head"></ul>
+          <p class="help">For a box, a project, a computer or a service: its ⋮ menu in the tree, “Read aloud what reaches it”. Each one shows here, to turn it off without looking for it.</p>
+          <h4 class="card-sub" id="tts-keep-head">Audio kept</h4>
+          <div class="row">
+            <div class="field"><input id="tts-keep-days" type="number" min="0.04" max="3650" step="any" placeholder=" " aria-describedby="tts-keep-help"><label for="tts-keep-days">Keep for (days)</label></div>
+            <div class="field"><input id="tts-keep-mb" type="number" min="10" max="1000000" step="10" placeholder=" " aria-describedby="tts-keep-help"><label for="tts-keep-mb">At most (MB)</label></div>
+          </div>
+          <p class="help" id="tts-keep-help">An audio file goes this long after it was last played (30 days by default). Past the size (300 MB by default), the least recently played go first, the one playing excepted. Applied at once.</p>
+          <p id="tts-cache" class="help" role="status"></p>
+          <div class="actions"><button id="tts-cache-clear" class="btn small text ripple" type="button" hidden>Delete the kept audio</button></div>
+          </div>
           </div>
         </section>
         <section class="card" aria-labelledby="set-done">
@@ -828,6 +908,8 @@
   <div id="rights-menu" class="menu" popover="auto">
     <div role="menu" aria-labelledby="rights-menu-title" id="rights-menu-items">
       <p id="rights-menu-title" class="menu-title"></p>
+      <button type="button" role="menuitemcheckbox" aria-checked="false" id="rights-tts" class="pause-item" hidden>Read aloud what reaches it<span class="hint">each new message, by itself</span></button>
+      <hr id="rights-tts-sep" hidden>
       <div id="box-acts" hidden>
         <button type="button" role="menuitem" class="pause-item" data-box="purge">Purge its history<span class="hint">what no longer waits, from this computer</span></button>
         <button type="button" role="menuitem" class="pause-item" data-box="empty">Empty what waits<span class="hint">purged unhandled, senders told</span></button>
@@ -889,6 +971,15 @@
     </div>
   </div>
 
+  <!-- What is read aloud, under every view (hidden while the open message shows its own player) -->
+  <section id="tts-bar" class="tts-bar" aria-label="Reading aloud" hidden>
+    <span id="tts-bar-icon" class="tts-bar-icon" aria-hidden="true"></span>
+    <div class="tts-bar-text">
+      <button id="tts-bar-title" class="tts-bar-title" type="button"></button>
+      <span id="tts-bar-sub" class="tts-bar-sub dim"></span>
+    </div>
+    <button id="tts-bar-close" class="btn icon ripple tts-bar-close" type="button" aria-label="Stop reading" title="Stop reading"></button>
+  </section>
   <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>

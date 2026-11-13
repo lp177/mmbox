@@ -266,6 +266,7 @@ function treeItem({ id, type, key, icon, name, sub, badge, held, dot, children, 
     dot ? h("span", { class: "dot " + dot, title: { listening: "listening", active: "active", closed: "closed", paused: "receiving stopped" }[dot] || "" }) : null,
     svg(ICON[icon] || ICON.box),
     h("span", { class: "name", title: name + (sub ? " · " + sub : "") }, name, sub ? h("span", { class: "sub" }, sub) : null),
+    typeof ttsTreeMark === "function" ? ttsTreeMark(type, key) : null,
     showChip ? h("span", { class: "chip rights-chip " + r.rights, title: r.title + ": " + (RIGHTS_TXT[r.rights] || "?") + (r.network ? " (overrides the workstations and boxes)" : r.source === "own" && type === "box" ? " (own setting)" : "") }, RIGHTS_SHORT[r.rights] || "?") : null,
     badge ? h("span", { class: "badge", title: `${badge} unread` }, badge) : null,
     held ? h("span", { class: "badge held", title: `${held} message(s) held: not accepted by this recipient yet` }, svg(ICON.warn, "ico tiny"), String(held)) : null,
@@ -273,7 +274,7 @@ function treeItem({ id, type, key, icon, name, sub, badge, held, dot, children, 
       "aria-label": `Unpin the conversation with ${name}`, title: "Pinned conversation: nothing expires. Click to unpin (each message starts the full delay again)" }, svg(ICON.pin)) : null,
     r ? h("button", { class: "node-menu ripple", type: "button", tabindex: "-1", "aria-haspopup": "menu", "aria-expanded": "false",
       "aria-label": r.noRights ? `Menu of ${name}` : `Handling of the messages from ${name}` + (r.acts ? ", and the box's own actions" : ""),
-      title: r.noRights ? "Purge, empty, close or delete" : "Handling: execute, ask, ignore" + (r.acts ? "; purge, empty, close or delete" : "") }, svg(ICON.more)) : null);
+      title: r.ttsOnly ? "Reading aloud" : r.noRights ? "Purge, empty, close or delete" : "Handling: execute, ask, ignore" + (r.acts ? "; purge, empty, close or delete" : "") }, svg(ICON.more)) : null);
   li.append(node);
   if (extra) li.append(extra);
   if (hasKids) li.append(h("ul", { role: "group" }, children));
@@ -452,7 +453,8 @@ function rightsOf(node) {
     const b = S.boxes.get(node.key);
     const butler = [...S.boxes.values()].find((x) => x.role === "butler" && !x.local && machineKey(x) === node.key);
     return b?.rights ? { target: b.id, rights: b.rights.rights, source: b.rights.source, butler: !!butler, butlerBox: butler?.id,
-      title: `Messages from ${nm(machineName(node.key))} and its sessions` + networkNote(b) } : null;
+      title: `Messages from ${nm(machineName(node.key))} and its sessions` + networkNote(b) }
+      : typeof ttsReady === "function" && ttsReady() ? { noRights: true, ttsOnly: true, title: `Computer ${nm(machineName(node.key))}` } : null;
   }
   if (node.type === "server") {
     const net = snap.service_rights?.[node.key];
@@ -463,12 +465,17 @@ function rightsOf(node) {
       other: op ? { target: "projects@" + node.key, rights: def || null, follow: "No default on this network", followed: "no default on this network",
         following: !def, title: `By default, the sessions of other projects of this computer writing through ${name}` } : null };
   }
+  if (node.type === "project") {  // its only entry: read aloud what reaches its boxes
+    const [mk, wp] = node.key.split("\u0000");
+    return typeof ttsReady === "function" && ttsReady() ? { noRights: true, ttsOnly: true, title: `Project ${nm(wp || "(no project)")} on ${nm(machineName(mk))}` } : null;
+  }
   if (node.type === "box") {
     const b = S.boxes.get(node.key);
     const base = boxRights(b, snap);
     // what this computer can do to its own boxes; another computer's daemon does it to its boxes (an op)
     const acts = b?.local ? (b.role !== "operator" ? boxActs(b) : null) : remoteActs(b);
-    if (!base && !acts) return null;
+    if (!base && !acts) return b && b.role !== "operator" && typeof ttsReady === "function" && ttsReady()
+      ? { noRights: true, ttsOnly: true, title: `${boxTitle(b)} (${b.local ? "this computer" : nm(machineName(machineKey(b)))})` } : null;
     return { ...(base || { noRights: true, title: `${boxTitle(b)} (${b.local ? "this computer" : nm(machineName(machineKey(b)))})` }), acts };
   }
   return null;
@@ -573,7 +580,7 @@ function networkNote(b) {
   const nets = (b?.servers || []).filter((u) => S.snap?.service_rights?.[u]);
   return nets.length ? ` — the network ${nets.map((u) => (S.servers.get(u) || {}).name || u).join(", ")} overrides it` : "";
 }
-function rmItems() { return $$('[role="menuitemradio"], [role="menuitem"]', RM.el).filter((b) => !b.hidden && !b.disabled && !b.parentElement.closest("[hidden]")); }
+function rmItems() { return $$('[role="menuitemradio"], [role="menuitem"], [role="menuitemcheckbox"]', RM.el).filter((b) => !b.hidden && !b.disabled && !b.parentElement.closest("[hidden]")); }
 const inOther = (it) => !!it.closest('[data-group="other"]');
 function openRightsMenu(li, fromPointer) {
   const btn = li.querySelector(":scope > .node .node-menu");
@@ -583,6 +590,8 @@ function openRightsMenu(li, fromPointer) {
   Object.assign(RM, { r, nid: li.dataset.nid, fromPointer, btn });
   setRich($("#rights-menu-title"), r.title);
   $("#rights-main").hidden = !!r.noRights;
+  if (typeof ttsMenuItem === "function") ttsMenuItem({ type: li.dataset.type, key: li.dataset.key });
+  if (r.ttsOnly) $("#rights-tts-sep").hidden = true;
   $("#rights-butler").hidden = $("#rights-butler-sep").hidden = !r.butler;
   const ba = $("#box-acts");
   ba.hidden = !r.acts;
@@ -666,7 +675,7 @@ RM.el.addEventListener("keydown", (e) => {
   e.preventDefault();
   items[j]?.focus();
 });
-RM.el.addEventListener("pointermove", (e) => { const it = e.target.closest('[role="menuitemradio"]'); if (it && !it.disabled && document.activeElement !== it) it.focus({ focusVisible: false }); });
+RM.el.addEventListener("pointermove", (e) => { const it = e.target.closest('[role="menuitemradio"], [role="menuitemcheckbox"]'); if (it && !it.disabled && document.activeElement !== it) it.focus({ focusVisible: false }); });
 const BOX_ACT = {
   purge: (b) => [`Purge the history of ${boxTitle(b).toLowerCase().startsWith("box") ? nm(boxName(b.id)) : boxTitle(b)}?`,
     "What no longer waits among its messages goes from this computer for good: its log, their attached files and the console's copy. What still waits, and what an open box handled within the kept delay (Settings), stays.",
@@ -1204,6 +1213,7 @@ function closeReader(focus = true) {
   $(".list-pane").inert = false;
   $("#reader").hidden = true;
   attRelease("detail"); AT.detail = null;
+  if (typeof ttsPaint === "function") ttsPaint();
   const back = RD.tab;
   RD.tab = null;
   if (back && focus) { showTab(back); $("#tab-" + back).focus(); return; }  // opened from another tab: back there
@@ -1441,7 +1451,8 @@ function renderDetail(m, partial) {
   const actBlock = m.sender_activity ? h("div", { class: "activity" }, h("strong", {}, `Activity of ${m.sender_title || boxName(m.from)} when sending`), m.sender_activity) : null;
   const body = typeof m.body === "string" ? m.body : m.preview;
   d.replaceChildren(h("div", { class: "detail" },
-    h("div", { class: "detail-title" }, h("h2", {}, m.subject || (m.lock ? `Lock ${m.lock.name}` : "(no subject)")), msgMenuBtn(m)), chips, heldBlock, recapBlock, meta, fwBlock, actBlock,
+    h("div", { class: "detail-title" }, h("h2", {}, m.subject || (m.lock ? `Lock ${m.lock.name}` : "(no subject)")), msgMenuBtn(m)),
+    typeof ttsBlock === "function" ? ttsBlock(m) : null, chips, heldBlock, recapBlock, meta, fwBlock, actBlock,
     body ? h("pre", { class: "body", tabindex: "0", "aria-label": "Message body" }, body + (partial && m.body_len > (m.preview || "").length ? "…" : ""))
       : h("p", { class: "notice" }, m.level === "meta" || m.level === "subject"
         ? "The content is not sent to the collector at this annotation level (a setting of the sending computer)."
@@ -1455,6 +1466,7 @@ function renderDetail(m, partial) {
         m.broadcast ? "Reply to the author" : replyTarget(m).to === m.from ? "Reply" : "Write again") : null,
       h("button", { class: "btn ripple", type: "button", onclick: () => navigator.clipboard?.writeText(m.id).then(() => toast("Id copied")) }, "Copy the id")),
     h("details", { class: "raw" }, h("summary", {}, "Raw data"), h("pre", {}, JSON.stringify(m, null, 1)))));
+  if (typeof ttsPaint === "function") ttsPaint();
 }
 
 // ---------------------------------------------------------------- a message's menu (⋮) and deleting messages from this computer
@@ -1929,6 +1941,7 @@ function showTab(name) {
   }
   butlerTab(name === "butler");
   if (name === "settings" && token) { loadButlerSettings(); loadAccount(); }
+  if (typeof ttsPaint === "function") ttsPaint();
   localStorage.setItem("mmbox-console-tab", name);
 }
 $(".tabs").addEventListener("click", (e) => { const t = e.target.closest(".tab"); if (t) { RD.tab = NAV.tab = NAV.box = null; showTab(t.id.slice(4)); } });
@@ -2474,6 +2487,7 @@ async function pollPending() {
   try {
     const r = await api(`/api/pending?notify=${canNotify() ? 1 : 0}&audio=${canAudio() ? 1 : 0}${window.pywebview ? "&app=1" : ""}`);
     if (r.goto) openFromNotification(r.goto);
+    if (typeof ttsPending === "function") ttsPending(r);
     const ids = r.ids || [];
     if (Q.known === null) Q.known = new Set(pendingQ().map((q) => q.id));
     const fresh = ids.filter((i) => !Q.known.has(i));
@@ -2564,6 +2578,7 @@ async function poll(force = false, background = false) {
       renderHeld(); heldSignals(); S.heldN = S.msgs.filter(isHeld).length;
       if (S.wantHeld) { S.wantHeld = false; showHeld(); }
       renderSent(); renderTree(); renderList(); renderBoxes(); renderServers(); renderActivity(); renderSettings(); renderQuestionSettings();
+      if (typeof ttsOnSnap === "function") ttsOnSnap(snap);
       const first = Q.known === null;
       const ids = pendingQ().map((q) => q.id);
       const fresh = first ? [] : ids.filter((i) => !Q.known.has(i));
