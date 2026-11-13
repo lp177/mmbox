@@ -372,12 +372,20 @@ function renderTree() {
 function visibleItems() {
   return $$('#tree [role="treeitem"]').filter((li) => !li.parentElement.closest('[aria-expanded="false"]'));
 }
+// A click on an item's row (its name, dot, subtitle, badges: anywhere but its buttons), or Enter / Space, selects it
+// and, when it has children, unfolds it: closed, it opens; open and already selected, it folds; open and not selected
+// yet, it stays open (selecting a parent never hides the child being looked at).
 function selectNode(li) {
   const type = li.dataset.type;
   if (type === "group") { toggle(li); return; }
   if (type === "held") { showHeld(); return; }
   if (type === "butler-start") { openButlerLaunch(li.dataset.key); return; }
-  S.node = { type, key: li.dataset.key || null };
+  const key = li.dataset.key || null;
+  if (li.hasAttribute("aria-expanded")) {
+    if (li.getAttribute("aria-expanded") !== "true") toggle(li, true);
+    else if (S.node.type === type && S.node.key === key) toggle(li, false);
+  }
+  S.node = { type, key };
   S.limit = 300;
   closeReader(false);
   renderTree(); renderList();
