@@ -45,6 +45,16 @@ WAITING = ("queued", "sent", "unread", "taken")  # a message's states while it i
 PURGE_KEEP_DEFAULT_S = 86400  # the purge keeps this much of the open boxes' finished messages (Settings)
 PURGE_KEEP_MAX_S = 366 * 86400
 HELD_AFTER_S = 300  # a message its sender keeps queued (the service refuses it) for longer than this is "held": shown loud
+HELD_UNREACHABLE_S = 60  # one of this computer's that no service took because none answered: shown loud after this
+
+
+def held_after_s(m: dict) -> float:
+    """How long a queued message waits before it is shown loud (console.js: heldAfter): a broadcast of this computer at
+    once (it lives minutes), a send no service answered for after a minute, a refused one after 5 minutes."""
+    q = m.get("queue") or {}
+    if q.get("kind") == "broadcast":
+        return 0
+    return HELD_UNREACHABLE_S if q.get("why") in ("unreachable", "none") else HELD_AFTER_S
 HELD_RETRY_S = 1800  # no refusal seen for this long: its sender stopped retrying (console.js: HELD_RETRY_S)
 # final states besides read: "delivered" (its service says it was consumed: what the logs of this computer and the
 # collectors could not tell, as for a message sent before a collector ran), "stranded" (it waits in a box that closed:
@@ -1415,8 +1425,13 @@ class Desktop:
             to.setdefault(m.get("to_name") or m.get("to") or "?", []).append(m)
         oldest = max(m["held"].get("age_s") or 0 for m in held)
         title = f"mmbox: {len(held)} message(s) held"
+        if all(m.get("why") in ("unreachable", "none") for m in held):
+            title = f"mmbox: {len(held)} message(s) not sent: no service answers"
         body = "; ".join(f"{len(ms)} for {who}" for who, ms in sorted(to.items(), key=lambda x: -len(x[1]))[:4]) \
-            + f". The oldest for {fmt_age(oldest)}: the recipient's computer has not accepted them yet; they leave by themselves when it runs."
+            + f". The oldest for {fmt_age(oldest)}: " + ("no service answers (network, VPN or the service down?); this computer "
+                                                          "sends them again by itself when one does."
+                                                          if all(m.get("why") in ("unreachable", "none") for m in held) else
+                                                          "kept by their senders and sent again by themselves as soon as they can go.")
         if self.held_shown == ids:  # the same messages: never popped up again because they got older
             return False
         icon = str(self.icons / "mmbox-console-alert.svg")
@@ -1976,11 +1991,76 @@ class State:
         with self.lock:
             boxes = {b["id"]: b for b in self.snapshot.get("boxes") or []}
             name = lambda i: (lambda b: " on ".join(x for x in (b.get("title") or b.get("label") or i, b.get("hostname")) if x))(boxes.get(i) or {})  # noqa: E731
-            out = [{**{k: m.get(k) for k in ("id", "from", "to", "kind", "subject", "tier")}, "to_name": name(m.get("to")),
+            out = [{**{k: m.get(k) for k in ("id", "from", "to", "kind", "subject", "tier", "broadcast")},
+                    "to_name": name(m.get("to")) if m.get("to") else "a broadcast",
+                    "why": (m.get("queue") or {}).get("why") or "refused",
                     "held": {**m["held"], "age_s": (now_ms - m["held"]["since"]) / 1000}}
                    for m in self.messages.values() if m.get("held") and not m["held"].get("ack")
-                   and now_ms - m["held"]["since"] >= HELD_AFTER_S * 1000]
+                   and now_ms - m["held"]["since"] >= held_after_s(m) * 1000]
         return sorted(out, key=lambda m: m["held"]["since"])
+
+    def outbox_queues(self, profiles: dict) -> dict:
+        """This computer's queues (mmbox.py outbox), by message id: why each send failed, its tries, when the next is
+        (times in ms, as the page counts)."""
+        out = {}
+        if not hasattr(M, "outbox_items"):
+            return out
+        ms = lambda t: int(float(t) * 1000) if t else None  # noqa: E731
+        for n, y in profiles.items():
+            try:
+                items = M.outbox_items(y)
+            except (Exception, SystemExit) as e:  # noqa: BLE001 - one box unreadable, the others shown
+                log(f"outbox of {n}: {type(e).__name__}: {e}")
+                continue
+            for i in items:
+                out[i["id"]] = {"profile": n, "kind": i["kind"], "why": i.get("why") or "refused", "since": ms(i.get("at")),
+                                "why_since": ms(i.get("why_since")), "tries": i.get("tries") or 0, "last": ms(i.get("last_try")),
+                                "next": ms(i.get("next_try")), "expires": ms(i.get("expires")),
+                                "errors": i.get("errors") or [], "services": i.get("services") or [],
+                                "to_names": i.get("to_names"), "own": bool(i.get("own"))}
+        return out
+
+    def flush_queues(self) -> None:
+        """While this computer's daemon does not run, the console tries the queues that are due itself (the daemon
+        does it every 15 s otherwise), in a thread: a service that does not answer makes a try wait."""
+        t = getattr(self, "_flush_t", None)
+        if (t and t.is_alive()) or not hasattr(M, "flush_every_box"):
+            return
+        try:
+            if B and hasattr(B, "control_state") and (B.control_state() or {}).get("running"):
+                return
+        except Exception:  # noqa: BLE001 - unknown: the console does it
+            pass
+        self._flush_t = threading.Thread(target=M.flush_every_box, daemon=True, name="outbox")
+        self._flush_t.start()
+
+    def outbox_act(self, op: str, ids) -> dict:
+        """The held panel's Retry now (these queued messages tried at once, in the background) and Cancel (dropped from
+        their box's queue: not sent again), through the client of each box (`outbox retry|cancel`)."""
+        ids = [str(i) for i in ids or [] if i]
+        with self.lock:
+            qs = {i: (self.messages.get(i) or {}).get("queue") for i in ids}
+        by_prof: dict[str, list] = {}
+        for i, q in qs.items():
+            if q:
+                by_prof.setdefault(q["profile"], []).append(i)
+        if not by_prof:
+            return {"ok": False, "err": "none of these messages waits in a queue of this computer"}
+        n = sum(len(x) for x in by_prof.values())
+        if op == "retry":
+            def work():
+                for p, xs in by_prof.items():
+                    r = run_client(["--profile", p, "outbox", "retry", *xs], timeout=600)
+                    if not r.get("ok"):
+                        log(f"outbox retry of {p}: {r.get('err') or r.get('out')}")
+                self.refresh()
+            threading.Thread(target=work, daemon=True, name="outbox-retry").start()
+            return {"ok": True, "out": f"Trying {n} message(s) now", "n": n}
+        res = [run_client(["--profile", p, "outbox", "cancel", *xs], timeout=120) for p, xs in by_prof.items()]
+        threading.Thread(target=self.refresh, daemon=True).start()
+        bad = [r for r in res if not r.get("ok")]
+        return {"ok": not bad, "n": n, "out": "\n".join(r.get("out") or "" for r in res).strip(),
+                "err": "; ".join((r.get("err") or "").strip()[-300:] for r in bad) or None}
 
     def waiting_ids(self) -> set:
         """The messages still in a box: sent and not consumed yet, unread, taken, or queued by their sender."""
@@ -3736,6 +3816,20 @@ class State:
             ack = (self.console_state.get("held_ack") or {}).get(m["id"])
             if ack:  # the operator marked it handled: still queued, no longer in the alert
                 m["held"] = {**m["held"], "ack": ack}
+        # this computer's own queues (mmbox.py outbox): why each send failed, its tries, when the next one is; a
+        # broadcast not on every channel yet is queued too, for the life of its post
+        for mid, q in self.outbox_queues(profiles).items():
+            m = msgs.get(mid)
+            if not m or (q.get("own") and not m.get("broadcast")):
+                continue
+            m["queue"] = q
+            if m.get("broadcast"):
+                m["state"] = "queued"
+                m["held"] = {"since": q.get("since") or _ms(m.get("ts")) or int(time.time() * 1000), "local": q["profile"]}
+                if (ack := (self.console_state.get("held_ack") or {}).get(mid)):
+                    m["held"]["ack"] = ack
+            elif m.get("held"):
+                m["held"]["why"] = q["why"]
 
         # labels and the relations of each message to the boxes
         for m in msgs.values():
@@ -3764,7 +3858,7 @@ class State:
                 if m["id"] in recap_ids or m.get("kind") in ("question", "recap") or m.get("to") == self.op.id:
                     return True  # written to the operator: kept until the operator deletes it
                 if m.get("broadcast"):
-                    return False
+                    return bool(m.get("queue"))  # a broadcast of this computer not on every channel yet
                 st = m.get("state")
                 if st in WAITING and not (st == "sent" and m.get("from") not in open_ids):
                     return True  # still in a box (or queued by its sender); "sent" by a box gone: done
@@ -4023,6 +4117,10 @@ def act(state: State, body: dict) -> dict:
         state.save_console_state()
         state._usage = (0.0, {})
         return {"ok": True, "purge_keep_s": v}
+    if a == "outbox_retry":  # the held panel: these queued messages of this computer tried at once
+        return state.outbox_act("retry", body.get("ids"))
+    if a == "outbox_cancel":  # the held panel: dropped from their box's queue, not sent again
+        return state.outbox_act("cancel", body.get("ids"))
     if a == "held_ack":  # the held alert: a message (or all of a recipient's) marked handled, or back in the alert
         ids = body.get("ids")
         if not isinstance(ids, list) or len(ids) > 5000:
@@ -4494,6 +4592,7 @@ def main():
             time.sleep(max(2.0, a.refresh))
             try:
                 state.refresh()
+                state.flush_queues()  # the queued sends, when no daemon tries them
                 if n % 8 == 0:
                     state.ensure_butler()  # runs with the console (Settings), one per computer
                 if n % 4 == 0 and (account_chain() or state.console_state.get("joining")):

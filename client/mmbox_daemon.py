@@ -1077,6 +1077,27 @@ def do_op(op: dict) -> dict:
         return {"error": str(e)}
 
 
+_OUTBOX: dict = {"thread": None}
+
+
+def outbox_round() -> None:
+    """The queued sends of every box of this computer, listener or not, tried when their time comes: in a thread of
+    their own, since a service that does not answer makes a try wait (the round goes on meanwhile)."""
+    t = _OUTBOX["thread"]
+    if not hasattr(M, "flush_every_box") or (t and t.is_alive()):
+        return
+
+    def work():
+        try:
+            for prof, n in M.flush_every_box().items():
+                if n:
+                    log("outbox", f"{prof}: {n}")
+        except Exception as e:  # noqa: BLE001 - logged, the next round tries again
+            log("error", f"outbox round: {type(e).__name__}: {e}")
+    _OUTBOX["thread"] = threading.Thread(target=work, daemon=True, name="outbox")
+    _OUTBOX["thread"].start()
+
+
 def daemon(once: bool = False) -> int:
     lock = open(home() / "daemon.lock", "a+")
     try:
@@ -1112,6 +1133,7 @@ def daemon(once: bool = False) -> int:
             jsave("state.json", {**jload("state.json", {}), "claims": st["claims"], "fails": st.get("fails") or {},
                                  "last_start": st.get("last_start") or {}, "beat": time.time()})
             check_started()
+            outbox_round()
             maybe_tray()
             refresh_chains(b)
             handle_own_box(b, st)

@@ -879,7 +879,10 @@ class Gateway:
             h = self.health()
             if h.get("ok"):
                 self._features = set(h.get("features") or [])
-        return self._features or set()
+                features_remember(self.url, self._features)
+            elif self._features is None:  # it does not answer now: what it carried when it last did (a post is queued)
+                self._known = features_known(self.url)
+        return self._features or getattr(self, "_known", None) or set()
 
     def call(self, me: "Me", path: str, body: dict, soft: bool = False, timeout: float | None = None):
         timeout = timeout or CALL_TIMEOUT[0]
@@ -1154,17 +1157,29 @@ def probe(url: str) -> float | None:
     u = urllib.parse.urlparse(url)
     port = u.port or (443 if u.scheme == "https" else 80)
     rtt = None
-    try:
-        addr = socket.getaddrinfo(u.hostname, port, type=socket.SOCK_STREAM)[0]
-        with socket.socket(addr[0], socket.SOCK_STREAM) as sk:
-            sk.settimeout(3)
-            t0 = time.monotonic()
-            sk.connect(addr[4])
-            rtt = round((time.monotonic() - t0) * 1000, 1)
-    except (OSError, IndexError):
-        rtt = None
+    try:  # each address of the name in turn (two at most): a broken IPv6 route never hides a working IPv4 one
+        addrs = list(dict.fromkeys((a[0], a[4]) for a in socket.getaddrinfo(u.hostname, port, type=socket.SOCK_STREAM)))[:2]
+    except OSError:
+        addrs = []
+    for fam, sa in addrs:
+        try:
+            with socket.socket(fam, socket.SOCK_STREAM) as sk:
+                sk.settimeout(3)
+                t0 = time.monotonic()
+                sk.connect(sa)
+                rtt = round((time.monotonic() - t0) * 1000, 1)
+                break
+        except OSError:
+            continue
     _PROBES[url] = (time.monotonic(), rtt)
     return rtt
+
+
+def answers(url: str) -> bool:
+    """Whether a service can be reached now: one TCP handshake within 3 s (kept 10 s). With no network or VPN, a send,
+    a sync or a post is then said unreachable at once, instead of waiting for three requests to time out. Behind a
+    proxy the handshake proves nothing: always yes."""
+    return _PROXIED or probe(url) is not None
 
 
 def probe_all(urls) -> dict:
@@ -1210,14 +1225,20 @@ def best_gateway(me: "Me", peer: dict, exclude: set | None = None) -> Gateway | 
     return gateway(tie_pick(alive))
 
 
-def send_env(me: "Me", peer: dict, env: dict, payload: dict | None = None) -> tuple[Gateway | None, dict, list]:
+def send_env(me: "Me", peer: dict, env: dict, payload: dict | None = None,
+             skip: set | None = None) -> tuple[Gateway | None, dict, list]:
     """Send through the best shared service, then the others if it fails: (service used, answer, failures). With the
-    payload, the service's collector gets its annotation when this computer enabled it there."""
-    tried, failed = set(), []
+    payload, the service's collector gets its annotation when this computer enabled it there. `skip`: services that
+    did not answer moments ago (an outbox round): not tried again now."""
+    tried, failed = set(skip or ()), []
     while True:
         gw = best_gateway(me, peer, exclude=tried)
         if not gw:
             return None, {}, failed
+        if not answers(gw.url):
+            tried.add(gw.url)
+            failed.append({"url": gw.url, "error": "0 no answer (no TCP handshake within 3 s)"})
+            continue
         r = gw.send(me, peer["id"], env, col_note(me, gw.url, payload, peer) if payload else None)
         if r.get("ok"):
             return gw, r, failed
@@ -1243,6 +1264,8 @@ def gw_sync(me: "Me", force: bool = False) -> None:
                  and not q.get("retired_at"))
     digest = hashlib.sha256(",".join(ids).encode()).hexdigest()
     for gw in gws:
+        if not answers(gw.url):  # nothing to sync with a service that cannot be reached now: the next pass does it
+            continue
         if force or (st.get("gw_card") or {}).get(gw.url) != fp:
             if (gw.call(me, "/card", {"card": me.signed({**me.card(), "updated": iso()})}, soft=True) or {}).get("ok"):
                 me.local.update("state.json", lambda st, u=gw.url: st.setdefault("gw_card", {}).__setitem__(u, fp))
@@ -1549,9 +1572,110 @@ def retired_dest(peers: dict, peer: dict) -> str | None:
     return None
 
 
-def flush_outbox(me: "Me") -> int:
-    """Messages the service refused (the peer had not listed us yet, or was not on it), sent again now. Never an
-    agent's to resend: the client does it, at each pass, until RECEIPT_TTL_S.
+# A queued send is tried again on a schedule of its own (its next try is in the outbox, shown by `outbox` and the
+# console): soon at first, then every 2 min while no service answers (network, VPN or service down), every minute
+# while a service answers but refuses it (the peer does not list this box yet). `outbox retry` tries at once.
+RETRY_STEPS_S = {"unreachable": (15, 30, 60, 120), "none": (60, 300), "refused": (15, 30, 60), "full": (30, 60, 120),
+                 "closed": (15,)}
+NET_CODES = ("0", "502", "503", "504", "")  # no answer, or a proxy saying the service behind it is down
+
+
+def fail_code(f: dict) -> str:
+    return str(f.get("error") or "").split(" ", 1)[0]
+
+
+def send_failure(failed: list, shared: list) -> str:
+    """Why no service took a send: `unreachable` (no service we share answered: network, VPN or the service down),
+    `refused` (one answered: the peer does not list this box yet), `full` (its box is full), `closed` (its box
+    closed), `none` (no service shared with the peer)."""
+    if not shared:
+        return "none"
+    codes = [fail_code(f) for f in failed]
+    if "410" in codes:
+        return "closed"
+    if "429" in codes:
+        return "full"
+    return "unreachable" if all(c in NET_CODES for c in codes) else "refused"
+
+
+def down_urls(failed: list) -> set:
+    return {f["url"] for f in failed if f.get("url") and fail_code(f) in NET_CODES}
+
+
+def retry_in(why: str, tries: int) -> float:
+    steps = RETRY_STEPS_S.get(why) or RETRY_STEPS_S["refused"]
+    return float(steps[min(max(tries, 1), len(steps)) - 1])
+
+
+def queue_fields(why: str, tries: int, failed: list, prev: dict | None = None) -> dict:
+    """What an outbox item says of its last try: why it failed, how many tries, when the next one is."""
+    t = time.time()
+    out = {"why": why, "tries": tries, "last_try": t, "next_try": t + retry_in(why, tries),
+           "errors": [{"url": f.get("url"), "error": str(f.get("error") or "")[:200]} for f in failed][-4:]}
+    if why != (prev or {}).get("why"):
+        out["why_since"] = t
+    return out
+
+
+class outbox_lock:
+    """One outbox round at a time per box (its listener, a send, the daemon, the console's Retry now): the others
+    skip it (`with outbox_lock(me) as got: if got: …`), so that no message goes out twice."""
+
+    def __init__(self, me: "Me", wait: float = 0):
+        self.path, self.fh, self.got, self.wait = me.local.path("outbox.lock"), None, False, wait
+
+    def __enter__(self) -> bool:
+        end = time.monotonic() + self.wait
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fh = open(self.path, "a+b")
+        except OSError:
+            return False
+        while True:  # `wait`: a retry asked by hand takes its turn after the round running now
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.fh.seek(0)
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.got = True
+                return True
+            except OSError:
+                if time.monotonic() >= end:
+                    return False
+                time.sleep(0.25)
+
+    def __exit__(self, *exc):
+        if self.fh:
+            if self.got:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        self.fh.seek(0)
+                        msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            self.fh.close()
+
+
+def flush_outbox(me: "Me", force: bool = False, only: set | None = None) -> int:
+    """The queued sends of this box (and its queued broadcasts) whose next try has come (all of them with `force`,
+    those of `only` when given), tried again; skipped while another process does it. Returns how many went out."""
+    with outbox_lock(me) as got:
+        if not got:
+            return 0
+        n = _flush_outbox(me, force, only)
+        return n + flush_chan_outbox(me, force, only)
+
+
+def _flush_outbox(me: "Me", force: bool = False, only: set | None = None) -> int:
+    """Messages the service refused (the peer had not listed us yet, or was not on it) or that no service took (none
+    answered), sent again now. Never an agent's to resend: the client does it, on its schedule, until RECEIPT_TTL_S.
 
     - the tool's own bookkeeping (BOOKKEEPING_KINDS): retried and dropped without a word (it is redone when needed);
     - a message for a session box that closed meanwhile: written again to the machine box it named, nothing lost;
@@ -1562,6 +1686,7 @@ def flush_outbox(me: "Me") -> int:
     if not q:
         return 0
     peers, keep, sent, alerts, added = peers_load(me.local), [], 0, [], set()
+    t0, down, updated, warned, done = time.time(), set(), {}, set(), set()  # down: no answer in this round
 
     def drop(item, peer, reason):
         p = item.get("payload") or {}  # the log says it too, or the message stays "queued" there for ever
@@ -1570,10 +1695,18 @@ def flush_outbox(me: "Me") -> int:
                                          if k in p}, "reason": reason})
 
     for item in q:
+        if (only is not None and item["msg_id"] not in only) or (not force and float(item.get("next_try") or 0) > t0):
+            continue  # not its turn: left as it is
         peer = peers.get(item["peer_id"])
         p = item.get("payload") or {}
         own = p.get("kind") in BOOKKEEPING_KINDS
-        gw, r, _failed = send_env(me, peer, item["env"], p) if peer else (None, {}, [])
+        urls = shared_urls(me, peer) if peer else []
+        if peer and urls and set(urls) <= down:  # every service it could go through did not answer moments ago
+            gw, r, _failed = None, {}, [{"url": u, "error": "0 no answer in this round"} for u in urls]
+        else:
+            gw, r, _failed = send_env(me, peer, item["env"], p, skip=down) if peer else (None, {}, [])
+            down |= down_urls(_failed)
+        done.add(item["msg_id"])
         if not r.get("ok") and peer and not peer.get("retired_at") and any(f["error"].startswith("410") for f in _failed):
             # the service says its box closed, a notice that never reached us: known from now on, then handled below
             fields = {"retired_at": iso(), "retired_machine": peer.get("retired_machine") or peer.get("introduced_by")}
@@ -1606,19 +1739,36 @@ def flush_outbox(me: "Me") -> int:
                                "the service never accepted it (the peer is not on it, or never listed this box); dropped"))
             drop(item, peer, reason)
         else:
+            why = send_failure(_failed, urls)
+            fields = queue_fields(why, int(item.get("tries") or 0) + 1, _failed, item)
+            item.update(fields)
+            updated[item["msg_id"]] = fields
             if not own and not item.get("warned") and age > 900:
+                where = ", ".join(urls) or "any shared service"
                 alerts.append(("unsent", peer, item["msg_id"], age,
-                               "not accepted for 15 min on " + (", ".join(shared_urls(me, peer)) or "any shared service")
-                               + ": the peer does not list this box yet (no client of its computer has run since this box "
-                               "was introduced to it). Kept and sent again by itself as soon as it does, or to its machine "
-                               "box if its box closed: do not send it again"))
+                               (f"no service shared with it has answered for a while ({where}: network, VPN or the service "
+                                f"down): kept and sent again by itself every {retry_in(why, 99):g} s until it does"
+                                if why == "unreachable" else
+                                f"not accepted for 15 min: its box is full on {where}; kept and sent again by itself"
+                                if why == "full" else
+                                "not accepted for 15 min on " + where + ": the peer does not list this box yet (no client "
+                                "of its computer has run since this box was introduced to it). Kept and sent again by "
+                                "itself as soon as it does, or to its machine box if its box closed")
+                               + ": do not send it again (`outbox` shows it, `outbox retry` tries now)"))
                 item["warned"] = True
+                warned.add(item["msg_id"])
             keep.append(item)
-    warned = {k["msg_id"] for k in keep if k.get("warned")}
-    kept = {k["msg_id"] for k in keep} | added
-    me.local.update("state.json", lambda st: st.__setitem__("outbox", [{**i, **({"warned": True} if i["msg_id"] in warned else {})}
-                                                                      for i in (st.get("outbox") or [])
-                                                                      if i["msg_id"] in kept]))
+    gone = done - {k["msg_id"] for k in keep}  # sent, dropped or rerouted in this round
+
+    def write(st):  # a send queued meanwhile by another process stays as it is
+        out = []
+        for i in st.get("outbox") or []:
+            mid = i.get("msg_id")
+            if mid in gone:
+                continue
+            out.append({**i, **updated.get(mid, {}), **({"warned": True} if mid in warned else {})})
+        st["outbox"] = out
+    me.local.update("state.json", write)
     if alerts:
         notify(me, Store(me.local), me.conf.get("project") or "", alerts)
     return sent
@@ -2735,6 +2885,31 @@ def send_mail(me: Me, subject: str, text: str) -> str:
 # rights: archive hides it, ask makes the agent ask its user before answering; a session of this computer, or a peer
 # with execute, may be answered with facts about one's own work. The service also adds arrival hints there: a message
 # reached a session box nobody listens to, so the computer's relay round comes ~2 min after it.
+def features_known(url: str) -> set | None:
+    """What a service carried when it last answered (features.json in the mmbox folder), for when it does not answer."""
+    try:
+        rec = (json.loads((base_dir() / "features.json").read_text(encoding="utf-8")) or {}).get(url.rstrip("/"))
+    except (OSError, ValueError):
+        return None
+    return set(rec.get("features") or []) if isinstance(rec, dict) else None
+
+
+def features_remember(url: str, feats: set) -> None:
+    url = url.rstrip("/")
+    if features_known(url) == set(feats):
+        return
+    p = base_dir() / "features.json"
+    try:
+        d = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+        d = d if isinstance(d, dict) else {}
+        d[url] = {"features": sorted(feats), "at": iso()}
+        tmp = p.with_name(f"features.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(d, indent=1), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
 def chan_gws(b: Me) -> list[Gateway]:
     """The services of box `b` that carry channels."""
     return [g for g in gateways_of(b) if "chan" in g.features()]
@@ -2834,7 +3009,8 @@ def chan_publish(me: Me, project: str, scope: str, kind: str, subject: str, body
         def flush():
             if not batch:
                 return
-            r = g.chan_post(me, batch, col_note(me, g.url, {**payload, "to": None}) if payload else None)
+            r = g.chan_post(me, batch, col_note(me, g.url, {**payload, "to": None}) if payload else None) if answers(g.url) \
+                else {"_error": 0, "error": "no answer (no TCP handshake within 3 s)"}
             if r.get("_error") is not None:
                 res.extend({"box": p["box"], "error": f"{r.get('_error')} {r.get('error', '')}".strip()} for p in batch)
             else:
@@ -2851,7 +3027,132 @@ def chan_publish(me: Me, project: str, scope: str, kind: str, subject: str, body
     me.local.append_log({"dir": "out", "id": post_id, "peer": "@" + scope, "status": "posted", "at": iso(), "box": "channel",
                          "payload": {**payload, "to": None}, "via": "gateway", "gateway": sorted({g.url for g in route.values()}),
                          "posted": [{k: p.get(k) for k in ("box", "entry", "error")} for p in res]})
-    return {"id": post_id, "ttl_s": ttl, "posted": res}
+    # the channels no service answered for: posted again by this box's outbox rounds, while the post lives
+    lost = {p["box"] for p in res if p.get("error") and fail_code(p) in NET_CODES and p.get("box") in route}
+    if lost and ttl > 20:
+        envs = {p["box"]: p for p, _ in posts}
+        item = {"post_id": post_id, "scope": scope, "at": time.time(), "expires": time.time() + ttl, "kind": kind,
+                "subject": subject, "payload": {**payload, "to": None},
+                "posts": [envs[b] for b in sorted(lost) if b in envs], "names": {b: names.get(b, b) for b in lost},
+                "sent": [{k: p.get(k) for k in ("box", "entry")} for p in res if p.get("entry")],
+                **queue_fields("unreachable", 1, [{"url": route[b].url, "error": next(
+                    (str(p.get("error")) for p in res if p.get("box") == b), "0")} for b in sorted(lost)])}
+        me.local.update("state.json", lambda st: st.setdefault("chan_outbox", []).append(item))
+    return {"id": post_id, "ttl_s": ttl, "posted": res, **({"queued": len(lost)} if lost and ttl > 20 else {})}
+
+
+def flush_chan_outbox(me: Me, force: bool = False, only: set | None = None) -> int:
+    """Broadcasts no service took for some channels (none answered), posted there again while they live: each keeps
+    its first time, its readers judge its age by it. One that expires first is logged as such. The caller holds the
+    box's outbox lock. Returns how many channels it reached."""
+    q = (me.local.load("state.json", {}) or {}).get("chan_outbox") or []
+    if not q:
+        return 0
+    t0, peers, reached, updated, gone = time.time(), peers_load(me.local), 0, {}, set()
+    for item in q:
+        pid = item["post_id"]
+        if only is not None and pid not in only:
+            continue
+        left = float(item.get("expires") or 0) - t0
+        sent = list(item.get("sent") or [])
+        if left < 5:  # its life is over: the channels that never got it are said in its log
+            gone.add(pid)
+            me.local.append_log({"dir": "out", "id": pid, "peer": "@" + item.get("scope", "?"), "status": "posted",
+                                 "at": iso(), "box": "channel", "payload": item.get("payload") or {}, "via": "gateway",
+                                 "posted": sent + [{"box": p["box"], "error": "expired before a service took it"}
+                                                   for p in item.get("posts") or []]})
+            continue
+        if not force and float(item.get("next_try") or 0) > t0:
+            continue
+        left_posts, failed, tried = [], [], set()
+        by_gw: dict = {}
+        for p in item.get("posts") or []:
+            tpeer = peers.get(p["box"]) or {}
+            g = chan_gw(me) if tpeer.get("local_profile") or p["box"] == (machine_me(me.user) or me).id else best_gateway(me, tpeer)
+            if not g:
+                left_posts.append(p)
+                continue
+            by_gw.setdefault(g.url, (g, []))[1].append({**p, "ttl_s": max(5, int(left))})
+        for url, (g, batch) in by_gw.items():
+            r = g.chan_post(me, batch, col_note(me, g.url, item.get("payload") or {}) if item.get("payload") else None) \
+                if answers(url) else {"_error": 0, "error": "no answer (no TCP handshake within 3 s)"}
+            tried.add(url)
+            if r.get("_error") is not None:
+                failed.append({"url": url, "error": f"{r.get('_error')} {r.get('error', '')}".strip()})
+                left_posts += [{k: v for k, v in p.items() if k != "ttl_s"} for p in batch]
+                continue
+            got = {x.get("box"): x for x in r.get("posted") or []}
+            for p in batch:
+                x = got.get(p["box"]) or {}
+                if x.get("entry"):
+                    sent.append({"box": p["box"], "entry": x["entry"]})
+                    reached += 1
+                else:
+                    left_posts.append({k: v for k, v in p.items() if k != "ttl_s"})
+                    failed.append({"url": url, "error": str(x.get("error") or "not posted")})
+        if not left_posts:
+            gone.add(pid)
+        if sent != list(item.get("sent") or []) or not left_posts:  # what reached a channel now, in its log
+            me.local.append_log({"dir": "out", "id": pid, "peer": "@" + item.get("scope", "?"), "status": "posted",
+                                 "at": iso(), "box": "channel", "payload": item.get("payload") or {}, "via": "gateway",
+                                 "gateway": sorted(tried), "posted": sent + [{"box": p["box"], "error": "queued: no service "
+                                                                              "answered yet"} for p in left_posts]})
+        if left_posts:
+            updated[pid] = {"posts": left_posts, "sent": sent,
+                            **queue_fields(send_failure(failed, list(tried) or ["?"]) if failed else "unreachable",
+                                           int(item.get("tries") or 0) + 1, failed, item)}
+
+    def write(st):
+        st["chan_outbox"] = [{**i, **updated.get(i.get("post_id"), {})} for i in st.get("chan_outbox") or []
+                             if i.get("post_id") not in gone]
+    me.local.update("state.json", write)
+    return reached
+
+
+def outbox_items(me: Me) -> list[dict]:
+    """This box's queue, as `outbox` and the console show it: its sends no service took yet and its broadcasts not on
+    every channel yet, with why, since when, how many tries and when the next one is."""
+    st = me.local.load("state.json", {}) or {}
+    peers = peers_load(me.local)
+    out = []
+    for i in st.get("outbox") or []:
+        p, q = i.get("payload") or {}, peers.get(i.get("peer_id") or "") or {}
+        out.append({"id": i["msg_id"], "kind": "send", "to": i.get("peer_id"), "to_alias": q.get("alias"),
+                    "subject": p.get("subject"), "msg_kind": p.get("kind"), "at": i.get("at"),
+                    "why": i.get("why") or "refused", "why_since": i.get("why_since") or i.get("at"),
+                    "tries": i.get("tries") or 0, "last_try": i.get("last_try"), "next_try": i.get("next_try"),
+                    "errors": i.get("errors") or [], "services": shared_urls(me, q) if q else [],
+                    "own": p.get("kind") in BOOKKEEPING_KINDS})
+    for i in st.get("chan_outbox") or []:
+        out.append({"id": i["post_id"], "kind": "broadcast", "scope": i.get("scope"), "subject": i.get("subject"),
+                    "msg_kind": i.get("kind"), "at": i.get("at"), "expires": i.get("expires"),
+                    "why": i.get("why") or "unreachable", "why_since": i.get("why_since") or i.get("at"),
+                    "tries": i.get("tries") or 0, "last_try": i.get("last_try"), "next_try": i.get("next_try"),
+                    "errors": i.get("errors") or [], "to_boxes": [p["box"] for p in i.get("posts") or []],
+                    "to_names": [(i.get("names") or {}).get(p["box"], p["box"]) for p in i.get("posts") or []],
+                    "reached": len(i.get("sent") or [])})
+    return out
+
+
+def flush_every_box(force: bool = False) -> dict:
+    """Every box of this computer whose queue has a try due, tried (the daemon's round, every 15 s: what a box without
+    a listener queued still goes out). {profile: messages that went out}."""
+    out, t0 = {}, time.time()
+    for n in local_profiles():
+        try:
+            st = home_dir(n).joinpath("state.json")
+            if not st.is_file():
+                continue
+            d = json.loads(st.read_text(encoding="utf-8") or "{}")
+            items = (d.get("outbox") or []) + (d.get("chan_outbox") or [])
+            if not items or not (force or any(float(i.get("next_try") or 0) <= t0 for i in items)):
+                continue
+            y = load_me(n)
+            if y and gw_of(y):
+                out[n] = flush_outbox(y, force)
+        except (OSError, ValueError, SystemExit) as e:
+            out[n] = f"{type(e).__name__}: {e}"
+    return out
 
 
 def chan_target(me: Me, who: str) -> dict:
@@ -6060,7 +6361,7 @@ def send_payload(me: Me, peer_id: str, peer: dict, project: str, subject: str, b
                 f"of attachments are base64-encoded twice on the way): send fewer or smaller files (about "
                 f"{fmt_size(MAX_ENV * 9 // 16 - len(body.encode()))} in all), or a path to them")
     via = {}
-    gw = None
+    gw, failed = None, []
     if shared_urls(me, peer):
         gw_sync(me)
         gw, r, failed = send_env(me, peer, env, payload)
@@ -6074,15 +6375,21 @@ def send_payload(me: Me, peer_id: str, peer: dict, project: str, subject: str, b
     if not via and memories_off(me.local):
         if kind in ("ping", "pong"):  # only worth something now
             return msg_id
-        item = {"peer_id": peer_id, "msg_id": msg_id, "env": env, "payload": payload, "at": time.time()}
+        failed = failed if shared_urls(me, peer) else []
+        why = send_failure(failed, shared_urls(me, peer))
+        item = {"peer_id": peer_id, "msg_id": msg_id, "env": env, "payload": payload, "at": time.time(),
+                **queue_fields(why, 1, failed)}
         me.local.update("state.json", lambda st: st.setdefault("outbox", []).append(item))
         me.local.append_log({"dir": "out", "id": msg_id, "peer": peer_id, "status": "queued", "at": iso(), "payload": payload})
         if QUEUE_NOTES is not None:
             QUEUE_NOTES.append(peer["alias"])
         else:
-            print(f"mmbox: the service did not accept {msg_id} for {peer['alias']} yet "
-                  f"({'it does not list this box yet, or is unreachable' if shared_urls(me, peer) else 'it is not on a service of ours'}): "
-                  f"queued, sent again at the next passes of this box", file=sys.stderr)
+            print(f"mmbox: no service took {msg_id} for {peer['alias']} yet ("
+                  + {"unreachable": "no service we share answers: network, VPN or the service down",
+                     "none": "it is not on a service of ours", "full": "its box is full",
+                     "closed": "its box closed"}.get(why, "it does not list this box yet")
+                  + f"): queued, sent again by itself (next try in {retry_in(why, 1):g} s; `outbox` shows the queue)",
+                  file=sys.stderr)
         QUEUED.add(msg_id)
         return msg_id
     if not via:
@@ -6384,7 +6691,10 @@ def print_posted(r: dict, as_json: bool) -> int:
         for p in r["posted"]:
             if not p.get("entry"):
                 print(f"  not on {p['alias']}: {p.get('status', '')} {p.get('error', '')}".rstrip(), file=sys.stderr)
-    return 0 if ok_ else 1
+        if r.get("queued"):
+            print(f"QUEUED: {r['queued']} channel(s) did not answer: posted again by itself while the post lives "
+                  f"({r['ttl_s']} s; `outbox` shows it)", file=sys.stderr)
+    return 0 if ok_ or r.get("queued") else 1
 
 
 def chan_matches(it: dict, a, me: Me) -> bool:
@@ -6727,10 +7037,62 @@ def cmd_inbox(a, local: Local):
     print_items(items, a.json)
 
 
+def cmd_outbox(a, local: Local):
+    """`outbox`: this box's queue (sends no service took yet, broadcasts not on every channel yet), with why, since when
+    and the next try; `outbox retry [ids]`: try now; `outbox cancel <ids>|--all`: drop them (never delivered)."""
+    me = Me(local)
+    items = outbox_items(me)
+    if a.ocmd == "retry":
+        ids = set(a.ids) if a.ids else None
+        _PROBES.clear()  # asked by hand, often because the network is back: each service is probed again now
+        with outbox_lock(me, wait=180) as got:
+            if not got:
+                print("another process has been trying this queue for 3 minutes: its result shows in `outbox`")
+                return
+            n = _flush_outbox(me, True, ids) + flush_chan_outbox(me, True, ids)
+        left = [i for i in outbox_items(me) if ids is None or i["id"] in ids]
+        print(f"{n} went out" + (f"; {len(left)} still queued (next try: `outbox`)" if left else "; the queue is empty"))
+        return
+    if a.ocmd == "cancel":
+        ids = {i["id"] for i in items} if a.all else set(a.ids or [])
+        if not ids:
+            die("name the ids to cancel, or --all")
+        a.ids = sorted(ids)
+        cmd_unqueue(a, local)
+        return
+    if a.json:
+        print(json.dumps(items, ensure_ascii=False, indent=1))
+        return
+    if not items:
+        print("the queue is empty: everything this box sent was taken by a service")
+        return
+    t = time.time()
+    for i in items:
+        nxt = max(0, (i.get("next_try") or t) - t)
+        to = i.get("to_alias") or i.get("to") if i["kind"] == "send" else f"@{i.get('scope')} ({', '.join(i['to_names'])})"
+        print(f"{i['id']}  {i['kind']} to {to}: {i['why']} since {iso(dt.datetime.fromtimestamp(i['why_since'], dt.timezone.utc))}"
+              f", {i['tries']} tr{'y' if i['tries'] == 1 else 'ies'}, next in {nxt:.0f} s"
+              + (f", expires in {max(0, i['expires'] - t):.0f} s" if i.get("expires") else "")
+              + f"  {i.get('subject') or ''}")
+        for e in i.get("errors") or []:
+            print(f"    {e.get('url')}: {e.get('error')}")
+
+
 def cmd_unqueue(a, local: Local):
     """Sends still queued in this box's outbox (the service refused them: the recipient does not list this box, or its
-    box is full), dropped: never delivered, logged `dropped`. The operator's console deletes a held message this way."""
+    box is full; or none answered), and broadcasts still waiting for some channels, dropped: never delivered, logged
+    `dropped`. The operator's console deletes a held message this way."""
     ids = set(a.ids)
+    cq = (local.load("state.json", {}) or {}).get("chan_outbox") or []
+    cdone = {i["post_id"] for i in cq if i.get("post_id") in ids}
+    for item in [i for i in cq if i.get("post_id") in ids]:
+        local.append_log({"dir": "out", "id": item["post_id"], "peer": "@" + item.get("scope", "?"), "status": "posted",
+                          "at": iso(), "box": "channel", "payload": item.get("payload") or {}, "via": "gateway",
+                          "posted": list(item.get("sent") or []) + [{"box": p["box"], "error": "cancelled before a service "
+                                                                     "took it"} for p in item.get("posts") or []]})
+    if cq:
+        local.update("state.json", lambda st: st.__setitem__("chan_outbox", [i for i in (st.get("chan_outbox") or [])
+                                                                              if i.get("post_id") not in ids]))
     q = (local.load("state.json", {}) or {}).get("outbox") or []
     drop = [i for i in q if i.get("msg_id") in ids]
     local.update("state.json", lambda st: st.__setitem__("outbox", [i for i in (st.get("outbox") or [])
@@ -6741,7 +7103,7 @@ def cmd_unqueue(a, local: Local):
                           "at": iso(), "reason": "dropped from the queue on request (never delivered)",
                           "payload": {k: p[k] for k in ("v", "id", "ts", "from", "to", "kind", "subject", "project", "re")
                                       if k in p}})
-    done = {i["msg_id"] for i in drop}
+    done = {i["msg_id"] for i in drop} | cdone
     for mid in sorted(ids):
         print(f"{mid}: " + ("dropped from the queue: never delivered" if mid in done else "not queued in this box"))
 
@@ -8457,6 +8819,11 @@ def main():
                                 "computer) the session that took it")
     x = sub("unqueue", cmd_unqueue, "drop sends the service refused and this box keeps resending (never delivered)")
     x.add_argument("ids", nargs="+")
+    x = sub("outbox", cmd_outbox, "this box's queue: sends no service took yet (why, since when, next try); retry now; cancel")
+    x.add_argument("ocmd", nargs="?", choices=("list", "retry", "cancel"), default="list")
+    x.add_argument("ids", nargs="*")
+    x.add_argument("--all", action="store_true", help="with cancel: every item of the queue")
+    x.add_argument("--json", action="store_true")
     x = sub("archive", cmd_archive, "mark messages archived (or done)")
     x.add_argument("ids", nargs="+")
     x.add_argument("--done", action="store_true")

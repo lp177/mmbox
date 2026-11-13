@@ -136,11 +136,13 @@ const boxOf = (id) => S.boxes.get(id) || { id, label: null, servers: [] };
 const boxName = (id) => { if (!id) return "?"; const b = boxOf(id); return b.title || b.label || b.alias || id; };
 const boxLabel = (id) => { const b = boxOf(id); return b.label || b.alias || id; };
 // the state of a direct message in words: who took it (the session behind a machine box when known), answered
-// held: its sender keeps it queued and the service refuses it (the recipient does not accept the sender yet)
-const HELD_AFTER = 300e3, HELD_RETRY = 1800e3;  // mmbox_console.py: HELD_AFTER_S, HELD_RETRY_S
-const isHeld = (m) => !m.broadcast && m.state === "queued" && !!m.held && !m.held.ack && Date.now() - m.held.since >= HELD_AFTER;
+// held: its sender keeps it queued: the service refuses it (the recipient does not accept the sender yet), or no
+// service answered (network, VPN or the service down: this computer's own sends, m.queue from `mmbox.py outbox`)
+const HELD_AFTER = 300e3, HELD_UNREACHABLE = 60e3, HELD_RETRY = 1800e3;  // mmbox_console.py: HELD_AFTER_S, HELD_UNREACHABLE_S, HELD_RETRY_S
+const heldAfter = (m) => m.queue?.kind === "broadcast" ? 0 : ["unreachable", "none"].includes(m.queue?.why) ? HELD_UNREACHABLE : HELD_AFTER;
+const isHeld = (m) => (!m.broadcast || !!m.queue) && m.state === "queued" && !!m.held && !m.held.ack && Date.now() - m.held.since >= heldAfter(m);
 // held, but the operator marked it handled: still queued by its sender, out of the alert
-const heldAcked = (m) => !m.broadcast && m.state === "queued" && !!m.held?.ack;
+const heldAcked = (m) => (!m.broadcast || !!m.queue) && m.state === "queued" && !!m.held?.ack;
 const heldAge = (m) => ago((Date.now() - m.held.since) / 1000).replace(" ago", "");
 const heldSilent = (m) => !!m.held && !m.held.local && Date.now() - (m.held.last || m.held.since) > HELD_RETRY;
 function stateText(m) {
@@ -218,7 +220,7 @@ function filtered() {
     switch (F.view) {
       case "unread": if (!["unread", "taken"].includes(m.state)) return false; break;
       case "late": if (!isLate(m) || m.tier > LATE_TIER) return false; break;
-      case "held": if (!isHeld(m)) return false; break;
+      case "held": if (!isHeld(m) || (H.only && !H.only.has(m.id))) return false; break;
       case "read": if (m.state !== "read" && !(m.broadcast && (m.seen_by || []).length)) return false; break;
       case "pending": if (!["queued", "sent"].includes(m.state)) return false; break;
       case "undelivered": if (!["stranded", "dropped"].includes(m.state)) return false; break;
@@ -358,7 +360,7 @@ function renderTree() {
     .sort((a, b) => (a.work || "").localeCompare(b.work || "") || machineName(machineKey(a)).localeCompare(machineName(machineKey(b))));
   const pjItems = pbs.map((b) => boxItem(b, 2, "pj"));
   tree.replaceChildren(
-    totalHeld ? treeItem({ id: "held", type: "held", key: "held", icon: "folder", level: 1, name: "Held messages", sub: "not accepted yet", held: totalHeld }) : "",
+    totalHeld ? treeItem({ id: "held", type: "held", key: "held", icon: "folder", level: 1, name: "Held messages", sub: "not delivered yet", held: totalHeld }) : "",
     treeItem({ id: "all", type: "all", key: null, icon: "all", level: 1, name: "All messages", badge: totalUnread || null }),
     treeItem({ id: "machines", type: "group", key: "machines", icon: "machine", level: 1, name: "Machines", sub: `${machines.size}`, children: mItems }),
     pbs.length || [...S.boxes.values()].some(isProjectBox) ? treeItem({ id: "projects", type: "projects", key: "projects", icon: "pbox", level: 1, name: "Project boxes",
@@ -1438,15 +1440,17 @@ function renderDetail(m, partial) {
   const fwBlock = fw ? h("div", { class: "notice" }, h("strong", {}, "Forwarded to the machine box"), h("br"),
     `Original message from ${fw.from ? boxName(fw.from) : fw.from_label || "?"}` + (fw.stored_at ? `, stored on ${fmtFull.format(new Date(Date.parse(fw.stored_at)))}` : "") + (fw.reason ? ` — ${fw.reason}` : "")) : null;
   const heldBlock = isHeld(m) ? h("div", { class: "held-banner", role: "note" },
-    h("div", { class: "held-head" }, svg(ICON.warn, "ico"), h("h2", {}, `Not delivered for ${heldAge(m)}`)),
-    h("p", { class: "held-help" }, (m.held.why === "full"
+    h("div", { class: "held-head" }, svg(ICON.warn, "ico"), h("h2", {}, m.queue ? `Not sent for ${heldAge(m)}` : `Not delivered for ${heldAge(m)}`)),
+    h("p", { class: "held-help" }, m.queue ? queueWhy(m) + " " + queueNext(m.queue) : (m.held.why === "full"
       ? `${nm(recipientName(m.to))}'s box is full.`
       : `${nm(recipientName(m.to))} does not accept messages from ${nm(boxName(m.from))} yet: its computer has not run since they were introduced.`)
       + ` ${nm(boxName(m.from))} keeps it and tries again by itself.`
       + (heldSilent(m) ? ` No new try since ${fmtFull.format(new Date(m.held.last || m.held.since))}: that computer may be off.` : "")),
     h("div", { class: "held-actions" },
-      h("button", { class: "btn small ripple", type: "button", title: "Removed from its sender's queue: never delivered",
-        onclick: () => deleteMessages([m.id]) }, "Delete it"),
+      m.queue ? h("button", { class: "btn small filled ripple", type: "button", title: "Try at once, whatever the schedule",
+        onclick: (e) => queueRetry([m.id], e.currentTarget) }, "Retry now") : null,
+      h("button", { class: "btn small ripple", type: "button", title: m.queue ? "Out of this computer's queue: not sent again" : "Removed from its sender's queue: never delivered",
+        onclick: () => m.queue ? queueCancel([m.id]) : deleteMessages([m.id]) }, m.queue ? "Cancel it" : "Delete it"),
       h("button", { class: "btn small text ripple", type: "button", title: "Out of the alert; its sender still keeps it and tries again by itself",
         onclick: () => heldAck([m.id]) }, "Mark handled"))) : heldAcked(m) ? h("div", { class: "notice held-acked" },
     `Held for ${heldAge(m)}, marked handled ${when(m.held.ack)}: out of the alert. ${nm(boxName(m.from))} still keeps it and sends it again by itself. `,
@@ -1969,7 +1973,7 @@ const bind = (sel, key, after) => {
     F[key] = el.type === "checkbox" ? el.checked : el.value; saveF(); S.limit = 300; after();
   });
 };
-bind("#f-view", "view", renderList); bind("#f-dir", "dir", renderList); bind("#f-tier", "tier", () => { renderTree(); renderList(); });
+bind("#f-view", "view", () => { H.only = null; renderList(); }); bind("#f-dir", "dir", renderList); bind("#f-tier", "tier", () => { renderTree(); renderList(); });
 bind("#f-period", "period", renderList); bind("#f-sort", "sort", renderList); bind("#f-group", "group", renderList);
 bind("#f-source", "source", renderList); bind("#f-search", "search", renderList);
 bind("#tree-active-only", "treeActive", renderTree); bind("#b-active", "boxActive", renderBoxes);
@@ -2088,60 +2092,146 @@ $("#late").addEventListener("click", showLate);
 const HKEY = "mmbox-console-held-hidden";
 let heldHidden = new Set();
 try { heldHidden = new Set(JSON.parse(localStorage.getItem(HKEY) || "[]")); } catch { /* a private window */ }
-const H = { notif: null, ids: "" };
+const H = { notif: null, ids: "", trying: new Map(), only: null };
+// The held panel groups what waits: this computer's own sends by destination computer and cause (no service answers,
+// not accepted yet, box full), its broadcasts one by one, and the other computers' held messages by recipient (seen in
+// the collectors). Each row says since when, how many, from whom and, for this computer's, the countdown to the next
+// try, with Show (the list narrowed to them), Retry now and Cancel at its end. "Hide" folds the panel into the app
+// bar's button, which opens it again; a new held message opens it by itself.
+const WHY = {
+  unreachable: (mk) => `${nm(machineName(mk))} cannot be reached`,
+  none: (mk) => `${nm(machineName(mk))} shares no service with this computer`,
+  refused: (mk) => `${nm(machineName(mk))} has not accepted this computer's box yet`,
+  full: (mk) => `A box of ${nm(machineName(mk))} is full`,
+  closed: (mk) => `A box of ${nm(machineName(mk))} closed`,
+};
 function heldGroups(list) {
   const g = new Map();
   for (const m of list) {
-    const k = m.to || "?";
-    if (!g.has(k)) g.set(k, { to: k, msgs: [], from: new Set() });
+    const q = m.queue, mk = m.to ? machineKey(boxOf(m.to)) : null;
+    const k = q?.kind === "broadcast" ? "b:" + m.id : q ? `q:${q.why}:${mk}` : "h:" + (m.to || "?");
+    if (!g.has(k)) g.set(k, { key: k, kind: q?.kind === "broadcast" ? "broadcast" : q ? "queue" : "remote", why: q?.why, machine: mk, to: m.to, msgs: [], from: new Set(), boxes: new Set() });
     const x = g.get(k);
-    x.msgs.push(m); x.from.add(m.from);
+    x.msgs.push(m); x.from.add(m.from); if (m.to) x.boxes.add(m.to);
   }
-  return [...g.values()].sort((a, b) => Math.min(...a.msgs.map((m) => m.held.since)) - Math.min(...b.msgs.map((m) => m.held.since)));
+  return [...g.values()].sort((a, b) => (a.kind === "remote") - (b.kind === "remote") || Math.min(...a.msgs.map((m) => m.held.since)) - Math.min(...b.msgs.map((m) => m.held.since)));
 }
 function recipientName(id) {
   const b = boxOf(id), mk = machineKey(b);
   const mach = machineName(mk);
   return b.role === "machine" ? `${mach} (machine box)` : `${boxName(id)} on ${mach}`;
 }
+const svcName = (u) => (S.servers.get(u) || {}).name || String(u || "").replace(/^https?:\/\//, "");
+function queueWhy(m) {  // a queued send of this computer: why, in words
+  const q = m.queue, errs = (q.errors || []).map((e) => `${svcName(e.url)}: ${String(e.error || "").replace(/^0 /, "")}`);
+  if (q.kind === "broadcast") return `Not on ${q.to_names?.length || "some"} channel(s) yet (${(q.to_names || []).map((x) => nm(x)).join(", ")}): no service answered${errs.length ? ` (${errs[0]})` : ""}. It lives until ${fmtTime.format(new Date(q.expires))}; after that it is dropped.`;
+  if (q.why === "unreachable") return `No service shared with ${nm(recipientName(m.to))} answers${errs.length ? ` (${errs.join("; ")})` : ""}: the network, the VPN or the service is down. This computer keeps it and sends it again by itself.`;
+  if (q.why === "none") return `${nm(recipientName(m.to))} is on no service of this computer: it cannot be sent until one is shared.`;
+  if (q.why === "full") return `${nm(recipientName(m.to))}'s box is full: kept and sent again by itself.`;
+  return `${nm(recipientName(m.to))} does not accept ${nm(boxName(m.from))} yet (its computer has not run since they were introduced): kept and sent again by itself.`;
+}
+function queueNext(q, short = false) {  // the countdown, refreshed every second by the ticker (data-next)
+  const n = q.next || 0;
+  return short ? "" : `${q.tries} tr${q.tries === 1 ? "y" : "ies"} so far; the next one in ${countdown(n)}.`;
+}
+const countdown = (ms) => { const s = Math.round((ms - Date.now()) / 1000); return s <= 0 ? "a moment" : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+function nextOf(g) { const ns = g.msgs.map((m) => m.queue?.next).filter(Boolean); return ns.length ? Math.min(...ns) : null; }
+function sinceOf(g) { return Math.min(...g.msgs.map((m) => (m.queue?.why_since || m.held.since))); }
+async function queueRetry(ids, btn) {
+  busy(btn, true);
+  const r = await action({ action: "outbox_retry", ids }).catch((x) => ({ ok: false, err: x.message }));
+  if (!r.ok) { busy(btn, false); toast("Retry: " + (r.err || "?"), true); return; }
+  toast(r.out || "Trying now");
+  for (const id of ids) H.trying.set(id, Date.now());
+  renderHeld();
+  for (const t of [2500, 8000, 20000]) setTimeout(() => poll(true), t);
+}
+async function queueCancel(ids) {
+  const n = ids.length;
+  if (!(await confirmAsk(n === 1 ? "Cancel this message?" : `Cancel these ${n} messages?`,
+    `${n === 1 ? "It leaves" : "They leave"} this computer's queue and ${n === 1 ? "is" : "are"} not sent again. One that a service took at its last try without answering in time may still arrive.`, "Cancel them"))) return;
+  const r = await action({ action: "outbox_cancel", ids }).catch((x) => ({ ok: false, err: x.message }));
+  if (!r.ok) { showOutput("Cancel", r); return; }
+  toast(n === 1 ? "Cancelled: not sent again" : `${n} messages cancelled: not sent again`);
+  setTimeout(() => poll(true), 600);
+}
+function heldRow(g) {
+  const n = g.msgs.length, ids = g.msgs.map((m) => m.id), since = sinceOf(g), next = nextOf(g);
+  const trying = ids.some((i) => Date.now() - (H.trying.get(i) || 0) < 20000);
+  const from = [...g.from].map((x) => nm(boxName(x))).join(", ");
+  const title = g.kind === "broadcast" ? `Broadcast “${g.msgs[0].subject || g.msgs[0].id}” not on every channel yet`
+    : g.kind === "queue" ? (WHY[g.why] || WHY.refused)(g.machine) : recipientName(g.to);
+  const facts = g.kind === "remote"
+    ? `${n} message${n > 1 ? "s" : ""} for ${heldAge(g.msgs.reduce((a, m) => (m.held.since < a.held.since ? m : a)))}, from ${from}` + (g.msgs.every(heldSilent) ? "; their sender has not retried for 30 min (its computer may be off too)" : "")
+    : `${n} message${n > 1 ? "s" : ""} waiting since ${fmtTime.format(new Date(since))} (${ago((Date.now() - since) / 1000)}), from ${from}`
+      + (g.kind === "queue" && g.boxes.size ? ` to ${[...g.boxes].map((b) => nm(boxName(b))).join(", ")}` : "");
+  const li = h("li", { class: "held-row " + g.kind, dataset: { key: g.key } },
+    h("div", { class: "held-row-main" },
+      h("span", { class: "held-to" }, h("strong", {}, title)),
+      h("span", { class: "dim held-facts" }, facts),
+      g.kind !== "remote" ? h("span", { class: "held-next" }, trying ? h("span", { class: "dim" }, "trying now…")
+        : g.kind === "broadcast" ? ["next try in ", h("span", { class: "held-count", dataset: { at: String(next || 0) } }, countdown(next || 0)),
+          " · dropped in ", h("span", { class: "held-count", dataset: { at: String(g.msgs[0].queue.expires || 0) } }, countdown(g.msgs[0].queue.expires || 0))]
+          : next ? ["next try in ", h("span", { class: "held-count", dataset: { at: String(next) } }, countdown(next))] : null) : null),
+    h("div", { class: "held-row-acts" },
+      h("button", { class: "btn small text ripple", type: "button", title: "The list narrowed to these messages", onclick: () => showHeld(null, ids) }, "Show"),
+      g.kind !== "remote" ? h("button", { class: "btn small filled ripple" + (trying ? " loading" : ""), type: "button", disabled: trying,
+        title: "Try at once, whatever the schedule", onclick: (e) => queueRetry(ids, e.currentTarget) }, "Retry now") : null,
+      g.kind !== "remote" ? h("button", { class: "btn small ripple", type: "button", title: "Out of this computer's queue: not sent again",
+        onclick: () => queueCancel(ids) }, n > 1 ? `Cancel all ${n}` : "Cancel")
+        : h("button", { class: "btn small text ripple", type: "button", title: "Out of the alert; its sender still keeps it and sends it again by itself",
+          onclick: () => heldAck(ids) }, n > 1 ? `Mark the ${n} handled` : "Mark handled")));
+  if (n > 1) li.append(h("ul", { class: "held-sub" }, g.msgs.sort((a, b) => a.held.since - b.held.since).map((m) =>
+    h("li", {},
+      h("span", { class: "held-subj" }, `${m.subject || m.kind || m.id}`),
+      h("span", { class: "dim" }, ` — for ${heldAge(m)}, from ${nm(boxName(m.from))}`),
+      h("button", { class: "btn small text ripple", type: "button", onclick: () => openMessage(m.id) }, "Open"),
+      m.queue ? h("button", { class: "btn small text ripple", type: "button", onclick: () => queueCancel([m.id]) }, "Cancel")
+        : h("button", { class: "btn small text ripple", type: "button", onclick: () => heldAck([m.id]) }, "Mark handled")))));
+  return li;
+}
+function heldSummary(list) {  // the app bar button's words and tooltip, when the panel is folded into it
+  const groups = heldGroups(list), mine = groups.filter((g) => g.kind === "queue" && ["unreachable", "none"].includes(g.why));
+  const label = mine.length ? (mine.length === 1 ? `${plain(machineName(mine[0].machine))} unreachable` : `${mine.length} computers unreachable`)
+    : list.length === 1 ? "1 message held" : `${list.length} messages held`;
+  const tip = groups.map((g) => plain((g.kind === "queue" ? (WHY[g.why] || WHY.refused)(g.machine) : g.kind === "broadcast" ? "A broadcast" : recipientName(g.to)))
+    + `: ${g.msgs.length} message(s) since ${fmtTime.format(new Date(sinceOf(g)))}` + (nextOf(g) ? `, next try in ${countdown(nextOf(g))}` : "")).join("\n");
+  return { label: `${label}${mine.length ? ` · ${list.length}` : ""}`, tip: tip + "\n(click: the panel)" };
+}
 function renderHeld() {
   const list = S.msgs.filter(isHeld);
   const btn = $("#held-btn"), ban = $("#held-banner");
   btn.hidden = !list.length;
-  btn.replaceChildren(svg(ICON.warn, "ico tiny"), h("span", {}, list.length === 1 ? "1 message held" : `${list.length} messages held`));
+  const sum = list.length ? heldSummary(list) : null;
+  btn.replaceChildren(svg(ICON.warn, "ico tiny"), h("span", {}, sum?.label || ""));
+  btn.title = sum?.tip || "";
   const shown = list.some((m) => !heldHidden.has(m.id));
+  btn.setAttribute("aria-expanded", String(!!list.length && shown));
   ban.hidden = !list.length || !shown;
   if (ban.hidden) { ban.replaceChildren(); return; }
-  const work = list.filter((m) => m.tier <= 1).length, unknown = list.filter((m) => !m.kind).length;
   const groups = heldGroups(list);
+  const down = groups.filter((g) => g.kind === "queue" && ["unreachable", "none"].includes(g.why));
+  const allDown = down.length && groups.every((g) => g.kind === "broadcast" || down.includes(g));  // a broadcast waits for the same cause
+  const head = allDown
+    ? `${list.length} message${list.length > 1 ? "s" : ""} not sent: ${down.length > 1 ? `${down.length} computers cannot` : `${nm(machineName(down[0].machine))} cannot`} be reached`
+    : groups.every((g) => g.kind === "broadcast") ? `${list.length} broadcast${list.length > 1 ? "s" : ""} not on every channel yet: no service answers`
+    : `${list.length} message${list.length > 1 ? "s" : ""} held: not delivered yet`;
   ban.replaceChildren(
-    h("div", { class: "held-head" }, svg(ICON.warn, "ico"),
-      h("h2", { id: "held-title" }, `${list.length} message${list.length > 1 ? "s" : ""} held: ${groups.length > 1 ? `${groups.length} recipients do` : "the recipient does"} not accept ${list.length > 1 ? "them" : "it"} yet`)),
-    h("p", { class: "held-help" }, [work && `${work} written by agents`, list.length - work - unknown && `${list.length - work - unknown} of the tool's own (introductions, links, services)`,
-      unknown && `${unknown} not annotated (their sender does not tell this console what they are)`].filter(Boolean).join(", ") + ". "
-      + "Their senders keep them and send them again by themselves as soon as a session of the recipient's computer runs (it has not accepted the sender's box yet). Nothing is lost; nothing needs to be sent again."),
-    h("ul", { class: "held-list" }, groups.map((g) => {
-      const oldest = g.msgs.reduce((a, m) => (m.held.since < a.held.since ? m : a));
-      const silent = g.msgs.every(heldSilent);
-      return h("li", {},
-        h("span", { class: "held-to" }, h("strong", {}, recipientName(g.to))),
-        h("span", { class: "dim" }, ` — ${g.msgs.length} message${g.msgs.length > 1 ? "s" : ""} for ${heldAge(oldest)}, from ${[...g.from].map(boxName).join(", ")}`
-          + (silent ? "; their sender has not retried for 30 min (its computer may be off too)" : "")),
-        h("button", { class: "btn small text ripple", type: "button", onclick: () => showHeld(g.to) }, "Show"),
-        h("button", { class: "btn small text ripple", type: "button", title: "Out of the alert; its sender still keeps it and sends it again by itself",
-          onclick: () => heldAck(g.msgs.map((m) => m.id)) }, g.msgs.length > 1 ? `Mark the ${g.msgs.length} handled` : "Mark handled"),
-        g.msgs.length > 1 ? h("ul", { class: "held-sub" }, g.msgs.sort((a, b) => a.held.since - b.held.since).map((m) =>
-          h("li", {},
-            h("span", { class: "held-subj" }, `${m.subject || m.kind || m.id}`),
-            h("span", { class: "dim" }, ` — for ${heldAge(m)}, from ${nm(boxName(m.from))}`),
-            h("button", { class: "btn small text ripple", type: "button", onclick: () => openMessage(m.id) }, "Open"),
-            h("button", { class: "btn small text ripple", type: "button", onclick: () => heldAck([m.id]) }, "Mark handled")))) : null);
-    })),
+    h("div", { class: "held-head" }, svg(ICON.warn, "ico"), h("h2", { id: "held-title" }, head),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn small text ripple", type: "button", title: "Folded into the red button of the app bar; a new held message opens it again",
+        onclick: () => { for (const m of list) heldHidden.add(m.id); try { localStorage.setItem(HKEY, JSON.stringify([...heldHidden].slice(-3000))); } catch { /* */ } renderHeld(); $("#held-btn").focus(); } }, "Hide")),
+    h("p", { class: "held-help" }, "Nothing is lost: this computer keeps its own and sends them again by itself (next try below), the other computers keep theirs. Retry now tries at once; Cancel drops them from the queue."),
+    h("ul", { class: "held-list" }, groups.map(heldRow)),
     h("div", { class: "held-actions" },
-      h("button", { class: "btn small ripple", type: "button", onclick: () => showHeld() }, "Show them all"),
-      h("button", { class: "btn small text ripple", type: "button", title: "The button above stays; the panel comes back with the next held message",
-        onclick: () => { for (const m of list) heldHidden.add(m.id); try { localStorage.setItem(HKEY, JSON.stringify([...heldHidden].slice(-3000))); } catch { /* */ } renderHeld(); } }, "Hide until a new one")));
+      h("button", { class: "btn small ripple", type: "button", onclick: () => showHeld() }, "Show them all")));
 }
+setInterval(() => {  // the countdowns of the held panel, and the app bar button's tooltip, every second
+  if (document.visibilityState !== "visible" || !S.msgs?.length) return;
+  for (const el of $$("#held-banner .held-count")) el.textContent = countdown(+el.dataset.at);
+  const list = S.msgs.filter(isHeld);
+  if (list.length) $("#held-btn").title = heldSummary(list).tip;
+}, 1000);
 // the operator marks held messages handled (out of the alert) or puts them back in it; the sender still keeps them
 async function heldAck(ids, on = true) {
   const r = await action({ action: "held_ack", ids, on }).catch((x) => ({ ok: false, err: x.message }));
@@ -2178,13 +2268,22 @@ function heldSignals() {
   } else if (H.notif && !list.length) { H.notif.close(); H.notif = null; H.ids = ""; }
 }
 // like the late button: every held message, whatever the filters; `to` narrows it to one recipient
-function showHeld(to) {
+function showHeld(to, ids = null) {
+  H.only = ids ? new Set(ids) : null;
   showTab("messages");
   Object.assign(F, { view: "held", dir: to ? "in" : "both", source: "all", search: "", period: "0", tier: "3" });
   for (const [sel, key] of [["#f-view", "view"], ["#f-dir", "dir"], ["#f-source", "source"], ["#f-search", "search"], ["#f-period", "period"], ["#f-tier", "tier"]]) $(sel).value = F[key];
   saveF(); S.limit = 300; S.node = to ? { type: "box", key: to } : { type: "all", key: null }; closeReader(false); renderTree(); renderList();
 }
-$("#held-btn").addEventListener("click", () => showHeld());
+$("#held-btn").addEventListener("click", () => {  // the folded panel opens again (its rows: Show narrows the list)
+  const list = S.msgs.filter(isHeld);
+  for (const m of list) heldHidden.delete(m.id);
+  try { localStorage.setItem(HKEY, JSON.stringify([...heldHidden].slice(-3000))); } catch { /* */ }
+  showTab("messages");
+  renderHeld();
+  $("#held-banner").scrollIntoView({ block: "nearest" });
+  $("#held-banner button")?.focus();
+});
 setInterval(() => {  // the ages, and what turns held with time
   if (!S.msgs?.length || document.visibilityState !== "visible") return;
   const n = S.msgs.filter(isHeld).length;
